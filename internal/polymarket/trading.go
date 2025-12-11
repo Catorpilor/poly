@@ -322,18 +322,20 @@ func (tc *TradingClient) GetOrderBook(ctx context.Context, tokenID string) (*Ord
 }
 
 // GetBestPrice gets the best available price for a trade
-// For BUY: returns the price to pay per share (how much USDC per share)
-// For SELL: returns the price received per share
+// For BUY: amount = USDC to spend, returns the VWAP price per share
+// For SELL: amount = shares to sell, returns the VWAP price per share
 func (tc *TradingClient) GetBestPrice(ctx context.Context, tokenID string, side string, amount float64) (float64, error) {
 	orderBook, err := tc.GetOrderBook(ctx, tokenID)
 	if err != nil {
 		return 0, err
 	}
 
+	isBuy := strings.ToUpper(side) == "BUY"
+
 	// For BUY orders, look at asks (selling side) - we're buying from sellers
 	// For SELL orders, look at bids (buying side) - we're selling to buyers
 	var entries []OrderBookEntry
-	if strings.ToUpper(side) == "BUY" {
+	if isBuy {
 		entries = orderBook.Asks
 		// Sort asks by price ascending - we want to buy from cheapest sellers first
 		sort.Slice(entries, func(i, j int) bool {
@@ -351,48 +353,79 @@ func (tc *TradingClient) GetBestPrice(ctx context.Context, tokenID string, side 
 		return 0, fmt.Errorf("no liquidity available")
 	}
 
-	log.Printf("GetBestPrice: side=%s, amount=%.2f USDC, %d entries in book (sorted)", side, amount, len(entries))
+	if isBuy {
+		log.Printf("GetBestPrice BUY: amount=%.2f USDC, %d asks in book (sorted ascending)", amount, len(entries))
+	} else {
+		log.Printf("GetBestPrice SELL: amount=%.2f shares, %d bids in book (sorted descending)", amount, len(entries))
+	}
 	for i, e := range entries {
 		if i < 5 { // Log first 5 entries
 			log.Printf("  Entry %d: price=%.4f, size=%.4f", i, e.Price, e.Size)
 		}
 	}
 
-	// For BUY orders, we want to spend 'amount' USDC to buy shares
-	// We iterate through asks, accumulating shares until we've spent enough USDC
-	// Price = totalUSDC / totalShares
-
-	remainingUSDC := amount
 	totalShares := 0.0
 	totalUSDC := 0.0
 
-	for _, entry := range entries {
-		if remainingUSDC <= 0 {
-			break
+	if isBuy {
+		// BUY: We want to spend 'amount' USDC to buy shares
+		// Iterate through asks (cheapest first), accumulating shares
+		remainingUSDC := amount
+
+		for _, entry := range entries {
+			if remainingUSDC <= 0 {
+				break
+			}
+
+			// How much USDC to buy all shares at this price level?
+			costForLevel := entry.Size * entry.Price
+
+			if costForLevel >= remainingUSDC {
+				// We can fill our order at this level
+				sharesToBuy := remainingUSDC / entry.Price
+				totalShares += sharesToBuy
+				totalUSDC += remainingUSDC
+				remainingUSDC = 0
+			} else {
+				// Take all shares at this level
+				totalShares += entry.Size
+				totalUSDC += costForLevel
+				remainingUSDC -= costForLevel
+			}
 		}
 
-		// How much USDC to buy all shares at this price level?
-		costForLevel := entry.Size * entry.Price
+		if remainingUSDC > 0 {
+			return 0, fmt.Errorf("insufficient liquidity for BUY order (needed %.2f more USDC)", remainingUSDC)
+		}
+	} else {
+		// SELL: We want to sell 'amount' shares to get USDC
+		// Iterate through bids (highest first), accumulating USDC
+		remainingShares := amount
 
-		if costForLevel >= remainingUSDC {
-			// We can fill our order at this level
-			sharesToBuy := remainingUSDC / entry.Price
-			totalShares += sharesToBuy
-			totalUSDC += remainingUSDC
-			remainingUSDC = 0
-		} else {
-			// Take all shares at this level
-			totalShares += entry.Size
-			totalUSDC += costForLevel
-			remainingUSDC -= costForLevel
+		for _, entry := range entries {
+			if remainingShares <= 0 {
+				break
+			}
+
+			if entry.Size >= remainingShares {
+				// We can sell all remaining shares at this level
+				totalUSDC += remainingShares * entry.Price
+				totalShares += remainingShares
+				remainingShares = 0
+			} else {
+				// Sell all shares at this level, continue to next
+				totalUSDC += entry.Size * entry.Price
+				totalShares += entry.Size
+				remainingShares -= entry.Size
+			}
+		}
+
+		if remainingShares > 0 {
+			return 0, fmt.Errorf("insufficient liquidity for SELL order (%.2f shares remaining)", remainingShares)
 		}
 	}
 
-	if remainingUSDC > 0 {
-		return 0, fmt.Errorf("insufficient liquidity for order size (needed %.2f more USDC)", remainingUSDC)
-	}
-
-	// VWAP = total cost / total shares
+	// VWAP = total USDC / total shares
 	vwap := totalUSDC / totalShares
 	log.Printf("GetBestPrice: VWAP=%.6f (totalUSDC=%.2f, totalShares=%.2f)", vwap, totalUSDC, totalShares)
 
@@ -409,15 +442,34 @@ func (tc *TradingClient) ExecuteTrade(
 ) (*TradeResult, error) {
 	log.Printf("Executing trade: %+v", trade)
 
-	// Get the best price if not specified
+	// Get the best price if not specified (market order)
 	price := trade.Price
 	if price == 0 {
 		var err error
-		price, err = tc.GetBestPrice(ctx, trade.TokenID, trade.Side, trade.Amount)
+		var amountForPricing float64
+
+		if strings.ToUpper(trade.Side) == "BUY" {
+			// BUY: pass USDC amount to get best price
+			amountForPricing = trade.Amount
+		} else {
+			// SELL: pass shares to get best price
+			// SharesRaw is in 6-decimal format (e.g., 1000000 = 1 share)
+			if trade.SharesRaw > 0 {
+				amountForPricing = float64(trade.SharesRaw) / 1e6
+			} else {
+				// Fallback: estimate shares from Amount (assumes Amount is USDC value)
+				// Use a rough mid-market estimate (0.5) to convert
+				amountForPricing = trade.Amount / 0.5
+				log.Printf("ExecuteTrade SELL: No SharesRaw set, estimating shares=%.2f from Amount=%.2f", amountForPricing, trade.Amount)
+			}
+		}
+
+		price, err = tc.GetBestPrice(ctx, trade.TokenID, trade.Side, amountForPricing)
 		if err != nil {
 			return &TradeResult{Success: false, ErrorMsg: fmt.Sprintf("Failed to get price: %v", err)}, nil
 		}
 		log.Printf("ExecuteTrade: Got market price=%.6f", price)
+
 		// Add slippage buffer (2%) but cap within valid range
 		if strings.ToUpper(trade.Side) == "BUY" {
 			price *= 1.02
@@ -562,8 +614,8 @@ func (tc *TradingClient) submitOrder(
 
 	// Build request body
 	// Note: salt is an integer, most other fields are strings
-	orderPayload := map[string]interface{}{
-		"order": map[string]interface{}{
+	orderPayload := map[string]any{
+		"order": map[string]any{
 			"salt":          signedOrder.Salt.Int64(), // Integer, not string
 			"maker":         signedOrder.Maker.Hex(),
 			"signer":        signedOrder.Signer.Hex(),
@@ -1025,10 +1077,11 @@ func (tc *TradingClient) GetTokenIDForOutcome(ctx context.Context, market *Gamma
 	// If exact match not found, try Yes/No mapping for binary markets
 	// Some markets use "Yes"/"No" internally but display different names
 	if len(outcomes) == 2 && len(tokenIDs) == 2 {
-		if outcomeUpper == "YES" {
+		switch outcomeUpper {
+		case "YES":
 			log.Printf("GetTokenIDForOutcome: using index 0 for YES, tokenID=%s", tokenIDs[0])
 			return tokenIDs[0], nil
-		} else if outcomeUpper == "NO" {
+		case "NO":
 			log.Printf("GetTokenIDForOutcome: using index 1 for NO, tokenID=%s", tokenIDs[1])
 			return tokenIDs[1], nil
 		}
