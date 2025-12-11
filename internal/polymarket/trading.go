@@ -444,21 +444,22 @@ func (tc *TradingClient) ExecuteTrade(
 	var makerAmount, takerAmount string
 	var side model.Side
 
-	// USDC has 6 decimals, shares also have 6 decimals
-	amountRaw := int64(trade.Amount * 1e6)
-
 	if strings.ToUpper(trade.Side) == "BUY" {
 		side = model.BUY
 		// BUY: spending USDC to get shares
-		// makerAmount (USDC): max 5 decimals -> round to nearest 10
-		makerAmountRaw := (amountRaw / 10) * 10
-		makerAmount = strconv.FormatInt(makerAmountRaw, 10)
+		// Step 1: Calculate shares from USDC amount
 		// takerAmount (shares): max 2 decimals -> round down to nearest 10000
 		shares := int64((trade.Amount / price) * 1e6)
 		sharesRounded := (shares / 10000) * 10000
 		takerAmount = strconv.FormatInt(sharesRounded, 10)
-		log.Printf("ExecuteTrade BUY: makerAmount=%s USDC (raw=%d), takerAmount=%s shares (raw=%d), impliedPrice=%.6f",
-			makerAmount, amountRaw, takerAmount, shares, float64(makerAmountRaw)/float64(sharesRounded))
+		// Step 2: Calculate makerAmount FROM shares * price to ensure consistency
+		// This is critical: Polymarket validates makerAmount == takerAmount * price
+		// makerAmount (USDC): max 5 decimals -> round to nearest 10
+		makerAmountRaw := int64(float64(sharesRounded) * price)
+		makerAmountRaw = (makerAmountRaw / 10) * 10
+		makerAmount = strconv.FormatInt(makerAmountRaw, 10)
+		log.Printf("ExecuteTrade BUY: makerAmount=%s USDC (calculated from shares*price), takerAmount=%s shares (raw=%d), price=%.6f, originalUSDC=%.2f",
+			makerAmount, takerAmount, shares, price, trade.Amount)
 	} else {
 		side = model.SELL
 		// SELL: selling shares to get USDC
