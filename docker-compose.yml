@@ -11,7 +11,7 @@ services:
       - .env
     environment:
       # Override database/redis URLs to use host network services
-      - DATABASE_URL=${DATABASE_URL:-postgresql://polybot:polybot@host.docker.internal:5432/polybot}
+      - DATABASE_URL=${DATABASE_URL:-postgresql://poly_user:poly_user_666@host.docker.internal:5432/polymarket}
       - REDIS_URL=${REDIS_URL:-redis://host.docker.internal:6379/0}
     # Use host network to easily connect to host's PostgreSQL and Redis
     # Alternatively, use extra_hosts for host.docker.internal

@@ -9,13 +9,14 @@ import (
 type UserState string
 
 const (
-	StateNone                UserState = ""
-	StateWaitingForKey       UserState = "waiting_for_key"
-	StateConfirmImport       UserState = "confirm_import"
-	StateWaitingForTrade     UserState = "waiting_for_trade"
-	StateWaitingForAmount    UserState = "waiting_for_amount"
-	StateSelectingPosition   UserState = "selecting_position"
-	StateWaitingForLimitPrice UserState = "waiting_for_limit_price"
+	StateNone                    UserState = ""
+	StateWaitingForKey           UserState = "waiting_for_key"
+	StateConfirmImport           UserState = "confirm_import"
+	StateWaitingForTrade         UserState = "waiting_for_trade"
+	StateWaitingForAmount        UserState = "waiting_for_amount"
+	StateSelectingPosition       UserState = "selecting_position"
+	StateWaitingForLimitPrice    UserState = "waiting_for_limit_price"      // For sell limit orders
+	StateWaitingForBuyLimitPrice UserState = "waiting_for_buy_limit_price" // For buy limit orders
 )
 
 // UserContext holds the context for a user's current interaction

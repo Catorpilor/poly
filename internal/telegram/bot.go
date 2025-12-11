@@ -360,6 +360,10 @@ func (b *Bot) handleTextMessage(ctx context.Context, update *tgbotapi.Update) {
 		// User is entering limit price for sell order
 		b.handleLimitPriceInput(ctx, update, userCtx)
 
+	case StateWaitingForBuyLimitPrice:
+		// User is entering limit price for buy order
+		b.handleBuyLimitPriceInput(ctx, update, userCtx)
+
 	default:
 		b.sendMessage(chatID,
 			"💬 I received your message. Please use commands to interact with the bot. Type /help for available commands.")
@@ -438,8 +442,8 @@ func (b *Bot) handleCustomAmountInput(ctx context.Context, update *tgbotapi.Upda
 
 Please wait...`, marketName, outcomeName, amount))
 
-	// Execute the trade using index
-	result := b.executeBuyOrderByIndex(ctx, user, market, outcomeIndex, amount)
+	// Execute the trade using index (market order - price = 0)
+	result := b.executeBuyOrderByIndex(ctx, user, market, outcomeIndex, amount, 0)
 
 	// Show result
 	if result.Success {
@@ -537,6 +541,12 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, update *tgbotapi.Update) 
 
 	case strings.HasPrefix(data, "cust:"):
 		b.handleCustomAmountCallback(ctx, update)
+
+	case strings.HasPrefix(data, "buyexec:"):
+		b.handleBuyExecuteCallback(ctx, update)
+
+	case strings.HasPrefix(data, "buylimit:"):
+		b.handleBuyLimitCallback(ctx, update)
 
 	case data == "cancel_order":
 		b.editMessage(chatID, update.CallbackQuery.Message.MessageID, "❌ Order cancelled.")
@@ -676,11 +686,10 @@ func (b *Bot) handleBuyCallback(ctx context.Context, update *tgbotapi.Update) {
 	b.editMessageWithKeyboard(chatID, messageID, message, keyboard)
 }
 
-// handleAmountCallback handles amount selection
+// handleAmountCallback handles amount selection - shows order type choice (market vs limit)
 func (b *Bot) handleAmountCallback(ctx context.Context, update *tgbotapi.Update) {
 	chatID := update.CallbackQuery.Message.Chat.ID
 	messageID := update.CallbackQuery.Message.MessageID
-	userID := update.CallbackQuery.From.ID
 
 	// Parse callback data: "amt:100:INDEX:marketID" where INDEX is 0 or 1
 	parts := strings.Split(update.CallbackQuery.Data, ":")
@@ -705,6 +714,81 @@ func (b *Bot) handleAmountCallback(ctx context.Context, update *tgbotapi.Update)
 		return
 	}
 
+	// Fetch market info
+	marketClient := polymarket.NewMarketClient()
+	market, err := marketClient.GetMarketByID(ctx, marketID)
+	if err != nil {
+		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Failed to fetch market: %v", err))
+		return
+	}
+
+	// Get outcome name and price for display
+	outcomes := market.GetOutcomes()
+	prices := market.GetOutcomePrices()
+	outcomeName := "Unknown"
+	currentPrice := 0.0
+	if idx < len(outcomes) {
+		outcomeName = outcomes[idx]
+	}
+	if idx < len(prices) {
+		fmt.Sscanf(prices[idx], "%f", &currentPrice)
+	}
+
+	log.Printf("handleAmountCallback: market=%s, outcomeIndex=%d, outcomeName=%s, price=%.2f",
+		marketID, idx, outcomeName, currentPrice)
+
+	marketName := market.Question
+	if len(marketName) > 40 {
+		marketName = marketName[:37] + "..."
+	}
+
+	// Show order type selection
+	message := fmt.Sprintf(`🎯 *Buy Order*
+
+*Market:* %s
+*Outcome:* %s
+*Amount:* $%.2f
+*Current Price:* $%.2f
+
+───────────────
+
+📊 *Select order type:*
+`, marketName, outcomeName, amount, currentPrice)
+
+	// Create order type selection keyboard
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⚡ Market Order", fmt.Sprintf("buyexec:%.0f:%d:%s:market", amount, idx, marketID)),
+			tgbotapi.NewInlineKeyboardButtonData("📝 Limit Order", fmt.Sprintf("buylimit:%.0f:%d:%s", amount, idx, marketID)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⬅️ Back", fmt.Sprintf("buy:%d:%s", idx, marketID)),
+			tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "cancel_order"),
+		),
+	)
+
+	b.editMessageWithKeyboard(chatID, messageID, message, keyboard)
+}
+
+// handleBuyExecuteCallback executes a market buy order
+func (b *Bot) handleBuyExecuteCallback(ctx context.Context, update *tgbotapi.Update) {
+	chatID := update.CallbackQuery.Message.Chat.ID
+	messageID := update.CallbackQuery.Message.MessageID
+	userID := update.CallbackQuery.From.ID
+
+	// Parse callback data: "buyexec:AMOUNT:INDEX:marketID:market"
+	parts := strings.Split(update.CallbackQuery.Data, ":")
+	if len(parts) != 5 {
+		return
+	}
+	amountStr := parts[1]
+	outcomeIndex := parts[2]
+	marketID := parts[3]
+	// parts[4] is "market" (order type)
+
+	amount, _ := strconv.ParseFloat(amountStr, 64)
+	idx, _ := strconv.Atoi(outcomeIndex)
+
 	// Check if user has wallet
 	user, err := b.userRepo.GetByTelegramID(ctx, userID)
 	if err != nil || user == nil {
@@ -720,15 +804,11 @@ func (b *Bot) handleAmountCallback(ctx context.Context, update *tgbotapi.Update)
 		return
 	}
 
-	// Get outcome name for display
 	outcomes := market.GetOutcomes()
 	outcomeName := "Unknown"
 	if idx < len(outcomes) {
 		outcomeName = outcomes[idx]
 	}
-
-	log.Printf("handleAmountCallback: market=%s, outcomeIndex=%d, outcomeName=%s, outcomes=%v",
-		marketID, idx, outcomeName, outcomes)
 
 	marketName := market.Question
 	if len(marketName) > 40 {
@@ -736,7 +816,7 @@ func (b *Bot) handleAmountCallback(ctx context.Context, update *tgbotapi.Update)
 	}
 
 	// Show processing message
-	b.editMessage(chatID, messageID, fmt.Sprintf(`⏳ *Processing Order...*
+	b.editMessage(chatID, messageID, fmt.Sprintf(`⏳ *Processing Market Order...*
 
 *Market:* %s
 *Side:* Buy %s
@@ -744,8 +824,8 @@ func (b *Bot) handleAmountCallback(ctx context.Context, update *tgbotapi.Update)
 
 Please wait...`, marketName, outcomeName, amount))
 
-	// Execute the trade using index
-	result := b.executeBuyOrderByIndex(ctx, user, market, idx, amount)
+	// Execute the trade using index (market order - price = 0)
+	result := b.executeBuyOrderByIndex(ctx, user, market, idx, amount, 0)
 
 	// Show result
 	if result.Success {
@@ -768,6 +848,172 @@ Use /positions to check your positions.
 Please try again or contact support.
 `, marketName, result.ErrorMsg)
 		b.editMessage(chatID, messageID, message)
+	}
+}
+
+// handleBuyLimitCallback prompts user for limit price
+func (b *Bot) handleBuyLimitCallback(ctx context.Context, update *tgbotapi.Update) {
+	chatID := update.CallbackQuery.Message.Chat.ID
+	messageID := update.CallbackQuery.Message.MessageID
+	userID := update.CallbackQuery.From.ID
+
+	// Parse callback data: "buylimit:AMOUNT:INDEX:marketID"
+	parts := strings.Split(update.CallbackQuery.Data, ":")
+	if len(parts) != 4 {
+		return
+	}
+	amountStr := parts[1]
+	outcomeIndex := parts[2]
+	marketID := parts[3]
+
+	amount, _ := strconv.ParseFloat(amountStr, 64)
+	idx, _ := strconv.Atoi(outcomeIndex)
+
+	// Fetch market info for display
+	marketClient := polymarket.NewMarketClient()
+	market, err := marketClient.GetMarketByID(ctx, marketID)
+	if err != nil {
+		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Failed to fetch market: %v", err))
+		return
+	}
+
+	outcomes := market.GetOutcomes()
+	prices := market.GetOutcomePrices()
+	outcomeName := "Unknown"
+	currentPrice := 0.0
+	if idx < len(outcomes) {
+		outcomeName = outcomes[idx]
+	}
+	if idx < len(prices) {
+		fmt.Sscanf(prices[idx], "%f", &currentPrice)
+	}
+
+	marketName := market.Question
+	if len(marketName) > 40 {
+		marketName = marketName[:37] + "..."
+	}
+
+	// Store context for the limit price input
+	b.stateManager.SetState(userID, StateWaitingForBuyLimitPrice, map[string]interface{}{
+		"market_id":      marketID,
+		"outcome_index":  idx,
+		"outcome_name":   outcomeName,
+		"amount":         amount,
+		"market_name":    marketName,
+		"current_price":  currentPrice,
+		"chat_id":        chatID,
+		"message_id":     messageID,
+	}, 5*time.Minute)
+
+	// Show prompt for limit price
+	message := fmt.Sprintf(`📝 *Limit Buy Order*
+
+*Market:* %s
+*Outcome:* %s
+*Amount:* $%.2f
+*Current Price:* $%.2f
+
+───────────────
+
+💰 *Enter your limit price (0.01 - 0.99):*
+
+_For example, type: 0.45_
+
+Your order will only fill if the price reaches your limit or better.
+`, marketName, outcomeName, amount, currentPrice)
+
+	b.editMessage(chatID, messageID, message)
+}
+
+// handleBuyLimitPriceInput handles when user enters a limit price for buy order
+func (b *Bot) handleBuyLimitPriceInput(ctx context.Context, update *tgbotapi.Update, userCtx *UserContext) {
+	chatID := update.Message.Chat.ID
+	userID := update.Message.From.ID
+	text := strings.TrimSpace(update.Message.Text)
+
+	// Check for cancel
+	if strings.ToLower(text) == "/cancel" {
+		b.stateManager.ClearState(userID)
+		b.sendMessage(chatID, "❌ Order cancelled.")
+		return
+	}
+
+	// Parse price
+	text = strings.TrimPrefix(text, "$")
+	var limitPrice float64
+	if _, err := fmt.Sscanf(text, "%f", &limitPrice); err != nil || limitPrice <= 0 || limitPrice >= 1 {
+		b.sendMessage(chatID, "❌ Invalid price. Please enter a value between 0.01 and 0.99 (e.g., 0.45)")
+		return
+	}
+
+	// Get order data from state
+	marketID, _ := userCtx.Data["market_id"].(string)
+	outcomeIndex, _ := userCtx.Data["outcome_index"].(int)
+	outcomeName, _ := userCtx.Data["outcome_name"].(string)
+	amount, _ := userCtx.Data["amount"].(float64)
+	marketName, _ := userCtx.Data["market_name"].(string)
+
+	if marketID == "" {
+		b.stateManager.ClearState(userID)
+		b.sendMessage(chatID, "❌ Session expired. Please start over with /market.")
+		return
+	}
+
+	// Get user
+	user, err := b.userRepo.GetByTelegramID(ctx, userID)
+	if err != nil || user == nil {
+		b.stateManager.ClearState(userID)
+		b.sendMessage(chatID, "❌ User not found.")
+		return
+	}
+
+	// Clear state before executing
+	b.stateManager.ClearState(userID)
+
+	// Fetch market info
+	marketClient := polymarket.NewMarketClient()
+	market, err := marketClient.GetMarketByID(ctx, marketID)
+	if err != nil {
+		b.sendMessage(chatID, fmt.Sprintf("❌ Failed to fetch market: %v", err))
+		return
+	}
+
+	// Show processing message
+	b.sendMessage(chatID, fmt.Sprintf(`⏳ *Processing Limit Buy Order...*
+
+*Market:* %s
+*Side:* Buy %s
+*Amount:* $%.2f
+*Limit Price:* $%.2f
+
+Please wait...`, marketName, outcomeName, amount, limitPrice))
+
+	// Execute the limit buy order
+	result := b.executeBuyOrderByIndex(ctx, user, market, outcomeIndex, amount, limitPrice)
+
+	// Show result
+	if result.Success {
+		message := fmt.Sprintf(`✅ *Limit Buy Order Placed!*
+
+*Market:* %s
+*Side:* Buy %s
+*Amount:* $%.2f
+*Limit Price:* $%.2f
+*Order ID:* %s
+
+Your order will fill when the price reaches $%.2f or lower.
+Use /orders to check your open orders.
+`, marketName, outcomeName, amount, limitPrice, result.OrderID, limitPrice)
+		b.sendMessage(chatID, message)
+	} else {
+		message := fmt.Sprintf(`❌ *Order Failed*
+
+*Market:* %s
+*Error:* %s
+
+Please try again or contact support.
+`, marketName, result.ErrorMsg)
+		b.sendMessage(chatID, message)
 	}
 }
 
@@ -1608,8 +1854,9 @@ func (b *Bot) executeBuyOrder(ctx context.Context, user *database.User, market *
 }
 
 // executeBuyOrderByIndex executes a buy order using outcome index (0 or 1) instead of name
-func (b *Bot) executeBuyOrderByIndex(ctx context.Context, user *database.User, market *polymarket.GammaMarket, outcomeIndex int, amount float64) *polymarket.TradeResult {
-	log.Printf("Executing buy order (by index) for user %d: index=%d market=%s $%.2f", user.TelegramID, outcomeIndex, market.ID, amount)
+// limitPrice of 0 means market order, >0 means limit order at specified price
+func (b *Bot) executeBuyOrderByIndex(ctx context.Context, user *database.User, market *polymarket.GammaMarket, outcomeIndex int, amount float64, limitPrice float64) *polymarket.TradeResult {
+	log.Printf("Executing buy order (by index) for user %d: index=%d market=%s $%.2f limitPrice=%.2f", user.TelegramID, outcomeIndex, market.ID, amount, limitPrice)
 
 	// Decrypt user's private key
 	userWallet, err := b.walletManager.DecryptPrivateKey(user.EncryptedKey)
@@ -1664,12 +1911,13 @@ func (b *Bot) executeBuyOrderByIndex(ctx context.Context, user *database.User, m
 		Side:         "BUY",
 		Outcome:      outcomeName,
 		Amount:       amount,
+		Price:        limitPrice, // 0 = market order, >0 = limit order
 		OrderType:    polymarket.OrderTypeGTC,
 		NegativeRisk: market.NegRisk,
 	}
 
-	log.Printf("Trade request (by index): outcomeIndex=%d, outcomeName=%s, tokenID=%s, negRisk=%v",
-		outcomeIndex, outcomeName, tokenID, tradeReq.NegativeRisk)
+	log.Printf("Trade request (by index): outcomeIndex=%d, outcomeName=%s, tokenID=%s, negRisk=%v, limitPrice=%.2f",
+		outcomeIndex, outcomeName, tokenID, tradeReq.NegativeRisk, limitPrice)
 
 	// Execute the trade
 	result, err := b.tradingClient.ExecuteTrade(ctx, userWallet.PrivateKey, proxyAddress, creds, tradeReq)

@@ -8,8 +8,8 @@ RUN apk add --no-cache gcc musl-dev
 WORKDIR /app
 
 # Copy go mod files first for better caching
-COPY go.mod go.sum ./
-RUN go mod download
+# COPY go.mod go.sum ./
+# RUN go mod download
 
 # Copy source code
 COPY . .
