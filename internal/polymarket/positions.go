@@ -303,7 +303,10 @@ func (pm *PositionManager) getActiveMarkets(ctx context.Context) ([]*Market, err
 	if err := json.NewDecoder(resp.Body).Decode(&markets); err != nil {
 		// If that fails, try as object with markets field
 		resp.Body.Close()
-		resp, _ = pm.httpClient.Do(req)
+		resp, err = pm.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to retry request: %w", err)
+		}
 		defer resp.Body.Close()
 
 		if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
@@ -335,7 +338,7 @@ func (pm *PositionManager) getMarketBalances(ctx context.Context, proxyAddress c
 }
 
 // calculateTokenIDs calculates the ERC-1155 token IDs for YES and NO outcomes
-func (pm *PositionManager) calculateTokenIDs(conditionID string) (*big.Int, *big.Int) {
+func (pm *PositionManager) calculateTokenIDs(_ string) (*big.Int, *big.Int) {
 	// In Polymarket's ConditionalTokens:
 	// Token ID = keccak256(USDC_address, collectionId)
 	// CollectionId = keccak256(conditionId, indexSet)

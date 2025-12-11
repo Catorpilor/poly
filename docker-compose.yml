@@ -2,9 +2,7 @@ version: "3.8"
 
 services:
   polybot:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: cheshire42/poly:latest
     container_name: polybot
     restart: unless-stopped
     env_file:
