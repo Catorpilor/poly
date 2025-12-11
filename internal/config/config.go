@@ -1,0 +1,264 @@
+package config
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"strconv"
+	"time"
+
+	"github.com/joho/godotenv"
+)
+
+// Config holds all application configuration
+type Config struct {
+	// Telegram configuration
+	Telegram TelegramConfig
+
+	// Database configuration
+	Database DatabaseConfig
+
+	// Blockchain configuration
+	Blockchain BlockchainConfig
+
+	// Polymarket configuration
+	Polymarket PolymarketConfig
+
+	// Redis configuration
+	Redis RedisConfig
+
+	// Security configuration
+	Security SecurityConfig
+
+	// Trading configuration
+	Trading TradingConfig
+
+	// Application configuration
+	App AppConfig
+
+	// Gnosis Safe configuration
+	GnosisSafe GnosisSafeConfig
+}
+
+// TelegramConfig holds Telegram bot configuration
+type TelegramConfig struct {
+	BotToken string
+}
+
+// DatabaseConfig holds database configuration
+type DatabaseConfig struct {
+	URL               string
+	MaxConnections    int
+	MaxIdleConns      int
+	ConnMaxLifetime   time.Duration
+	ConnMaxIdleTime   time.Duration
+}
+
+// BlockchainConfig holds blockchain configuration
+type BlockchainConfig struct {
+	PolygonRPCURL    string
+	DefaultGasPrice  uint64 // in Gwei
+	MaxGasPrice      uint64 // in Gwei
+	ChainID          int64
+}
+
+// PolymarketConfig holds Polymarket API configuration
+type PolymarketConfig struct {
+	CLOBAPIUrl string
+	DataAPIUrl string // Polymarket Data API for positions
+	APIKey     string
+	// ConditionalTokens contract address on Polygon
+	ConditionalTokensAddress string
+	// USDC contract address on Polygon
+	USDCAddress string
+	// CTFExchange contract address
+	CTFExchangeAddress string
+}
+
+// RedisConfig holds Redis configuration
+type RedisConfig struct {
+	URL string
+}
+
+// SecurityConfig holds security-related configuration
+type SecurityConfig struct {
+	EncryptionKey        string
+	RateLimitPerUser     int
+	RateLimitWindowMins  int
+	SessionTimeoutMins   int
+}
+
+// TradingConfig holds trading-related configuration
+type TradingConfig struct {
+	DefaultSlippagePercent float64
+	MaxOrderSizeUSDC       float64
+	MinOrderSizeUSDC       float64
+}
+
+// AppConfig holds general application configuration
+type AppConfig struct {
+	Environment string
+	LogLevel    string
+	Port        int
+}
+
+// GnosisSafeConfig holds Gnosis Safe configuration
+type GnosisSafeConfig struct {
+	FactoryAddress   string
+	MasterCopyAddress string
+}
+
+// Load loads configuration from environment variables
+func Load() (*Config, error) {
+	// Load .env file if it exists (for local development)
+	if err := godotenv.Load(); err != nil {
+		// It's okay if .env doesn't exist in production
+		log.Printf("No .env file found: %v", err)
+	}
+
+	cfg := &Config{}
+
+	// Load Telegram configuration
+	cfg.Telegram.BotToken = getEnv("TELEGRAM_BOT_TOKEN", "")
+	if cfg.Telegram.BotToken == "" {
+		return nil, fmt.Errorf("TELEGRAM_BOT_TOKEN is required")
+	}
+
+	// Load Database configuration
+	cfg.Database.URL = getEnv("DATABASE_URL", "")
+	if cfg.Database.URL == "" {
+		return nil, fmt.Errorf("DATABASE_URL is required")
+	}
+	cfg.Database.MaxConnections = getEnvInt("DATABASE_MAX_CONNECTIONS", 25)
+	cfg.Database.MaxIdleConns = getEnvInt("DATABASE_MAX_IDLE_CONNECTIONS", 5)
+	cfg.Database.ConnMaxLifetime = time.Hour
+	cfg.Database.ConnMaxIdleTime = time.Minute * 10
+
+	// Load Blockchain configuration
+	cfg.Blockchain.PolygonRPCURL = getEnv("POLYGON_RPC_URL", "")
+	if cfg.Blockchain.PolygonRPCURL == "" {
+		return nil, fmt.Errorf("POLYGON_RPC_URL is required")
+	}
+	cfg.Blockchain.DefaultGasPrice = uint64(getEnvInt("DEFAULT_GAS_PRICE", 30))
+	cfg.Blockchain.MaxGasPrice = uint64(getEnvInt("MAX_GAS_PRICE", 200))
+
+	// Determine chain ID based on RPC URL (Mumbai testnet or Polygon mainnet)
+	if contains(cfg.Blockchain.PolygonRPCURL, "mumbai") {
+		cfg.Blockchain.ChainID = 80001 // Mumbai testnet
+	} else {
+		cfg.Blockchain.ChainID = 137 // Polygon mainnet
+	}
+
+	// Load Polymarket configuration
+	cfg.Polymarket.CLOBAPIUrl = getEnv("POLYMARKET_CLOB_API_URL", "https://clob.polymarket.com")
+	cfg.Polymarket.DataAPIUrl = getEnv("POLYMARKET_DATA_API_URL", "https://data-api.polymarket.com")
+	cfg.Polymarket.APIKey = getEnv("POLYMARKET_API_KEY", "")
+	// Contract addresses from the spec
+	cfg.Polymarket.ConditionalTokensAddress = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+	cfg.Polymarket.USDCAddress = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174" // USDC on Polygon
+	cfg.Polymarket.CTFExchangeAddress = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E" // CTFExchange on Polygon
+
+	// Load Redis configuration
+	cfg.Redis.URL = getEnv("REDIS_URL", "redis://localhost:6379/0")
+
+	// Load Security configuration
+	cfg.Security.EncryptionKey = getEnv("ENCRYPTION_KEY", "")
+	if cfg.Security.EncryptionKey == "" {
+		return nil, fmt.Errorf("ENCRYPTION_KEY is required")
+	}
+	cfg.Security.RateLimitPerUser = getEnvInt("RATE_LIMIT_PER_USER", 60)
+	cfg.Security.RateLimitWindowMins = getEnvInt("RATE_LIMIT_WINDOW_MINUTES", 1)
+	cfg.Security.SessionTimeoutMins = getEnvInt("SESSION_TIMEOUT_MINUTES", 30)
+
+	// Load Trading configuration
+	cfg.Trading.DefaultSlippagePercent = getEnvFloat("DEFAULT_SLIPPAGE_PERCENT", 2.0)
+	cfg.Trading.MaxOrderSizeUSDC = getEnvFloat("MAX_ORDER_SIZE_USDC", 10000.0)
+	cfg.Trading.MinOrderSizeUSDC = getEnvFloat("MIN_ORDER_SIZE_USDC", 1.0)
+
+	// Load App configuration
+	cfg.App.Environment = getEnv("ENVIRONMENT", "development")
+	cfg.App.LogLevel = getEnv("LOG_LEVEL", "debug")
+	cfg.App.Port = getEnvInt("PORT", 8080)
+
+	// Load Gnosis Safe configuration
+	cfg.GnosisSafe.FactoryAddress = getEnv("GNOSIS_SAFE_FACTORY_ADDRESS", "0xa6B71E26C5e0845f74c812102Ca7114b6a896AB2")
+	cfg.GnosisSafe.MasterCopyAddress = getEnv("GNOSIS_SAFE_MASTER_COPY", "0xd9Db270c1B5E3Bd161E8c8503c55cEABeE709552")
+
+	return cfg, nil
+}
+
+// Helper functions
+
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if intVal, err := strconv.Atoi(value); err == nil {
+			return intVal
+		}
+	}
+	return defaultValue
+}
+
+func getEnvFloat(key string, defaultValue float64) float64 {
+	if value := os.Getenv(key); value != "" {
+		if floatVal, err := strconv.ParseFloat(value, 64); err == nil {
+			return floatVal
+		}
+	}
+	return defaultValue
+}
+
+func getEnvBool(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		if boolVal, err := strconv.ParseBool(value); err == nil {
+			return boolVal
+		}
+	}
+	return defaultValue
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		(len(s) > 0 && len(substr) > 0 && s[0:len(substr)] == substr) ||
+		(len(s) > len(substr) && s[len(s)-len(substr):] == substr) ||
+		(len(s) > len(substr) && findSubstring(s, substr)))
+}
+
+func findSubstring(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+// Validate validates the configuration
+func (c *Config) Validate() error {
+	// Validate trading configuration
+	if c.Trading.MinOrderSizeUSDC > c.Trading.MaxOrderSizeUSDC {
+		return fmt.Errorf("MIN_ORDER_SIZE_USDC cannot be greater than MAX_ORDER_SIZE_USDC")
+	}
+
+	if c.Trading.DefaultSlippagePercent < 0 || c.Trading.DefaultSlippagePercent > 100 {
+		return fmt.Errorf("DEFAULT_SLIPPAGE_PERCENT must be between 0 and 100")
+	}
+
+	// Validate gas prices
+	if c.Blockchain.DefaultGasPrice > c.Blockchain.MaxGasPrice {
+		return fmt.Errorf("DEFAULT_GAS_PRICE cannot be greater than MAX_GAS_PRICE")
+	}
+
+	// Validate encryption key length (should be 32 bytes hex encoded = 64 characters)
+	if len(c.Security.EncryptionKey) != 64 {
+		return fmt.Errorf("ENCRYPTION_KEY must be 64 characters (32 bytes hex encoded)")
+	}
+
+	return nil
+}

@@ -1,0 +1,1824 @@
+package telegram
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/Catorpilor/poly/internal/blockchain"
+	"github.com/Catorpilor/poly/internal/config"
+	"github.com/Catorpilor/poly/internal/database"
+	"github.com/Catorpilor/poly/internal/database/repositories"
+	"github.com/Catorpilor/poly/internal/polymarket"
+	"github.com/Catorpilor/poly/internal/wallet"
+)
+
+// Bot represents the Telegram bot
+type Bot struct {
+	api           *tgbotapi.BotAPI
+	config        *config.Config
+	db            *database.DB
+	userRepo      repositories.UserRepository
+	handlers      map[string]CommandHandler
+	rateLimiter   *RateLimiter
+	stateManager  *StateManager
+	walletManager *wallet.Manager
+	blockchain    *blockchain.Client
+	proxyResolver *polymarket.ProxyResolver
+	tradingClient *polymarket.TradingClient
+}
+
+// CommandHandler is a function that handles a command
+type CommandHandler func(ctx context.Context, bot *Bot, update *tgbotapi.Update) error
+
+// NewBot creates a new Telegram bot instance
+func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
+	api, err := tgbotapi.NewBotAPI(cfg.Telegram.BotToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create bot API: %w", err)
+	}
+
+	// Set debug mode based on environment
+	api.Debug = cfg.App.Environment == "development"
+
+	// Create wallet manager
+	walletManager, err := wallet.NewManager(cfg.Security.EncryptionKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create wallet manager: %w", err)
+	}
+
+	// Create blockchain client
+	blockchainClient, err := blockchain.NewClient(&cfg.Blockchain)
+	if err != nil {
+		log.Printf("Warning: Failed to create blockchain client: %v", err)
+		// Don't fail completely, just log the error
+		blockchainClient = nil
+	}
+
+	// Create proxy resolver
+	proxyResolver := polymarket.NewProxyResolver(&cfg.Polymarket)
+
+	// Create trading client
+	tradingClient := polymarket.NewTradingClient(cfg.Polymarket.CLOBAPIUrl, cfg.Blockchain.ChainID)
+
+	bot := &Bot{
+		api:           api,
+		config:        cfg,
+		db:            db,
+		userRepo:      repositories.NewUserRepository(db),
+		handlers:      make(map[string]CommandHandler),
+		rateLimiter:   NewRateLimiter(cfg.Security.RateLimitPerUser, time.Duration(cfg.Security.RateLimitWindowMins)*time.Minute),
+		stateManager:  NewStateManager(),
+		walletManager: walletManager,
+		blockchain:    blockchainClient,
+		proxyResolver: proxyResolver,
+		tradingClient: tradingClient,
+	}
+
+	// Register command handlers
+	bot.registerHandlers()
+
+	log.Printf("Authorized on account %s", api.Self.UserName)
+
+	return bot, nil
+}
+
+// registerHandlers registers all command handlers
+func (b *Bot) registerHandlers() {
+	b.handlers["/start"] = b.handleStart
+	b.handlers["/wallet"] = b.handleWallet
+	b.handlers["/import"] = b.handleImport
+	b.handlers["/export"] = b.handleExport
+	b.handlers["/markets"] = b.handleMarkets
+	b.handlers["/market"] = b.handleMarket
+	b.handlers["/buy"] = b.handleBuy
+	b.handlers["/sell"] = b.handleSell
+	b.handlers["/orders"] = b.handleOrders
+	b.handlers["/cancel"] = b.handleCancel
+	b.handlers["/positions"] = b.handlePositions
+	b.handlers["/pnl"] = b.handlePNL
+	b.handlers["/history"] = b.handleHistory
+	b.handlers["/settings"] = b.handleSettings
+	b.handlers["/alerts"] = b.handleAlerts
+	b.handlers["/gas"] = b.handleGas
+	b.handlers["/help"] = b.handleHelp
+	b.handlers["/refresh"] = b.handleRefresh
+}
+
+// Start starts the bot and begins listening for updates
+func (b *Bot) Start(ctx context.Context) error {
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = 60
+
+	updates := b.api.GetUpdatesChan(u)
+
+	// Set bot commands for the menu
+	commands := []tgbotapi.BotCommand{
+		{Command: "start", Description: "Initialize bot and create/import wallet"},
+		{Command: "wallet", Description: "Show wallet addresses and balances"},
+		{Command: "import", Description: "Import existing wallet"},
+		{Command: "markets", Description: "List active markets"},
+		{Command: "market", Description: "Show market details"},
+		{Command: "buy", Description: "Buy YES or NO tokens"},
+		{Command: "sell", Description: "Sell YES or NO tokens"},
+		{Command: "orders", Description: "Show open orders"},
+		{Command: "positions", Description: "Show all positions"},
+		{Command: "pnl", Description: "Calculate unrealized P&L"},
+		{Command: "help", Description: "Show help message"},
+	}
+
+	cmdConfig := tgbotapi.NewSetMyCommands(commands...)
+	_, err := b.api.Request(cmdConfig)
+	if err != nil {
+		log.Printf("Failed to set bot commands: %v", err)
+	}
+
+	log.Println("Bot started successfully. Listening for updates...")
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Bot stopping due to context cancellation")
+			return ctx.Err()
+
+		case update := <-updates:
+			go b.handleUpdate(ctx, update)
+		}
+	}
+}
+
+// handleUpdate handles incoming updates
+func (b *Bot) handleUpdate(ctx context.Context, update tgbotapi.Update) {
+	// Handle callback queries (inline keyboard buttons)
+	if update.CallbackQuery != nil {
+		b.handleCallbackQuery(ctx, &update)
+		return
+	}
+
+	// Handle only messages for now
+	if update.Message == nil {
+		return
+	}
+
+	// Check rate limiting
+	userID := update.Message.From.ID
+	if !b.rateLimiter.Allow(userID) {
+		b.sendMessage(update.Message.Chat.ID,
+			"⚠️ Rate limit exceeded. Please wait a moment before sending more commands.")
+		return
+	}
+
+	// Log the received message
+	log.Printf("[%s] %s", update.Message.From.UserName, update.Message.Text)
+
+	// Handle deep links first (start with parameters) - must check before IsCommand()
+	// because /start with params is still detected as a command
+	if strings.HasPrefix(update.Message.Text, "/start ") {
+		b.handleDeepLink(ctx, &update)
+		return
+	}
+
+	// Check if it's a command
+	if update.Message.IsCommand() {
+		b.handleCommand(ctx, update)
+		return
+	}
+
+	// Handle regular text messages (could be responses to prompts)
+	b.handleTextMessage(ctx, &update)
+}
+
+// handleCommand routes commands to their handlers
+func (b *Bot) handleCommand(ctx context.Context, update tgbotapi.Update) {
+	command := update.Message.Command()
+	handler, exists := b.handlers["/"+command]
+
+	if !exists {
+		b.sendMessage(update.Message.Chat.ID,
+			"❓ Unknown command. Type /help to see available commands.")
+		return
+	}
+
+	// Execute the handler
+	if err := handler(ctx, b, &update); err != nil {
+		log.Printf("Error handling command /%s: %v", command, err)
+		b.sendMessage(update.Message.Chat.ID,
+			fmt.Sprintf("❌ Error executing command: %v", err))
+	}
+}
+
+// handleDeepLink handles deep links with start parameters
+// Supported formats:
+//   - /start m_<marketID> - View market details
+//   - /start (no param) - Normal start
+func (b *Bot) handleDeepLink(ctx context.Context, update *tgbotapi.Update) {
+	// Extract the parameter from "/start parameter"
+	parts := strings.SplitN(update.Message.Text, " ", 2)
+	if len(parts) != 2 {
+		b.handleStart(ctx, b, update)
+		return
+	}
+
+	parameter := parts[1]
+	log.Printf("Received deep link with parameter: %s", parameter)
+
+	// Handle market deep links: m_<marketID>
+	if strings.HasPrefix(parameter, "m_") {
+		marketID := strings.TrimPrefix(parameter, "m_")
+		b.handleMarketByID(ctx, update, marketID)
+		return
+	}
+
+	// Unknown parameter, just start normally
+	b.handleStart(ctx, b, update)
+}
+
+// handleMarketByID fetches and displays market by ID (used by deep links)
+func (b *Bot) handleMarketByID(ctx context.Context, update *tgbotapi.Update, marketID string) {
+	chatID := update.Message.Chat.ID
+
+	// Fetch market details from Gamma API
+	marketClient := polymarket.NewMarketClient()
+	market, err := marketClient.GetMarketByID(ctx, marketID)
+	if err != nil {
+		b.sendMessage(chatID, fmt.Sprintf("❌ Market not found: %s", marketID))
+		return
+	}
+
+	// Get outcomes and prices - they should be in the same order
+	outcomes := market.GetOutcomes()
+	prices := market.GetOutcomePrices()
+
+	log.Printf("handleMarketLink: market=%s, outcomes=%v, prices=%v", market.ID, outcomes, prices)
+
+	// Determine outcome labels and prices
+	// outcomes[i] corresponds to prices[i] and clobTokenIds[i]
+	outcome0Label := "Yes"
+	outcome1Label := "No"
+	if len(outcomes) >= 2 {
+		// Use actual outcome names if not "Yes"/"No"
+		o0 := strings.ToLower(outcomes[0])
+		o1 := strings.ToLower(outcomes[1])
+		if o0 != "yes" && o0 != "no" {
+			outcome0Label = outcomes[0]
+		}
+		if o1 != "yes" && o1 != "no" {
+			outcome1Label = outcomes[1]
+		}
+	}
+
+	// Get prices - outcomes[0] has prices[0], outcomes[1] has prices[1]
+	price0, price1 := 0.0, 0.0
+	if len(prices) >= 2 {
+		fmt.Sscanf(prices[0], "%f", &price0)
+		fmt.Sscanf(prices[1], "%f", &price1)
+	}
+
+	// Format end date
+	endDate := market.EndDate
+	if len(endDate) > 10 {
+		endDate = endDate[:10]
+	}
+
+	message := fmt.Sprintf(`📈 *%s*
+
+*Current Prices:*
+   %s: %s
+   %s: %s
+
+*Market Stats:*
+   24h Volume: %s
+   Total Volume: %s
+   Liquidity: %s
+
+*Status:* %s
+*End Date:* %s
+`,
+		market.Question,
+		outcome0Label, polymarket.FormatPrice(price0),
+		outcome1Label, polymarket.FormatPrice(price1),
+		polymarket.FormatVolume(market.Volume24hr),
+		polymarket.FormatVolume(market.Volume),
+		polymarket.FormatVolume(market.Liquidity),
+		getMarketStatusFromBot(market),
+		endDate,
+	)
+
+	// Create buy buttons using index 0 and 1 instead of yes/no
+	// This ensures the button matches the displayed price
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("📈 Buy %s", outcome0Label), fmt.Sprintf("buy:0:%s", market.ID)),
+			tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("📉 Buy %s", outcome1Label), fmt.Sprintf("buy:1:%s", market.ID)),
+		),
+	)
+
+	b.sendMessageWithKeyboard(chatID, message, keyboard)
+}
+
+// getMarketStatusFromBot returns market status (duplicate to avoid import cycle)
+func getMarketStatusFromBot(market *polymarket.GammaMarket) string {
+	if market.Closed {
+		return "Closed"
+	}
+	if !market.AcceptingOrders {
+		return "Not accepting orders"
+	}
+	return "Active"
+}
+
+// handleTextMessage handles regular text messages
+func (b *Bot) handleTextMessage(ctx context.Context, update *tgbotapi.Update) {
+	userID := update.Message.From.ID
+	chatID := update.Message.Chat.ID
+
+	// Check if user is in a specific state
+	userCtx, exists := b.stateManager.GetState(userID)
+	if !exists {
+		// No state, just inform user to use commands
+		b.sendMessage(chatID,
+			"💬 Please use commands to interact with the bot. Type /help for available commands.")
+		return
+	}
+
+	// Handle based on state
+	switch userCtx.State {
+	case StateWaitingForKey:
+		// User is sending their private key
+		b.handlePrivateKeyInput(ctx, update)
+
+	case StateWaitingForAmount:
+		// User is entering custom amount
+		b.handleCustomAmountInput(ctx, update, userCtx)
+
+	case StateWaitingForLimitPrice:
+		// User is entering limit price for sell order
+		b.handleLimitPriceInput(ctx, update, userCtx)
+
+	default:
+		b.sendMessage(chatID,
+			"💬 I received your message. Please use commands to interact with the bot. Type /help for available commands.")
+	}
+}
+
+// handleCustomAmountInput handles when user enters a custom amount
+func (b *Bot) handleCustomAmountInput(ctx context.Context, update *tgbotapi.Update, userCtx *UserContext) {
+	chatID := update.Message.Chat.ID
+	userID := update.Message.From.ID
+	text := strings.TrimSpace(update.Message.Text)
+
+	// Clear state
+	b.stateManager.ClearState(userID)
+
+	// Check for cancel
+	if strings.ToLower(text) == "/cancel" {
+		b.sendMessage(chatID, "❌ Order cancelled.")
+		return
+	}
+
+	// Parse amount
+	var amount float64
+	text = strings.TrimPrefix(text, "$")
+	if _, err := fmt.Sscanf(text, "%f", &amount); err != nil || amount <= 0 {
+		b.sendMessage(chatID, "❌ Invalid amount. Please enter a positive number (e.g., 75)")
+		return
+	}
+
+	// Get order context from state - now uses outcome_index instead of outcome
+	outcomeIndexStr, _ := userCtx.Data["outcome_index"].(string)
+	marketID, _ := userCtx.Data["market_id"].(string)
+
+	if outcomeIndexStr == "" || marketID == "" {
+		b.sendMessage(chatID, "❌ Order context lost. Please start again with /market")
+		return
+	}
+
+	// Parse outcome index
+	outcomeIndex, err := strconv.Atoi(outcomeIndexStr)
+	if err != nil || (outcomeIndex != 0 && outcomeIndex != 1) {
+		b.sendMessage(chatID, "❌ Invalid outcome. Please start again with /market")
+		return
+	}
+
+	// Check if user has wallet
+	user, err := b.userRepo.GetByTelegramID(ctx, userID)
+	if err != nil || user == nil {
+		b.sendMessage(chatID, "❌ You need to set up a wallet first. Use /start")
+		return
+	}
+
+	// Fetch market info for display
+	marketClient := polymarket.NewMarketClient()
+	market, _ := marketClient.GetMarketByID(ctx, marketID)
+	marketName := marketID
+	outcomeName := fmt.Sprintf("index_%d", outcomeIndex)
+	if market != nil {
+		marketName = market.Question
+		if len(marketName) > 40 {
+			marketName = marketName[:37] + "..."
+		}
+		// Get actual outcome name
+		outcomes := market.GetOutcomes()
+		if outcomeIndex < len(outcomes) {
+			outcomeName = outcomes[outcomeIndex]
+		}
+	}
+
+	// Show processing message
+	b.sendMessage(chatID, fmt.Sprintf(`⏳ *Processing Order...*
+
+*Market:* %s
+*Side:* Buy %s
+*Amount:* $%.2f
+
+Please wait...`, marketName, outcomeName, amount))
+
+	// Execute the trade using index
+	result := b.executeBuyOrderByIndex(ctx, user, market, outcomeIndex, amount)
+
+	// Show result
+	if result.Success {
+		message := fmt.Sprintf(`✅ *Order Executed Successfully!*
+
+*Market:* %s
+*Side:* Buy %s
+*Amount:* $%.2f
+*Order ID:* %s
+
+Use /positions to check your positions.
+`, marketName, outcomeName, amount, result.OrderID)
+		b.sendMessage(chatID, message)
+	} else {
+		message := fmt.Sprintf(`❌ *Order Failed*
+
+*Market:* %s
+*Error:* %s
+
+Please try again or contact support.
+`, marketName, result.ErrorMsg)
+		b.sendMessage(chatID, message)
+	}
+}
+
+// sendMessage sends a message to a chat
+func (b *Bot) sendMessage(chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "Markdown"
+	msg.DisableWebPagePreview = true
+
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("Error sending message: %v", err)
+	}
+}
+
+// sendMessageAndReturn sends a message and returns the sent message
+func (b *Bot) sendMessageAndReturn(chatID int64, text string) tgbotapi.Message {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "Markdown"
+	msg.DisableWebPagePreview = true
+
+	sent, err := b.api.Send(msg)
+	if err != nil {
+		log.Printf("Error sending message: %v", err)
+		return tgbotapi.Message{}
+	}
+	return sent
+}
+
+// sendMessageWithKeyboard sends a message with an inline keyboard
+func (b *Bot) sendMessageWithKeyboard(chatID int64, text string, keyboard tgbotapi.InlineKeyboardMarkup) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "Markdown"
+	msg.DisableWebPagePreview = true
+	msg.ReplyMarkup = keyboard
+
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("Error sending message with keyboard: %v", err)
+	}
+}
+
+// deleteMessage deletes a message (useful for sensitive data)
+func (b *Bot) deleteMessage(chatID int64, messageID int) {
+	deleteConfig := tgbotapi.NewDeleteMessage(chatID, messageID)
+	if _, err := b.api.Request(deleteConfig); err != nil {
+		log.Printf("Error deleting message: %v", err)
+	}
+}
+
+// handleCallbackQuery handles inline keyboard button callbacks
+func (b *Bot) handleCallbackQuery(ctx context.Context, update *tgbotapi.Update) {
+	// Answer the callback query to remove the loading state
+	callback := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
+	if _, err := b.api.Request(callback); err != nil {
+		log.Printf("Error answering callback: %v", err)
+	}
+
+	data := update.CallbackQuery.Data
+	chatID := update.CallbackQuery.Message.Chat.ID
+
+	// Handle based on callback data
+	switch {
+	case data == "create_wallet":
+		b.handleCreateWallet(ctx, update)
+
+	case data == "import_wallet":
+		b.handleImportWalletCallback(ctx, update)
+
+	case strings.HasPrefix(data, "buy:"):
+		b.handleBuyCallback(ctx, update)
+
+	case strings.HasPrefix(data, "amt:"):
+		b.handleAmountCallback(ctx, update)
+
+	case strings.HasPrefix(data, "cust:"):
+		b.handleCustomAmountCallback(ctx, update)
+
+	case data == "cancel_order":
+		b.editMessage(chatID, update.CallbackQuery.Message.MessageID, "❌ Order cancelled.")
+
+	case data == "refresh_positions":
+		b.handleRefreshPositions(ctx, update)
+
+	case data == "sell_positions":
+		b.handleSellPositions(ctx, update)
+
+	case strings.HasPrefix(data, "sellpos:"):
+		b.handleSellPositionDetail(ctx, update)
+
+	case strings.HasPrefix(data, "sellqty:"):
+		b.handleSellQuantityCallback(ctx, update)
+
+	case strings.HasPrefix(data, "sell:"):
+		b.handleSellAmountCallback(ctx, update)
+
+	case data == "back_to_positions":
+		b.handleRefreshPositions(ctx, update)
+
+	case data == "refresh_orders":
+		b.handleRefreshOrders(ctx, update)
+
+	case data == "cancel_all_orders":
+		b.handleCancelAllOrders(ctx, update)
+
+	default:
+		log.Printf("Unknown callback data: %s", data)
+	}
+}
+
+// handleImportWalletCallback handles the import wallet button
+func (b *Bot) handleImportWalletCallback(ctx context.Context, update *tgbotapi.Update) {
+	userID := update.CallbackQuery.From.ID
+	chatID := update.CallbackQuery.Message.Chat.ID
+
+	// Check if user already has a wallet
+	existingUser, err := b.userRepo.GetByTelegramID(ctx, userID)
+	if err != nil {
+		b.sendMessage(chatID, "❌ Failed to check existing wallet. Please try again.")
+		return
+	}
+
+	if existingUser != nil {
+		b.sendMessage(chatID, "⚠️ You already have a wallet set up.")
+		return
+	}
+
+	message := `
+🔐 *Import Your Wallet*
+
+⚠️ *IMPORTANT SECURITY NOTICE:*
+• Send your private key in the next message
+• The message will be deleted immediately
+• Your key will be encrypted before storage
+• Never share your private key with anyone else
+
+Please send your private key now (it should start with 0x or be 64 characters long).
+
+_Type /cancel to abort the import process._
+`
+	b.sendMessage(chatID, message)
+	b.stateManager.SetState(userID, StateWaitingForKey, nil, 5*time.Minute)
+}
+
+// handleBuyCallback handles Buy button clicks - shows amount selection
+// Callback format: "buy:INDEX:marketID" where INDEX is 0 or 1
+func (b *Bot) handleBuyCallback(ctx context.Context, update *tgbotapi.Update) {
+	chatID := update.CallbackQuery.Message.Chat.ID
+	messageID := update.CallbackQuery.Message.MessageID
+
+	// Parse callback data: "buy:0:id" or "buy:1:id" (index-based)
+	parts := strings.Split(update.CallbackQuery.Data, ":")
+	if len(parts) != 3 {
+		return
+	}
+	outcomeIndex := parts[1] // "0" or "1"
+	marketID := parts[2]
+
+	// Fetch market info to show in the order UI
+	marketClient := polymarket.NewMarketClient()
+	market, err := marketClient.GetMarketByID(ctx, marketID)
+	if err != nil {
+		b.sendMessage(chatID, "❌ Failed to fetch market info.")
+		return
+	}
+
+	// Get the actual outcome name based on index
+	outcomes := market.GetOutcomes()
+	outcomeName := "Unknown"
+	if outcomeIndex == "0" && len(outcomes) > 0 {
+		outcomeName = outcomes[0]
+	} else if outcomeIndex == "1" && len(outcomes) > 1 {
+		outcomeName = outcomes[1]
+	}
+
+	log.Printf("handleBuyCallback: market=%s, outcomeIndex=%s, outcomeName=%s, outcomes=%v",
+		marketID, outcomeIndex, outcomeName, outcomes)
+
+	// Truncate question if too long
+	question := market.Question
+	if len(question) > 50 {
+		question = question[:47] + "..."
+	}
+
+	message := fmt.Sprintf(`🎯 *Buy Order*
+
+*Market:* %s
+*Outcome:* %s
+
+───────────────
+
+💰 *Select amount or enter custom amount:*
+`, question, outcomeName)
+
+	// Create amount selection keyboard - pass index for consistent lookup
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("💵 $10", fmt.Sprintf("amt:10:%s:%s", outcomeIndex, marketID)),
+			tgbotapi.NewInlineKeyboardButtonData("💰 $25", fmt.Sprintf("amt:25:%s:%s", outcomeIndex, marketID)),
+			tgbotapi.NewInlineKeyboardButtonData("💎 $50", fmt.Sprintf("amt:50:%s:%s", outcomeIndex, marketID)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🚀 $100", fmt.Sprintf("amt:100:%s:%s", outcomeIndex, marketID)),
+			tgbotapi.NewInlineKeyboardButtonData("🌟 $250", fmt.Sprintf("amt:250:%s:%s", outcomeIndex, marketID)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("✏️ Custom Amount", fmt.Sprintf("cust:%s:%s", outcomeIndex, marketID)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "cancel_order"),
+		),
+	)
+
+	b.editMessageWithKeyboard(chatID, messageID, message, keyboard)
+}
+
+// handleAmountCallback handles amount selection
+func (b *Bot) handleAmountCallback(ctx context.Context, update *tgbotapi.Update) {
+	chatID := update.CallbackQuery.Message.Chat.ID
+	messageID := update.CallbackQuery.Message.MessageID
+	userID := update.CallbackQuery.From.ID
+
+	// Parse callback data: "amt:100:INDEX:marketID" where INDEX is 0 or 1
+	parts := strings.Split(update.CallbackQuery.Data, ":")
+	if len(parts) != 4 {
+		return
+	}
+	amountStr := parts[1]
+	outcomeIndex := parts[2] // "0" or "1"
+	marketID := parts[3]
+
+	// Parse amount
+	amount, err := strconv.ParseFloat(amountStr, 64)
+	if err != nil {
+		b.editMessage(chatID, messageID, "❌ Invalid amount")
+		return
+	}
+
+	// Parse outcome index
+	idx, err := strconv.Atoi(outcomeIndex)
+	if err != nil || (idx != 0 && idx != 1) {
+		b.editMessage(chatID, messageID, "❌ Invalid outcome")
+		return
+	}
+
+	// Check if user has wallet
+	user, err := b.userRepo.GetByTelegramID(ctx, userID)
+	if err != nil || user == nil {
+		b.editMessage(chatID, messageID, "❌ You need to set up a wallet first. Use /start")
+		return
+	}
+
+	// Fetch market info
+	marketClient := polymarket.NewMarketClient()
+	market, err := marketClient.GetMarketByID(ctx, marketID)
+	if err != nil {
+		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Failed to fetch market: %v", err))
+		return
+	}
+
+	// Get outcome name for display
+	outcomes := market.GetOutcomes()
+	outcomeName := "Unknown"
+	if idx < len(outcomes) {
+		outcomeName = outcomes[idx]
+	}
+
+	log.Printf("handleAmountCallback: market=%s, outcomeIndex=%d, outcomeName=%s, outcomes=%v",
+		marketID, idx, outcomeName, outcomes)
+
+	marketName := market.Question
+	if len(marketName) > 40 {
+		marketName = marketName[:37] + "..."
+	}
+
+	// Show processing message
+	b.editMessage(chatID, messageID, fmt.Sprintf(`⏳ *Processing Order...*
+
+*Market:* %s
+*Side:* Buy %s
+*Amount:* $%.2f
+
+Please wait...`, marketName, outcomeName, amount))
+
+	// Execute the trade using index
+	result := b.executeBuyOrderByIndex(ctx, user, market, idx, amount)
+
+	// Show result
+	if result.Success {
+		message := fmt.Sprintf(`✅ *Order Executed Successfully!*
+
+*Market:* %s
+*Side:* Buy %s
+*Amount:* $%.2f
+*Order ID:* %s
+
+Use /positions to check your positions.
+`, marketName, outcomeName, amount, result.OrderID)
+		b.editMessage(chatID, messageID, message)
+	} else {
+		message := fmt.Sprintf(`❌ *Order Failed*
+
+*Market:* %s
+*Error:* %s
+
+Please try again or contact support.
+`, marketName, result.ErrorMsg)
+		b.editMessage(chatID, messageID, message)
+	}
+}
+
+// handleCustomAmountCallback handles custom amount input
+func (b *Bot) handleCustomAmountCallback(ctx context.Context, update *tgbotapi.Update) {
+	chatID := update.CallbackQuery.Message.Chat.ID
+	userID := update.CallbackQuery.From.ID
+
+	// Parse callback data: "cust:INDEX:marketID" where INDEX is 0 or 1
+	parts := strings.Split(update.CallbackQuery.Data, ":")
+	if len(parts) != 3 {
+		return
+	}
+	outcomeIndex := parts[1] // "0" or "1"
+	marketID := parts[2]
+
+	message := `✏️ *Enter Custom Amount*
+
+Please enter the amount in USD (e.g., "75" for $75):
+
+_Type /cancel to abort._
+`
+
+	b.sendMessage(chatID, message)
+
+	// Store order context in state with outcome INDEX (not name)
+	b.stateManager.SetState(userID, StateWaitingForAmount, map[string]interface{}{
+		"outcome_index": outcomeIndex,
+		"market_id":     marketID,
+	}, 5*time.Minute)
+}
+
+// handleRefreshPositions handles the refresh positions button callback
+func (b *Bot) handleRefreshPositions(ctx context.Context, update *tgbotapi.Update) {
+	userID := update.CallbackQuery.From.ID
+	chatID := update.CallbackQuery.Message.Chat.ID
+	messageID := update.CallbackQuery.Message.MessageID
+
+	// Get user
+	user, err := b.userRepo.GetByTelegramID(ctx, userID)
+	if err != nil || user == nil {
+		b.editMessage(chatID, messageID, "❌ User not found. Please use /start to set up your wallet.")
+		return
+	}
+
+	if user.ProxyAddress == "" {
+		b.editMessage(chatID, messageID, "❌ No proxy wallet found. Please ensure you have traded on Polymarket.")
+		return
+	}
+
+	// Show loading state
+	b.editMessage(chatID, messageID, "🔄 *Refreshing positions...*\n\n_Scanning blockchain activity..._")
+
+	// Fetch positions
+	if b.blockchain != nil {
+		proxyAddr := common.HexToAddress(user.ProxyAddress)
+
+		unifiedScanner := polymarket.NewUnifiedPositionScanner(b.blockchain.GetClient())
+		summary, err := unifiedScanner.ScanAllStrategies(ctx, proxyAddr)
+
+		if err != nil {
+			log.Printf("Unified position scan error: %v", err)
+		}
+
+		// Build full message with footer
+		fullMessage := summary
+		if err == nil {
+			fullMessage += `
+
+💡 *Tips:*
+• Positions shown are from recent activity
+• For complete history, visit Polymarket.com
+• Use /wallet to check your USDC balance`
+		}
+
+		// Add refresh and sell buttons
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "refresh_positions"),
+				tgbotapi.NewInlineKeyboardButtonData("💰 Sell", "sell_positions"),
+			),
+		)
+
+		b.editMessageWithKeyboard(chatID, messageID, fullMessage, keyboard)
+	} else {
+		b.editMessage(chatID, messageID, "❌ Blockchain connection unavailable.")
+	}
+}
+
+// handleSellPositions shows the list of positions available for selling
+func (b *Bot) handleSellPositions(ctx context.Context, update *tgbotapi.Update) {
+	userID := update.CallbackQuery.From.ID
+	chatID := update.CallbackQuery.Message.Chat.ID
+	messageID := update.CallbackQuery.Message.MessageID
+
+	// Get user
+	user, err := b.userRepo.GetByTelegramID(ctx, userID)
+	if err != nil || user == nil {
+		b.editMessage(chatID, messageID, "❌ User not found. Please use /start to set up your wallet.")
+		return
+	}
+
+	if user.ProxyAddress == "" {
+		b.editMessage(chatID, messageID, "❌ No proxy wallet found. Please ensure you have traded on Polymarket.")
+		return
+	}
+
+	// Show loading
+	b.editMessage(chatID, messageID, "💰 *Loading positions for sale...*")
+
+	// Fetch positions
+	if b.blockchain == nil {
+		b.editMessage(chatID, messageID, "❌ Blockchain connection unavailable.")
+		return
+	}
+
+	proxyAddr := common.HexToAddress(user.ProxyAddress)
+	unifiedScanner := polymarket.NewUnifiedPositionScanner(b.blockchain.GetClient())
+	positions, err := unifiedScanner.GetPositions(ctx, proxyAddr)
+
+	if err != nil {
+		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Failed to fetch positions: %v", err))
+		return
+	}
+
+	if len(positions) == 0 {
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("← Back", "back_to_positions"),
+			),
+		)
+		b.editMessageWithKeyboard(chatID, messageID, "📊 *No positions to sell*\n\nYou don't have any active positions.", keyboard)
+		return
+	}
+
+	// Build position list with buttons
+	message := fmt.Sprintf("💰 *Select Position to Sell* (%d positions)\n\n", len(positions))
+
+	// Create buttons for each position (max 8 due to Telegram limits)
+	var rows [][]tgbotapi.InlineKeyboardButton
+	for i, pos := range positions {
+		if i >= 8 {
+			message += fmt.Sprintf("\n_...and %d more positions_", len(positions)-8)
+			break
+		}
+
+		// Truncate title
+		title := pos.MarketTitle
+		if len(title) > 25 {
+			title = title[:22] + "..."
+		}
+
+		// Format shares
+		sharesStr := polymarket.FormatShares(pos.Shares)
+
+		// Button text: "Title - 10.5 YES"
+		btnText := fmt.Sprintf("%s - %s %s", title, sharesStr, pos.Outcome)
+		if len(btnText) > 40 {
+			btnText = btnText[:37] + "..."
+		}
+
+		// Callback data: sellpos:<index>
+		// We use index because callback data is limited to 64 bytes
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(btnText, fmt.Sprintf("sellpos:%d", i)),
+		))
+	}
+
+	// Add back button
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("← Back to Positions", "back_to_positions"),
+	))
+
+	keyboard := tgbotapi.InlineKeyboardMarkup{InlineKeyboard: rows}
+	b.editMessageWithKeyboard(chatID, messageID, message, keyboard)
+
+	// Store positions in state for later access
+	b.stateManager.SetState(userID, StateSelectingPosition, map[string]interface{}{
+		"positions": positions,
+	}, 10*time.Minute)
+}
+
+// handleSellPositionDetail shows details for a specific position with sell options
+func (b *Bot) handleSellPositionDetail(ctx context.Context, update *tgbotapi.Update) {
+	userID := update.CallbackQuery.From.ID
+	chatID := update.CallbackQuery.Message.Chat.ID
+	messageID := update.CallbackQuery.Message.MessageID
+
+	// Parse position index from callback data: sellpos:<index>
+	parts := strings.Split(update.CallbackQuery.Data, ":")
+	if len(parts) != 2 {
+		b.editMessage(chatID, messageID, "❌ Invalid position selection.")
+		return
+	}
+
+	posIndex, err := strconv.Atoi(parts[1])
+	if err != nil {
+		b.editMessage(chatID, messageID, "❌ Invalid position index.")
+		return
+	}
+
+	// Get positions from state
+	userCtx, exists := b.stateManager.GetState(userID)
+	if !exists {
+		b.editMessage(chatID, messageID, "❌ Session expired. Please click 'Sell' again.")
+		return
+	}
+
+	positions, ok := userCtx.Data["positions"].([]*polymarket.Position)
+	if !ok || posIndex >= len(positions) {
+		b.editMessage(chatID, messageID, "❌ Position not found. Please try again.")
+		return
+	}
+
+	pos := positions[posIndex]
+
+	// Format position details
+	sharesStr := polymarket.FormatShares(pos.Shares)
+	message := fmt.Sprintf(`💰 *Sell Position*
+
+*Market:* %s
+*Outcome:* %s
+*Shares:* %s
+*Current Price:* $%.2f
+*Estimated Value:* $%.2f
+
+───────────────
+
+*Select amount to sell:*
+`, pos.MarketTitle, pos.Outcome, sharesStr, pos.CurrentPrice, pos.Value)
+
+	// Create sell amount buttons
+	// Callback format: sell:<percentage>:<posIndex>:market (for market order)
+	// Callback format: selllimit:<percentage>:<posIndex> (for limit order flow)
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("25%", fmt.Sprintf("sellqty:25:%d", posIndex)),
+			tgbotapi.NewInlineKeyboardButtonData("50%", fmt.Sprintf("sellqty:50:%d", posIndex)),
+			tgbotapi.NewInlineKeyboardButtonData("75%", fmt.Sprintf("sellqty:75:%d", posIndex)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("💯 Sell All", fmt.Sprintf("sellqty:100:%d", posIndex)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("← Back to Positions", "sell_positions"),
+			tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "back_to_positions"),
+		),
+	)
+
+	b.editMessageWithKeyboard(chatID, messageID, message, keyboard)
+}
+
+// handleSellQuantityCallback handles quantity selection and shows price options
+func (b *Bot) handleSellQuantityCallback(ctx context.Context, update *tgbotapi.Update) {
+	userID := update.CallbackQuery.From.ID
+	chatID := update.CallbackQuery.Message.Chat.ID
+	messageID := update.CallbackQuery.Message.MessageID
+
+	// Parse callback data: sellqty:<percentage>:<posIndex>
+	parts := strings.Split(update.CallbackQuery.Data, ":")
+	if len(parts) != 3 {
+		b.editMessage(chatID, messageID, "❌ Invalid parameters.")
+		return
+	}
+
+	percentage, err := strconv.Atoi(parts[1])
+	if err != nil || percentage <= 0 || percentage > 100 {
+		b.editMessage(chatID, messageID, "❌ Invalid percentage.")
+		return
+	}
+
+	posIndex, err := strconv.Atoi(parts[2])
+	if err != nil {
+		b.editMessage(chatID, messageID, "❌ Invalid position index.")
+		return
+	}
+
+	// Get positions from state
+	userCtx, exists := b.stateManager.GetState(userID)
+	if !exists {
+		b.editMessage(chatID, messageID, "❌ Session expired. Please start over with /positions.")
+		return
+	}
+
+	positions, ok := userCtx.Data["positions"].([]*polymarket.Position)
+	if !ok || posIndex >= len(positions) {
+		b.editMessage(chatID, messageID, "❌ Position not found. Please try again.")
+		return
+	}
+
+	pos := positions[posIndex]
+	sellValue := pos.Value * float64(percentage) / 100.0
+	sharesStr := polymarket.FormatShares(pos.Shares)
+
+	// Calculate shares to sell
+	posSharesRaw := pos.Shares.Int64()
+	sellSharesRaw := (posSharesRaw * int64(percentage)) / 100
+	sellSharesFormatted := fmt.Sprintf("%.2f", float64(sellSharesRaw)/1e6)
+
+	message := fmt.Sprintf(`💰 *Sell Order*
+
+*Market:* %s
+*Selling:* %d%% (%s of %s shares)
+*Estimated Value:* $%.2f
+*Current Price:* $%.2f
+
+───────────────
+
+*Choose order type:*
+
+📊 *Market Order* - Sell immediately at best available price
+📝 *Limit Order* - Set your minimum price
+`, pos.MarketTitle, percentage, sellSharesFormatted, sharesStr, sellValue, pos.CurrentPrice)
+
+	// Create order type buttons
+	// sell:<percentage>:<posIndex>:market - market order (immediate)
+	// sell:<percentage>:<posIndex>:limit - limit order (ask for price)
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📊 Market Order", fmt.Sprintf("sell:%d:%d:market", percentage, posIndex)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📝 Limit Order", fmt.Sprintf("sell:%d:%d:limit", percentage, posIndex)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("← Back", fmt.Sprintf("sellpos:%d", posIndex)),
+			tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "back_to_positions"),
+		),
+	)
+
+	b.editMessageWithKeyboard(chatID, messageID, message, keyboard)
+}
+
+// handleSellAmountCallback executes the sell order
+func (b *Bot) handleSellAmountCallback(ctx context.Context, update *tgbotapi.Update) {
+	userID := update.CallbackQuery.From.ID
+	chatID := update.CallbackQuery.Message.Chat.ID
+	messageID := update.CallbackQuery.Message.MessageID
+
+	// Parse callback data: sell:<percentage>:<posIndex>:<orderType>
+	// orderType is "market" or "limit"
+	parts := strings.Split(update.CallbackQuery.Data, ":")
+	if len(parts) != 4 {
+		b.editMessage(chatID, messageID, "❌ Invalid sell parameters.")
+		return
+	}
+
+	percentage, err := strconv.Atoi(parts[1])
+	if err != nil || percentage <= 0 || percentage > 100 {
+		b.editMessage(chatID, messageID, "❌ Invalid percentage.")
+		return
+	}
+
+	posIndex, err := strconv.Atoi(parts[2])
+	if err != nil {
+		b.editMessage(chatID, messageID, "❌ Invalid position index.")
+		return
+	}
+
+	orderType := parts[3] // "market" or "limit"
+
+	// Get positions from state
+	userCtx, exists := b.stateManager.GetState(userID)
+	if !exists {
+		b.editMessage(chatID, messageID, "❌ Session expired. Please start over with /positions.")
+		return
+	}
+
+	positions, ok := userCtx.Data["positions"].([]*polymarket.Position)
+	if !ok || posIndex >= len(positions) {
+		b.editMessage(chatID, messageID, "❌ Position not found. Please try again.")
+		return
+	}
+
+	pos := positions[posIndex]
+
+	// If limit order, prompt for price
+	if orderType == "limit" {
+		b.promptForLimitPrice(ctx, update, pos, percentage, posIndex)
+		return
+	}
+
+	// Market order - execute immediately
+	b.executeSellWithPrice(ctx, update, pos, percentage, 0) // 0 means market price
+}
+
+// promptForLimitPrice asks user to enter a limit price
+func (b *Bot) promptForLimitPrice(ctx context.Context, update *tgbotapi.Update, pos *polymarket.Position, percentage int, posIndex int) {
+	userID := update.CallbackQuery.From.ID
+	chatID := update.CallbackQuery.Message.Chat.ID
+	messageID := update.CallbackQuery.Message.MessageID
+
+	sharesStr := polymarket.FormatShares(pos.Shares)
+	posSharesRaw := pos.Shares.Int64()
+	sellSharesRaw := (posSharesRaw * int64(percentage)) / 100
+	sellSharesFormatted := fmt.Sprintf("%.2f", float64(sellSharesRaw)/1e6)
+
+	message := fmt.Sprintf(`📝 *Set Limit Price*
+
+*Market:* %s
+*Selling:* %s of %s shares (%d%%)
+*Current Price:* $%.2f
+
+───────────────
+
+Please enter your minimum sell price (0.01 - 0.99):
+
+_Example: Type "0.65" to sell at $0.65 or higher_
+_Type /cancel to abort_
+`, pos.MarketTitle, sellSharesFormatted, sharesStr, percentage, pos.CurrentPrice)
+
+	b.editMessage(chatID, messageID, message)
+
+	// Get existing positions from state before overwriting
+	userCtx, _ := b.stateManager.GetState(userID)
+	var positions []*polymarket.Position
+	if userCtx != nil && userCtx.Data != nil {
+		positions, _ = userCtx.Data["positions"].([]*polymarket.Position)
+	}
+
+	// Store context for price input
+	b.stateManager.SetState(userID, StateWaitingForLimitPrice, map[string]interface{}{
+		"positions":  positions,
+		"pos_index":  posIndex,
+		"percentage": percentage,
+	}, 5*time.Minute)
+}
+
+// executeSellWithPrice executes a sell order with optional limit price
+func (b *Bot) executeSellWithPrice(ctx context.Context, update *tgbotapi.Update, pos *polymarket.Position, percentage int, limitPrice float64) {
+	userID := update.CallbackQuery.From.ID
+	chatID := update.CallbackQuery.Message.Chat.ID
+	messageID := update.CallbackQuery.Message.MessageID
+
+	// Get user
+	user, err := b.userRepo.GetByTelegramID(ctx, userID)
+	if err != nil || user == nil {
+		b.editMessage(chatID, messageID, "❌ User not found.")
+		return
+	}
+
+	// Calculate sell amount based on percentage
+	sellValue := pos.Value * float64(percentage) / 100.0
+
+	// Calculate exact shares to sell based on percentage of position
+	posSharesRaw := pos.Shares.Int64()
+	sellSharesRaw := (posSharesRaw * int64(percentage)) / 100
+
+	// Show processing message
+	marketName := pos.MarketTitle
+	if len(marketName) > 40 {
+		marketName = marketName[:37] + "..."
+	}
+
+	orderTypeStr := "Market"
+	priceStr := "best available"
+	if limitPrice > 0 {
+		orderTypeStr = "Limit"
+		priceStr = fmt.Sprintf("$%.2f", limitPrice)
+	}
+
+	b.editMessage(chatID, messageID, fmt.Sprintf(`⏳ *Processing %s Sell Order...*
+
+*Market:* %s
+*Selling:* %d%% of %s position
+*Price:* %s
+*Estimated Value:* $%.2f
+
+Please wait...`, orderTypeStr, marketName, percentage, pos.Outcome, priceStr, sellValue))
+
+	// Execute the sell order using position data directly
+	result := b.executeSellOrderFromPosition(ctx, user, pos, sellValue, sellSharesRaw, limitPrice)
+
+	// Clear state
+	b.stateManager.ClearState(userID)
+
+	// Show result
+	if result.Success {
+		message := fmt.Sprintf(`✅ *Sell Order Executed!*
+
+*Market:* %s
+*Sold:* %d%% of %s position
+*Amount:* $%.2f
+*Order ID:* %s
+
+Use /positions to check your updated positions.
+`, marketName, percentage, pos.Outcome, sellValue, result.OrderID)
+		b.editMessage(chatID, messageID, message)
+	} else {
+		message := fmt.Sprintf(`❌ *Sell Order Failed*
+
+*Market:* %s
+*Error:* %s
+
+Please try again or contact support.
+`, marketName, result.ErrorMsg)
+
+		// Add retry button
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("🔄 Try Again", "sell_positions"),
+				tgbotapi.NewInlineKeyboardButtonData("← Back", "back_to_positions"),
+			),
+		)
+		b.editMessageWithKeyboard(chatID, messageID, message, keyboard)
+	}
+}
+
+// handleLimitPriceInput handles when user enters a limit price for sell order
+func (b *Bot) handleLimitPriceInput(ctx context.Context, update *tgbotapi.Update, userCtx *UserContext) {
+	chatID := update.Message.Chat.ID
+	userID := update.Message.From.ID
+	text := strings.TrimSpace(update.Message.Text)
+
+	// Check for cancel
+	if strings.ToLower(text) == "/cancel" {
+		b.stateManager.ClearState(userID)
+		b.sendMessage(chatID, "❌ Order cancelled.")
+		return
+	}
+
+	// Parse price
+	text = strings.TrimPrefix(text, "$")
+	var limitPrice float64
+	if _, err := fmt.Sscanf(text, "%f", &limitPrice); err != nil || limitPrice <= 0 || limitPrice >= 1 {
+		b.sendMessage(chatID, "❌ Invalid price. Please enter a value between 0.01 and 0.99 (e.g., 0.65)")
+		return
+	}
+
+	// Get position data from state
+	positions, ok := userCtx.Data["positions"].([]*polymarket.Position)
+	posIndex, _ := userCtx.Data["pos_index"].(int)
+	percentage, _ := userCtx.Data["percentage"].(int)
+
+	if !ok || posIndex >= len(positions) {
+		b.stateManager.ClearState(userID)
+		b.sendMessage(chatID, "❌ Session expired. Please start over with /positions.")
+		return
+	}
+
+	pos := positions[posIndex]
+
+	// Get user
+	user, err := b.userRepo.GetByTelegramID(ctx, userID)
+	if err != nil || user == nil {
+		b.stateManager.ClearState(userID)
+		b.sendMessage(chatID, "❌ User not found.")
+		return
+	}
+
+	// Clear state before executing
+	b.stateManager.ClearState(userID)
+
+	// Calculate sell values
+	sellValue := pos.Value * float64(percentage) / 100.0
+	posSharesRaw := pos.Shares.Int64()
+	sellSharesRaw := (posSharesRaw * int64(percentage)) / 100
+
+	// Show processing message
+	marketName := pos.MarketTitle
+	if len(marketName) > 40 {
+		marketName = marketName[:37] + "..."
+	}
+
+	b.sendMessage(chatID, fmt.Sprintf(`⏳ *Processing Limit Sell Order...*
+
+*Market:* %s
+*Selling:* %d%% of %s position
+*Limit Price:* $%.2f
+*Estimated Value:* $%.2f
+
+Please wait...`, marketName, percentage, pos.Outcome, limitPrice, sellValue))
+
+	// Execute the sell order
+	result := b.executeSellOrderFromPosition(ctx, user, pos, sellValue, sellSharesRaw, limitPrice)
+
+	// Show result
+	if result.Success {
+		message := fmt.Sprintf(`✅ *Limit Sell Order Placed!*
+
+*Market:* %s
+*Sold:* %d%% of %s position
+*Limit Price:* $%.2f
+*Order ID:* %s
+
+Your order will fill when the price reaches $%.2f or higher.
+Use /positions to check your positions.
+`, marketName, percentage, pos.Outcome, limitPrice, result.OrderID, limitPrice)
+		b.sendMessage(chatID, message)
+	} else {
+		message := fmt.Sprintf(`❌ *Limit Sell Order Failed*
+
+*Market:* %s
+*Error:* %s
+
+Please try again or contact support.
+`, marketName, result.ErrorMsg)
+		b.sendMessage(chatID, message)
+	}
+}
+
+// handleRefreshOrders refreshes the open orders display
+func (b *Bot) handleRefreshOrders(ctx context.Context, update *tgbotapi.Update) {
+	userID := update.CallbackQuery.From.ID
+	chatID := update.CallbackQuery.Message.Chat.ID
+	messageID := update.CallbackQuery.Message.MessageID
+
+	// Check if user has a wallet
+	user, err := b.userRepo.GetByTelegramID(ctx, userID)
+	if err != nil || user == nil {
+		b.editMessage(chatID, messageID, "❌ You need to set up a wallet first. Use /start to begin.")
+		return
+	}
+
+	// Show loading
+	b.editMessage(chatID, messageID, "📋 Refreshing orders...")
+
+	// Decrypt the wallet to get API credentials
+	userWallet, err := b.walletManager.DecryptPrivateKey(user.EncryptedKey)
+	if err != nil {
+		b.editMessage(chatID, messageID, "❌ Failed to decrypt wallet")
+		return
+	}
+
+	// Get API credentials
+	creds, err := b.tradingClient.GetOrCreateAPICredentials(ctx, userWallet.PrivateKey)
+	if err != nil {
+		b.editMessage(chatID, messageID, "❌ Failed to get API credentials")
+		return
+	}
+
+	// Fetch open orders
+	eoaAddress := common.HexToAddress(user.EOAAddress)
+	orders, err := b.tradingClient.GetOpenOrders(ctx, eoaAddress, creds)
+	if err != nil {
+		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Failed to fetch orders: %v", err))
+		return
+	}
+
+	if len(orders) == 0 {
+		msg := `📋 *Your Open Orders*
+
+No open orders found.
+
+Use /markets to find markets and place orders.`
+		b.editMessage(chatID, messageID, msg)
+		return
+	}
+
+	// Format orders for display
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📋 *Your Open Orders* (%d)\n\n", len(orders)))
+
+	for i, order := range orders {
+		if i >= 10 {
+			sb.WriteString(fmt.Sprintf("\n_...and %d more orders_", len(orders)-10))
+			break
+		}
+
+		originalSize := order.OriginalSize
+		sizeMatched := order.SizeMatched
+		price := order.Price
+
+		sideEmoji := "📈"
+		if strings.ToUpper(order.Side) == "SELL" {
+			sideEmoji = "📉"
+		}
+
+		createdTime := time.Unix(order.CreatedAt, 0).Format("Jan 2 15:04")
+
+		sb.WriteString(fmt.Sprintf("*%d. %s %s*\n", i+1, sideEmoji, strings.ToUpper(order.Side)))
+		sb.WriteString(fmt.Sprintf("   Price: $%s | Size: %s\n", price, originalSize))
+		sb.WriteString(fmt.Sprintf("   Filled: %s | Type: %s\n", sizeMatched, order.OrderType))
+		sb.WriteString(fmt.Sprintf("   Created: %s\n", createdTime))
+		sb.WriteString(fmt.Sprintf("   ID: `%s`\n\n", truncateOrderID(order.ID)))
+	}
+
+	sb.WriteString("Use /cancel <order\\_id> to cancel an order")
+
+	// Create keyboard with refresh and cancel all buttons
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "refresh_orders"),
+			tgbotapi.NewInlineKeyboardButtonData("❌ Cancel All", "cancel_all_orders"),
+		),
+	)
+
+	b.editMessageWithKeyboard(chatID, messageID, sb.String(), keyboard)
+}
+
+// handleCancelAllOrders cancels all open orders
+func (b *Bot) handleCancelAllOrders(ctx context.Context, update *tgbotapi.Update) {
+	userID := update.CallbackQuery.From.ID
+	chatID := update.CallbackQuery.Message.Chat.ID
+	messageID := update.CallbackQuery.Message.MessageID
+
+	// Check if user has a wallet
+	user, err := b.userRepo.GetByTelegramID(ctx, userID)
+	if err != nil || user == nil {
+		b.editMessage(chatID, messageID, "❌ You need to set up a wallet first. Use /start to begin.")
+		return
+	}
+
+	// Show loading
+	b.editMessage(chatID, messageID, "⏳ Cancelling all orders...")
+
+	// Decrypt the wallet to get API credentials
+	userWallet, err := b.walletManager.DecryptPrivateKey(user.EncryptedKey)
+	if err != nil {
+		b.editMessage(chatID, messageID, "❌ Failed to decrypt wallet")
+		return
+	}
+
+	// Get API credentials
+	creds, err := b.tradingClient.GetOrCreateAPICredentials(ctx, userWallet.PrivateKey)
+	if err != nil {
+		b.editMessage(chatID, messageID, "❌ Failed to get API credentials")
+		return
+	}
+
+	// Cancel all orders
+	eoaAddress := common.HexToAddress(user.EOAAddress)
+	cancelled, err := b.tradingClient.CancelAllOrders(ctx, eoaAddress, creds)
+	if err != nil {
+		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Failed to cancel orders: %v", err))
+		return
+	}
+
+	if cancelled == 0 {
+		msg := `📋 *Your Open Orders*
+
+No orders to cancel.
+
+Use /markets to find markets and place orders.`
+		b.editMessage(chatID, messageID, msg)
+		return
+	}
+
+	msg := fmt.Sprintf(`✅ *Orders Cancelled*
+
+Successfully cancelled %d order(s).
+
+Use /markets to find markets and place new orders.`, cancelled)
+	b.editMessage(chatID, messageID, msg)
+}
+
+// editMessage edits an existing message
+func (b *Bot) editMessage(chatID int64, messageID int, text string) {
+	msg := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	msg.ParseMode = "Markdown"
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("Error editing message: %v", err)
+	}
+}
+
+// editMessageWithKeyboard edits an existing message with a keyboard
+func (b *Bot) editMessageWithKeyboard(chatID int64, messageID int, text string, keyboard tgbotapi.InlineKeyboardMarkup) {
+	msg := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = &keyboard
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("Error editing message with keyboard: %v", err)
+	}
+}
+
+// Stop stops the bot gracefully
+func (b *Bot) Stop() {
+	b.api.StopReceivingUpdates()
+	log.Println("Bot stopped")
+}
+
+// executeBuyOrder executes a buy order on Polymarket
+func (b *Bot) executeBuyOrder(ctx context.Context, user *database.User, market *polymarket.GammaMarket, outcome string, amount float64) *polymarket.TradeResult {
+	log.Printf("Executing buy order for user %d: %s %s $%.2f", user.TelegramID, outcome, market.ID, amount)
+
+	// Decrypt user's private key
+	userWallet, err := b.walletManager.DecryptPrivateKey(user.EncryptedKey)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("Failed to decrypt wallet: %v", err),
+		}
+	}
+
+	// Get or create API credentials
+	creds, err := b.tradingClient.GetOrCreateAPICredentials(ctx, userWallet.PrivateKey)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("Failed to get API credentials: %v", err),
+		}
+	}
+
+	// Test L2 auth before executing trade
+	eoaAddress := common.HexToAddress(user.EOAAddress)
+	if err := b.tradingClient.TestL2Auth(ctx, eoaAddress, creds); err != nil {
+		log.Printf("L2 auth test failed: %v", err)
+	}
+
+	// Get token ID for the outcome
+	tokenID, err := b.tradingClient.GetTokenIDForOutcome(ctx, market, outcome)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("Failed to get token ID: %v", err),
+		}
+	}
+
+	// Determine proxy address
+	var proxyAddress common.Address
+	if user.ProxyAddress != "" {
+		proxyAddress = common.HexToAddress(user.ProxyAddress)
+	}
+
+	// Build trade request
+	tradeReq := &polymarket.TradeRequest{
+		MarketID:     market.ID,
+		TokenID:      tokenID,
+		Side:         "BUY",
+		Outcome:      outcome,
+		Amount:       amount,
+		OrderType:    polymarket.OrderTypeGTC, // Good-til-cancelled
+		NegativeRisk: market.NegRisk,          // Use negRisk exchange if market is negRisk
+	}
+
+	log.Printf("Trade request: negRisk=%v, market.NegRisk=%v", tradeReq.NegativeRisk, market.NegRisk)
+
+	// Execute the trade
+	result, err := b.tradingClient.ExecuteTrade(ctx, userWallet.PrivateKey, proxyAddress, creds, tradeReq)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("Trade execution failed: %v", err),
+		}
+	}
+
+	return result
+}
+
+// executeBuyOrderByIndex executes a buy order using outcome index (0 or 1) instead of name
+func (b *Bot) executeBuyOrderByIndex(ctx context.Context, user *database.User, market *polymarket.GammaMarket, outcomeIndex int, amount float64) *polymarket.TradeResult {
+	log.Printf("Executing buy order (by index) for user %d: index=%d market=%s $%.2f", user.TelegramID, outcomeIndex, market.ID, amount)
+
+	// Decrypt user's private key
+	userWallet, err := b.walletManager.DecryptPrivateKey(user.EncryptedKey)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("Failed to decrypt wallet: %v", err),
+		}
+	}
+
+	// Get or create API credentials
+	creds, err := b.tradingClient.GetOrCreateAPICredentials(ctx, userWallet.PrivateKey)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("Failed to get API credentials: %v", err),
+		}
+	}
+
+	// Test L2 auth before executing trade
+	eoaAddress := common.HexToAddress(user.EOAAddress)
+	if err := b.tradingClient.TestL2Auth(ctx, eoaAddress, creds); err != nil {
+		log.Printf("L2 auth test failed: %v", err)
+	}
+
+	// Get token ID by index - this is the key fix!
+	tokenID, err := b.tradingClient.GetTokenIDByIndex(ctx, market.ID, outcomeIndex)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("Failed to get token ID: %v", err),
+		}
+	}
+
+	// Get outcome name for logging
+	outcomes := market.GetOutcomes()
+	outcomeName := fmt.Sprintf("index_%d", outcomeIndex)
+	if outcomeIndex < len(outcomes) {
+		outcomeName = outcomes[outcomeIndex]
+	}
+
+	// Determine proxy address
+	var proxyAddress common.Address
+	if user.ProxyAddress != "" {
+		proxyAddress = common.HexToAddress(user.ProxyAddress)
+	}
+
+	// Build trade request
+	tradeReq := &polymarket.TradeRequest{
+		MarketID:     market.ID,
+		TokenID:      tokenID,
+		Side:         "BUY",
+		Outcome:      outcomeName,
+		Amount:       amount,
+		OrderType:    polymarket.OrderTypeGTC,
+		NegativeRisk: market.NegRisk,
+	}
+
+	log.Printf("Trade request (by index): outcomeIndex=%d, outcomeName=%s, tokenID=%s, negRisk=%v",
+		outcomeIndex, outcomeName, tokenID, tradeReq.NegativeRisk)
+
+	// Execute the trade
+	result, err := b.tradingClient.ExecuteTrade(ctx, userWallet.PrivateKey, proxyAddress, creds, tradeReq)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("Trade execution failed: %v", err),
+		}
+	}
+
+	return result
+}
+
+// executeSellOrder executes a sell order on Polymarket
+func (b *Bot) executeSellOrder(ctx context.Context, user *database.User, market *polymarket.GammaMarket, outcome string, amount float64) *polymarket.TradeResult {
+	log.Printf("Executing sell order for user %d: %s %s $%.2f", user.TelegramID, outcome, market.ID, amount)
+
+	// Decrypt user's private key
+	userWallet, err := b.walletManager.DecryptPrivateKey(user.EncryptedKey)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("Failed to decrypt wallet: %v", err),
+		}
+	}
+
+	// Get or create API credentials
+	creds, err := b.tradingClient.GetOrCreateAPICredentials(ctx, userWallet.PrivateKey)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("Failed to get API credentials: %v", err),
+		}
+	}
+
+	// Get token ID for the outcome
+	tokenID, err := b.tradingClient.GetTokenIDForOutcome(ctx, market, outcome)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("Failed to get token ID: %v", err),
+		}
+	}
+
+	// Determine proxy address
+	var proxyAddress common.Address
+	if user.ProxyAddress != "" {
+		proxyAddress = common.HexToAddress(user.ProxyAddress)
+	}
+
+	// Build trade request
+	tradeReq := &polymarket.TradeRequest{
+		MarketID:     market.ID,
+		TokenID:      tokenID,
+		Side:         "SELL",
+		Outcome:      outcome,
+		Amount:       amount,
+		OrderType:    polymarket.OrderTypeGTC,
+		NegativeRisk: market.NegRisk, // Use negRisk exchange if market is negRisk
+	}
+
+	// Execute the trade
+	result, err := b.tradingClient.ExecuteTrade(ctx, userWallet.PrivateKey, proxyAddress, creds, tradeReq)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("Trade execution failed: %v", err),
+		}
+	}
+
+	return result
+}
+
+// executeSellOrderFromPosition executes a sell order using position data directly
+// This avoids needing to query the Gamma API for token ID since we have it from the position
+// limitPrice of 0 means market order (use best bid), otherwise it's a limit order at specified price
+func (b *Bot) executeSellOrderFromPosition(ctx context.Context, user *database.User, pos *polymarket.Position, amount float64, sharesRaw int64, limitPrice float64) *polymarket.TradeResult {
+	log.Printf("Executing sell order from position for user %d: %s %s $%.2f (shares: %d, limitPrice: %.2f)", user.TelegramID, pos.Outcome, pos.TokenID, amount, sharesRaw, limitPrice)
+
+	// Decrypt user's private key
+	userWallet, err := b.walletManager.DecryptPrivateKey(user.EncryptedKey)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("Failed to decrypt wallet: %v", err),
+		}
+	}
+
+	// Get or create API credentials
+	creds, err := b.tradingClient.GetOrCreateAPICredentials(ctx, userWallet.PrivateKey)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("Failed to get API credentials: %v", err),
+		}
+	}
+
+	// Determine proxy address
+	var proxyAddress common.Address
+	if user.ProxyAddress != "" {
+		proxyAddress = common.HexToAddress(user.ProxyAddress)
+	}
+
+	// Build trade request using position data directly
+	tradeReq := &polymarket.TradeRequest{
+		MarketID:     pos.ConditionID,
+		TokenID:      pos.TokenID, // Use token ID directly from position
+		Side:         "SELL",
+		Outcome:      pos.Outcome,
+		Amount:       amount,
+		SharesRaw:    sharesRaw,   // Use exact shares from position
+		Price:        limitPrice,  // 0 means market order, >0 means limit order
+		OrderType:    polymarket.OrderTypeGTC,
+		NegativeRisk: pos.NegativeRisk,
+	}
+
+	log.Printf("Sell trade request: tokenID=%s, negRisk=%v, conditionID=%s, amount=$%.2f, posShares=%s, posValue=$%.2f, limitPrice=%.2f",
+		tradeReq.TokenID, tradeReq.NegativeRisk, tradeReq.MarketID, amount, polymarket.FormatShares(pos.Shares), pos.Value, limitPrice)
+
+	// Check if exchange has approval to transfer shares
+	if b.blockchain != nil {
+		balanceChecker := blockchain.NewBalanceChecker(b.blockchain.GetClient())
+		approved, exchangeAddr, err := balanceChecker.CheckExchangeApproval(ctx, proxyAddress, pos.NegativeRisk)
+		if err != nil {
+			log.Printf("Warning: Failed to check exchange approval: %v", err)
+		} else if !approved {
+			exchangeName := "CTFExchange"
+			if pos.NegativeRisk {
+				exchangeName = "NegRiskCTFExchange"
+			}
+			log.Printf("Exchange %s (%s) is NOT approved to transfer shares from proxy %s",
+				exchangeName, exchangeAddr.Hex(), proxyAddress.Hex())
+			return &polymarket.TradeResult{
+				Success: false,
+				ErrorMsg: fmt.Sprintf("Exchange not approved. Please sell this position once on Polymarket.com to enable approval, then you can sell via bot. (Exchange: %s)", exchangeName),
+			}
+		} else {
+			log.Printf("Exchange approval confirmed for proxy %s", proxyAddress.Hex())
+		}
+	}
+
+	// Execute the trade
+	result, err := b.tradingClient.ExecuteTrade(ctx, userWallet.PrivateKey, proxyAddress, creds, tradeReq)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("Trade execution failed: %v", err),
+		}
+	}
+
+	return result
+}

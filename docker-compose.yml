@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  polybot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polybot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Override database/redis URLs to use host network services
+      - DATABASE_URL=${DATABASE_URL:-postgresql://polybot:polybot@host.docker.internal:5432/polybot}
+      - REDIS_URL=${REDIS_URL:-redis://host.docker.internal:6379/0}
+    # Use host network to easily connect to host's PostgreSQL and Redis
+    # Alternatively, use extra_hosts for host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on: []
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Resource limits (adjust based on your Raspberry Pi model)
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M

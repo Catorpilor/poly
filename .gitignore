@@ -1,0 +1,100 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go binaries (no extension on Linux/Mac)
+polybot
+poly_bot
+polymarket-bot
+bot
+poly
+cmd/bot/bot
+/cmd/*/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+*.prof
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# Environment variables - all variations
+.env
+.env.*
+!.env.example
+*.env
+.envrc
+
+# IDE specific files
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Build directories
+bin/
+dist/
+build/
+out/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Log files
+*.log
+logs/
+debug/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Docker volumes and overrides
+data/
+postgres-data/
+redis-data/
+docker-compose.override.yml
+docker-compose.local.yml
+
+# Coverage reports
+coverage.txt
+coverage.html
+*.coverprofile
+
+# Private keys and sensitive data
+*.pem
+*.key
+*.crt
+*.p12
+*.jks
+wallets/
+keys/
+credentials.json
+secrets.json
+secrets/
+
+# Application specific
+sessions/
+cache/
+
+# Compressed archives (often contain built binaries)
+*.tar.gz
+*.zip
+*.rar
