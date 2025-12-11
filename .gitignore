@@ -9,10 +9,10 @@
 polybot
 poly_bot
 polymarket-bot
-bot
+/bot
 poly
+# Ignore compiled binary in cmd/bot, not the source
 cmd/bot/bot
-/cmd/*/
 
 # Test binary, built with `go test -c`
 *.test
