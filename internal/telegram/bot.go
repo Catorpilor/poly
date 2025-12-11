@@ -418,55 +418,54 @@ func (b *Bot) handleCustomAmountInput(ctx context.Context, update *tgbotapi.Upda
 
 	// Fetch market info for display
 	marketClient := polymarket.NewMarketClient()
-	market, _ := marketClient.GetMarketByID(ctx, marketID)
-	marketName := marketID
-	outcomeName := fmt.Sprintf("index_%d", outcomeIndex)
-	if market != nil {
-		marketName = market.Question
-		if len(marketName) > 40 {
-			marketName = marketName[:37] + "..."
-		}
-		// Get actual outcome name
-		outcomes := market.GetOutcomes()
-		if outcomeIndex < len(outcomes) {
-			outcomeName = outcomes[outcomeIndex]
-		}
+	market, err := marketClient.GetMarketByID(ctx, marketID)
+	if err != nil {
+		b.sendMessage(chatID, fmt.Sprintf("❌ Failed to fetch market: %v", err))
+		return
 	}
 
-	// Show processing message
-	b.sendMessage(chatID, fmt.Sprintf(`⏳ *Processing Order...*
-
-*Market:* %s
-*Side:* Buy %s
-*Amount:* $%.2f
-
-Please wait...`, marketName, outcomeName, amount))
-
-	// Execute the trade using index (market order - price = 0)
-	result := b.executeBuyOrderByIndex(ctx, user, market, outcomeIndex, amount, 0)
-
-	// Show result
-	if result.Success {
-		message := fmt.Sprintf(`✅ *Order Executed Successfully!*
-
-*Market:* %s
-*Side:* Buy %s
-*Amount:* $%.2f
-*Order ID:* %s
-
-Use /positions to check your positions.
-`, marketName, outcomeName, amount, result.OrderID)
-		b.sendMessage(chatID, message)
-	} else {
-		message := fmt.Sprintf(`❌ *Order Failed*
-
-*Market:* %s
-*Error:* %s
-
-Please try again or contact support.
-`, marketName, result.ErrorMsg)
-		b.sendMessage(chatID, message)
+	marketName := market.Question
+	if len(marketName) > 40 {
+		marketName = marketName[:37] + "..."
 	}
+	// Get actual outcome name and price
+	outcomes := market.GetOutcomes()
+	prices := market.GetOutcomePrices()
+	outcomeName := "Unknown"
+	currentPrice := 0.0
+	if outcomeIndex < len(outcomes) {
+		outcomeName = outcomes[outcomeIndex]
+	}
+	if outcomeIndex < len(prices) {
+		fmt.Sscanf(prices[outcomeIndex], "%f", &currentPrice)
+	}
+
+	// Show order type selection (same as handleAmountCallback)
+	message := fmt.Sprintf(`🎯 *Buy Order*
+
+*Market:* %s
+*Outcome:* %s
+*Amount:* $%.2f
+*Current Price:* $%.2f
+
+───────────────
+
+📊 *Select order type:*
+`, marketName, outcomeName, amount, currentPrice)
+
+	// Create order type selection keyboard
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⚡ Market Order", fmt.Sprintf("buyexec:%.0f:%d:%s:market", amount, outcomeIndex, marketID)),
+			tgbotapi.NewInlineKeyboardButtonData("📝 Limit Order", fmt.Sprintf("buylimit:%.0f:%d:%s", amount, outcomeIndex, marketID)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⬅️ Back", fmt.Sprintf("buy:%d:%s", outcomeIndex, marketID)),
+			tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "cancel_order"),
+		),
+	)
+
+	b.sendMessageWithKeyboard(chatID, message, keyboard)
 }
 
 // sendMessage sends a message to a chat
