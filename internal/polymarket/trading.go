@@ -14,6 +14,7 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -334,15 +335,23 @@ func (tc *TradingClient) GetBestPrice(ctx context.Context, tokenID string, side 
 	var entries []OrderBookEntry
 	if strings.ToUpper(side) == "BUY" {
 		entries = orderBook.Asks
+		// Sort asks by price ascending - we want to buy from cheapest sellers first
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].Price < entries[j].Price
+		})
 	} else {
 		entries = orderBook.Bids
+		// Sort bids by price descending - we want to sell to highest bidders first
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].Price > entries[j].Price
+		})
 	}
 
 	if len(entries) == 0 {
 		return 0, fmt.Errorf("no liquidity available")
 	}
 
-	log.Printf("GetBestPrice: side=%s, amount=%.2f USDC, %d entries in book", side, amount, len(entries))
+	log.Printf("GetBestPrice: side=%s, amount=%.2f USDC, %d entries in book (sorted)", side, amount, len(entries))
 	for i, e := range entries {
 		if i < 5 { // Log first 5 entries
 			log.Printf("  Entry %d: price=%.4f, size=%.4f", i, e.Price, e.Size)
