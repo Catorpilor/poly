@@ -492,6 +492,11 @@ func (tc *TradingClient) ExecuteTrade(
 		return &TradeResult{Success: false, ErrorMsg: fmt.Sprintf("Invalid price: %.6f (must be between 0 and 1)", price)}, nil
 	}
 
+	// Round price to 2 decimal places (Polymarket tick size requirement)
+	// This must be done BEFORE calculating amounts to ensure consistency
+	price = float64(int64(price*100+0.5)) / 100
+	log.Printf("ExecuteTrade: Price rounded to tick size=%.2f", price)
+
 	// Calculate order amounts
 	// For BUY: makerAmount = USDC spent, takerAmount = shares received
 	// For SELL: makerAmount = shares sold, takerAmount = USDC received
