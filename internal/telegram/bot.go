@@ -214,7 +214,8 @@ func (b *Bot) handleCommand(ctx context.Context, update tgbotapi.Update) {
 
 // handleDeepLink handles deep links with start parameters
 // Supported formats:
-//   - /start m_<marketID> - View market details
+//   - /start m_<marketID> - View market details by market ID
+//   - /start c_<conditionID> - View market details by condition ID (for copy trading)
 //   - /start (no param) - Normal start
 func (b *Bot) handleDeepLink(ctx context.Context, update *tgbotapi.Update) {
 	// Extract the parameter from "/start parameter"
@@ -234,27 +235,40 @@ func (b *Bot) handleDeepLink(ctx context.Context, update *tgbotapi.Update) {
 		return
 	}
 
+	// Handle condition ID deep links: c_<conditionID> (for copy trading signals)
+	if strings.HasPrefix(parameter, "c_") {
+		conditionID := strings.TrimPrefix(parameter, "c_")
+		b.handleMarketByConditionID(ctx, update, conditionID)
+		return
+	}
+
 	// Unknown parameter, just start normally
 	b.handleStart(ctx, b, update)
 }
 
-// handleMarketByID fetches and displays market by ID (used by deep links)
-func (b *Bot) handleMarketByID(ctx context.Context, update *tgbotapi.Update, marketID string) {
+// handleMarketByConditionID fetches and displays market by condition ID (used for copy trading)
+func (b *Bot) handleMarketByConditionID(ctx context.Context, update *tgbotapi.Update, conditionID string) {
 	chatID := update.Message.Chat.ID
 
-	// Fetch market details from Gamma API
+	// Fetch market details from Gamma API using conditionID
 	marketClient := polymarket.NewMarketClient()
-	market, err := marketClient.GetMarketByID(ctx, marketID)
+	market, err := marketClient.GetMarketByConditionID(ctx, conditionID)
 	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("❌ Market not found: %s", marketID))
+		b.sendMessage(chatID, fmt.Sprintf("❌ Market not found for conditionId: %s", conditionID))
 		return
 	}
 
+	// Reuse the same display logic as handleMarketByID
+	b.displayMarketForTrading(ctx, chatID, market)
+}
+
+// displayMarketForTrading shows market details with trading buttons
+func (b *Bot) displayMarketForTrading(ctx context.Context, chatID int64, market *polymarket.GammaMarket) {
 	// Get outcomes and prices - they should be in the same order
 	outcomes := market.GetOutcomes()
 	prices := market.GetOutcomePrices()
 
-	log.Printf("handleMarketLink: market=%s, outcomes=%v, prices=%v", market.ID, outcomes, prices)
+	log.Printf("displayMarketForTrading: market=%s, outcomes=%v, prices=%v", market.ID, outcomes, prices)
 
 	// Determine outcome labels and prices
 	// outcomes[i] corresponds to prices[i] and clobTokenIds[i]
@@ -288,8 +302,8 @@ func (b *Bot) handleMarketByID(ctx context.Context, update *tgbotapi.Update, mar
 	message := fmt.Sprintf(`📈 *%s*
 
 *Current Prices:*
-   %s: %s
-   %s: %s
+   %s: %s ($%.2f)
+   %s: %s ($%.2f)
 
 *Market Stats:*
    24h Volume: %s
@@ -300,8 +314,8 @@ func (b *Bot) handleMarketByID(ctx context.Context, update *tgbotapi.Update, mar
 *End Date:* %s
 `,
 		market.Question,
-		outcome0Label, polymarket.FormatPrice(price0),
-		outcome1Label, polymarket.FormatPrice(price1),
+		outcome0Label, polymarket.FormatPrice(price0), price0,
+		outcome1Label, polymarket.FormatPrice(price1), price1,
 		polymarket.FormatVolume(market.Volume24hr),
 		polymarket.FormatVolume(market.Volume),
 		polymarket.FormatVolume(market.Liquidity),
@@ -319,6 +333,22 @@ func (b *Bot) handleMarketByID(ctx context.Context, update *tgbotapi.Update, mar
 	)
 
 	b.sendMessageWithKeyboard(chatID, message, keyboard)
+}
+
+// handleMarketByID fetches and displays market by ID (used by deep links)
+func (b *Bot) handleMarketByID(ctx context.Context, update *tgbotapi.Update, marketID string) {
+	chatID := update.Message.Chat.ID
+
+	// Fetch market details from Gamma API
+	marketClient := polymarket.NewMarketClient()
+	market, err := marketClient.GetMarketByID(ctx, marketID)
+	if err != nil {
+		b.sendMessage(chatID, fmt.Sprintf("❌ Market not found: %s", marketID))
+		return
+	}
+
+	// Reuse the shared display logic
+	b.displayMarketForTrading(ctx, chatID, market)
 }
 
 // getMarketStatusFromBot returns market status (duplicate to avoid import cycle)

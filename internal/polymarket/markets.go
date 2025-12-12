@@ -171,6 +171,39 @@ func (mc *MarketClient) GetMarketByID(ctx context.Context, id string) (*GammaMar
 	return &market, nil
 }
 
+// GetMarketByConditionID fetches a specific market by its condition ID
+// This is useful for copy trading where signals provide conditionId
+func (mc *MarketClient) GetMarketByConditionID(ctx context.Context, conditionID string) (*GammaMarket, error) {
+	url := fmt.Sprintf("%s/markets?condition_id=%s", mc.gammaAPIURL, conditionID)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := mc.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch market: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Gamma API returned status %d", resp.StatusCode)
+	}
+
+	var markets []*GammaMarket
+	if err := json.NewDecoder(resp.Body).Decode(&markets); err != nil {
+		return nil, fmt.Errorf("failed to decode markets: %w", err)
+	}
+
+	if len(markets) == 0 {
+		return nil, fmt.Errorf("market not found for conditionId: %s", conditionID)
+	}
+
+	return markets[0], nil
+}
+
 // FormatVolume formats volume for display
 func FormatVolume(volume float64) string {
 	if volume >= 1000000 {
