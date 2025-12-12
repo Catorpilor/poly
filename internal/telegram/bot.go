@@ -215,7 +215,9 @@ func (b *Bot) handleCommand(ctx context.Context, update tgbotapi.Update) {
 // handleDeepLink handles deep links with start parameters
 // Supported formats:
 //   - /start m_<marketID> - View market details by market ID
-//   - /start c_<conditionID> - View market details by condition ID (for copy trading)
+//   - /start <64-hex-chars> - View market by condition ID (for copy trading)
+//     Note: Telegram limits deep link params to 64 chars, so conditionId must be
+//     passed without "0x" prefix (e.g., 35ae72ec...da891 not 0x35ae72ec...da891)
 //   - /start (no param) - Normal start
 func (b *Bot) handleDeepLink(ctx context.Context, update *tgbotapi.Update) {
 	// Extract the parameter from "/start parameter"
@@ -226,7 +228,7 @@ func (b *Bot) handleDeepLink(ctx context.Context, update *tgbotapi.Update) {
 	}
 
 	parameter := parts[1]
-	log.Printf("Received deep link with parameter: %s", parameter)
+	log.Printf("Received deep link with parameter: %s (length: %d)", parameter, len(parameter))
 
 	// Handle market deep links: m_<marketID>
 	if strings.HasPrefix(parameter, "m_") {
@@ -235,15 +237,26 @@ func (b *Bot) handleDeepLink(ctx context.Context, update *tgbotapi.Update) {
 		return
 	}
 
-	// Handle condition ID deep links: c_<conditionID> (for copy trading signals)
-	if strings.HasPrefix(parameter, "c_") {
-		conditionID := strings.TrimPrefix(parameter, "c_")
+	// Handle condition ID deep links: exactly 64 hex characters (for copy trading)
+	// Telegram has a 64-char limit on deep link params, so we use raw hex without "0x"
+	if len(parameter) == 64 && isHexString(parameter) {
+		conditionID := "0x" + parameter // Add back the 0x prefix for API call
 		b.handleMarketByConditionID(ctx, update, conditionID)
 		return
 	}
 
 	// Unknown parameter, just start normally
 	b.handleStart(ctx, b, update)
+}
+
+// isHexString checks if a string contains only valid hex characters
+func isHexString(s string) bool {
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 // handleMarketByConditionID fetches and displays market by condition ID (used for copy trading)
