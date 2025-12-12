@@ -2,8 +2,6 @@ package telegram
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/hex"
 	"fmt"
 	"log"
 	"strconv"
@@ -217,14 +215,16 @@ func (b *Bot) handleCommand(ctx context.Context, update tgbotapi.Update) {
 // handleDeepLink handles deep links with start parameters
 // Supported formats:
 //   - /start m_<marketID> - View market details by market ID
-//   - /start c_<base64url> - View market by condition ID (base64url encoded, for copy trading)
+//   - /start s_<slug> - View market by slug (RECOMMENDED for copy trading)
 //   - /start (no param) - Normal start
 //
-// To generate a deep link for copy trading:
+// To generate a deep link for copy trading, use the market slug:
 //
-//	conditionId := "0x35ae72ecea68142496d891d6b74c3ea7069e8ac7b066542298691b43d74da891"
-//	encoded := EncodeConditionID(conditionId) // Returns "Na5y7OpBQkltidF7dMPqcGnoiseAZlQimGkbQ9dNqJE"
-//	link := fmt.Sprintf("https://t.me/bot?start=c_%s", encoded)
+//	slug := "us-operation-to-capture-maduro-in-2025"
+//	link := fmt.Sprintf("https://t.me/bot?start=s_%s", slug)
+//
+// Note: conditionId lookups are not supported by the Gamma API.
+// Always use slug from the workflow data for reliable market lookups.
 func (b *Bot) handleDeepLink(ctx context.Context, update *tgbotapi.Update) {
 	// Extract the parameter from "/start parameter"
 	parts := strings.SplitN(update.Message.Text, " ", 2)
@@ -243,17 +243,11 @@ func (b *Bot) handleDeepLink(ctx context.Context, update *tgbotapi.Update) {
 		return
 	}
 
-	// Handle condition ID deep links: c_<base64url-encoded-conditionId>
-	// Base64URL encoding reduces 32 bytes (64 hex chars) to ~43 chars, fitting Telegram's 64-char limit
-	if strings.HasPrefix(parameter, "c_") {
-		encoded := strings.TrimPrefix(parameter, "c_")
-		conditionID, err := DecodeConditionID(encoded)
-		if err != nil {
-			log.Printf("Failed to decode conditionId: %v", err)
-			b.sendMessage(update.Message.Chat.ID, fmt.Sprintf("❌ Invalid condition ID format: %v", err))
-			return
-		}
-		b.handleMarketByConditionID(ctx, update, conditionID)
+	// Handle slug deep links: s_<slug> (RECOMMENDED for copy trading)
+	// Slugs are URL-safe and the Gamma API reliably supports slug lookups
+	if strings.HasPrefix(parameter, "s_") {
+		slug := strings.TrimPrefix(parameter, "s_")
+		b.handleMarketBySlug(ctx, update, slug)
 		return
 	}
 
@@ -261,52 +255,19 @@ func (b *Bot) handleDeepLink(ctx context.Context, update *tgbotapi.Update) {
 	b.handleStart(ctx, b, update)
 }
 
-// EncodeConditionID encodes a conditionId (0x-prefixed hex) to base64url for use in deep links
-// Input:  "0x35ae72ecea68142496d891d6b74c3ea7069e8ac7b066542298691b43d74da891"
-// Output: "Na5y7OpBQkltidF7dMPqcGnoiseAZlQimGkbQ9dNqJE"
-func EncodeConditionID(conditionID string) (string, error) {
-	// Remove 0x prefix if present
-	hexStr := strings.TrimPrefix(conditionID, "0x")
-
-	// Decode hex to bytes
-	bytes, err := hex.DecodeString(hexStr)
-	if err != nil {
-		return "", fmt.Errorf("invalid hex string: %w", err)
-	}
-
-	// Encode to base64url (no padding)
-	encoded := base64.RawURLEncoding.EncodeToString(bytes)
-	return encoded, nil
-}
-
-// DecodeConditionID decodes a base64url-encoded conditionId back to 0x-prefixed hex
-// Input:  "Na5y7OpBQkltidF7dMPqcGnoiseAZlQimGkbQ9dNqJE"
-// Output: "0x35ae72ecea68142496d891d6b74c3ea7069e8ac7b066542298691b43d74da891"
-func DecodeConditionID(encoded string) (string, error) {
-	// Decode from base64url
-	bytes, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil {
-		return "", fmt.Errorf("invalid base64url: %w", err)
-	}
-
-	// Encode to hex with 0x prefix
-	conditionID := "0x" + hex.EncodeToString(bytes)
-	return conditionID, nil
-}
-
-// handleMarketByConditionID fetches and displays market by condition ID (used for copy trading)
-func (b *Bot) handleMarketByConditionID(ctx context.Context, update *tgbotapi.Update, conditionID string) {
+// handleMarketBySlug fetches and displays market by slug (used for copy trading)
+func (b *Bot) handleMarketBySlug(ctx context.Context, update *tgbotapi.Update, slug string) {
 	chatID := update.Message.Chat.ID
 
-	// Fetch market details from Gamma API using conditionID
+	// Fetch market details from Gamma API using slug
 	marketClient := polymarket.NewMarketClient()
-	market, err := marketClient.GetMarketByConditionID(ctx, conditionID)
+	market, err := marketClient.GetMarketBySlug(ctx, slug)
 	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("❌ Market not found for conditionId: %s", conditionID))
+		b.sendMessage(chatID, fmt.Sprintf("❌ Market not found for slug: %s", slug))
 		return
 	}
 
-	// Reuse the same display logic as handleMarketByID
+	// Reuse the same display logic
 	b.displayMarketForTrading(ctx, chatID, market)
 }
 
