@@ -8,32 +8,40 @@ import (
 	"time"
 )
 
+// GammaEvent represents a parent event from the Gamma API
+type GammaEvent struct {
+	ID    string `json:"id"`
+	Slug  string `json:"slug"`
+	Title string `json:"title"`
+}
+
 // GammaMarket represents a market from the Gamma API
 type GammaMarket struct {
-	ID               string  `json:"id"`
-	Question         string  `json:"question"`
-	ConditionID      string  `json:"conditionId"`
-	Slug             string  `json:"slug"`
-	EndDate          string  `json:"endDate"`
-	OutcomesRaw      string  `json:"outcomes"`      // JSON string like "[\"Yes\", \"No\"]"
-	OutcomePricesRaw string  `json:"outcomePrices"` // JSON string like "[\"0.55\", \"0.45\"]"
-	Volume           float64 `json:"volumeNum"`
-	Volume24hr       float64 `json:"volume24hr"`
-	Liquidity        float64 `json:"liquidityNum"`
-	Active           bool    `json:"active"`
-	Closed           bool    `json:"closed"`
-	BestBid          float64 `json:"bestBid"`
-	BestAsk          float64 `json:"bestAsk"`
-	LastTradePrice   float64 `json:"lastTradePrice"`
-	OneHourChange    float64 `json:"oneHourPriceChange"`
-	OneDayChange     float64 `json:"oneDayPriceChange,omitempty"`
-	AcceptingOrders  bool    `json:"acceptingOrders"`
-	Image            string  `json:"image"`
-	Icon             string  `json:"icon"`
-	Description      string  `json:"description"`
-	GroupItemTitle   string  `json:"groupItemTitle"`
-	NegRisk          bool    `json:"negRisk"`          // Whether this is a negative risk market
-	NegRiskMarketID  string  `json:"negRiskMarketID"`  // Neg risk market ID if applicable
+	ID               string        `json:"id"`
+	Question         string        `json:"question"`
+	ConditionID      string        `json:"conditionId"`
+	Slug             string        `json:"slug"`
+	EndDate          string        `json:"endDate"`
+	OutcomesRaw      string        `json:"outcomes"`      // JSON string like "[\"Yes\", \"No\"]"
+	OutcomePricesRaw string        `json:"outcomePrices"` // JSON string like "[\"0.55\", \"0.45\"]"
+	Volume           float64       `json:"volumeNum"`
+	Volume24hr       float64       `json:"volume24hr"`
+	Liquidity        float64       `json:"liquidityNum"`
+	Active           bool          `json:"active"`
+	Closed           bool          `json:"closed"`
+	BestBid          float64       `json:"bestBid"`
+	BestAsk          float64       `json:"bestAsk"`
+	LastTradePrice   float64       `json:"lastTradePrice"`
+	OneHourChange    float64       `json:"oneHourPriceChange"`
+	OneDayChange     float64       `json:"oneDayPriceChange,omitempty"`
+	AcceptingOrders  bool          `json:"acceptingOrders"`
+	Image            string        `json:"image"`
+	Icon             string        `json:"icon"`
+	Description      string        `json:"description"`
+	GroupItemTitle   string        `json:"groupItemTitle"`
+	NegRisk          bool          `json:"negRisk"`         // Whether this is a negative risk market
+	NegRiskMarketID  string        `json:"negRiskMarketID"` // Neg risk market ID if applicable
+	Events           []*GammaEvent `json:"events"`          // Parent events this market belongs to
 }
 
 // GetOutcomes parses the outcomes JSON string into a slice
@@ -52,6 +60,15 @@ func (m *GammaMarket) GetOutcomePrices() []string {
 		return []string{"0", "0"}
 	}
 	return prices
+}
+
+// GetEventSlug returns the parent event slug, or market slug as fallback
+func (m *GammaMarket) GetEventSlug() string {
+	if len(m.Events) > 0 && m.Events[0].Slug != "" {
+		return m.Events[0].Slug
+	}
+	// Fallback to market slug if no event
+	return m.Slug
 }
 
 // MarketClient handles market queries from the Gamma API

@@ -308,8 +308,8 @@ func (b *Bot) displayMarketForTrading(ctx context.Context, chatID int64, market 
 		endDate = endDate[:10]
 	}
 
-	// Build Polymarket URL
-	polymarketURL := fmt.Sprintf("https://polymarket.com/event/%s", market.Slug)
+	// Build Polymarket URL using event slug (not market slug)
+	polymarketURL := fmt.Sprintf("https://polymarket.com/event/%s", market.GetEventSlug())
 
 	message := fmt.Sprintf(`📈 *%s*
 
