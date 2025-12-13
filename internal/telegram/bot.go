@@ -467,30 +467,70 @@ func (b *Bot) handleCustomAmountInput(ctx context.Context, update *tgbotapi.Upda
 	if len(marketName) > 40 {
 		marketName = marketName[:37] + "..."
 	}
-	// Get actual outcome name and price
+	// Get actual outcome name
 	outcomes := market.GetOutcomes()
-	prices := market.GetOutcomePrices()
 	outcomeName := "Unknown"
-	currentPrice := 0.0
 	if outcomeIndex < len(outcomes) {
 		outcomeName = outcomes[outcomeIndex]
 	}
-	if outcomeIndex < len(prices) {
-		fmt.Sscanf(prices[outcomeIndex], "%f", &currentPrice)
+
+	// Get the REAL orderbook price (not the stale outcomePrices)
+	var realPrice float64
+	var priceWarning string
+
+	tokenID, err := b.tradingClient.GetTokenIDByIndex(ctx, marketID, outcomeIndex)
+	if err != nil {
+		log.Printf("Failed to get tokenID for price check: %v", err)
+		// Fallback to outcomePrices if we can't get orderbook
+		prices := market.GetOutcomePrices()
+		if outcomeIndex < len(prices) {
+			fmt.Sscanf(prices[outcomeIndex], "%f", &realPrice)
+		}
+		priceWarning = "\n⚠️ _Price is indicative, actual may vary_"
+	} else {
+		// Fetch actual orderbook price for this amount
+		realPrice, err = b.tradingClient.GetBestPrice(ctx, tokenID, "BUY", amount)
+		if err != nil {
+			log.Printf("Failed to get orderbook price: %v", err)
+			// Fallback to outcomePrices
+			prices := market.GetOutcomePrices()
+			if outcomeIndex < len(prices) {
+				fmt.Sscanf(prices[outcomeIndex], "%f", &realPrice)
+			}
+			priceWarning = "\n⚠️ _Price is indicative, actual may vary_"
+		} else {
+			// Check if price differs significantly from displayed price
+			prices := market.GetOutcomePrices()
+			displayedPrice := 0.0
+			if outcomeIndex < len(prices) {
+				fmt.Sscanf(prices[outcomeIndex], "%f", &displayedPrice)
+			}
+			if displayedPrice > 0 && realPrice > displayedPrice*1.1 {
+				// Price is >10% higher than displayed
+				priceWarning = fmt.Sprintf("\n⚠️ _Orderbook price ($%.2f) is higher than displayed ($%.2f)!_", realPrice, displayedPrice)
+			}
+		}
 	}
 
-	// Show order type selection (same as handleAmountCallback)
+	// Calculate estimated shares
+	estimatedShares := 0.0
+	if realPrice > 0 {
+		estimatedShares = amount / realPrice
+	}
+
+	// Show order type selection with REAL price
 	message := fmt.Sprintf(`🎯 *Buy Order*
 
 *Market:* %s
 *Outcome:* %s
 *Amount:* $%.2f
-*Current Price:* $%.2f
+*Est. Price:* $%.2f (%.0f%%)
+*Est. Shares:* %.2f%s
 
 ───────────────
 
 📊 *Select order type:*
-`, marketName, outcomeName, amount, currentPrice)
+`, marketName, outcomeName, amount, realPrice, realPrice*100, estimatedShares, priceWarning)
 
 	// Create order type selection keyboard
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
@@ -760,38 +800,78 @@ func (b *Bot) handleAmountCallback(ctx context.Context, update *tgbotapi.Update)
 		return
 	}
 
-	// Get outcome name and price for display
+	// Get outcome name
 	outcomes := market.GetOutcomes()
-	prices := market.GetOutcomePrices()
 	outcomeName := "Unknown"
-	currentPrice := 0.0
 	if idx < len(outcomes) {
 		outcomeName = outcomes[idx]
 	}
-	if idx < len(prices) {
-		fmt.Sscanf(prices[idx], "%f", &currentPrice)
-	}
-
-	log.Printf("handleAmountCallback: market=%s, outcomeIndex=%d, outcomeName=%s, price=%.2f",
-		marketID, idx, outcomeName, currentPrice)
 
 	marketName := market.Question
 	if len(marketName) > 40 {
 		marketName = marketName[:37] + "..."
 	}
 
-	// Show order type selection
+	// Get the REAL orderbook price (not the stale outcomePrices)
+	var realPrice float64
+	var priceWarning string
+
+	tokenID, err := b.tradingClient.GetTokenIDByIndex(ctx, marketID, idx)
+	if err != nil {
+		log.Printf("Failed to get tokenID for price check: %v", err)
+		// Fallback to outcomePrices if we can't get orderbook
+		prices := market.GetOutcomePrices()
+		if idx < len(prices) {
+			fmt.Sscanf(prices[idx], "%f", &realPrice)
+		}
+		priceWarning = "\n⚠️ _Price is indicative, actual may vary_"
+	} else {
+		// Fetch actual orderbook price for this amount
+		realPrice, err = b.tradingClient.GetBestPrice(ctx, tokenID, "BUY", amount)
+		if err != nil {
+			log.Printf("Failed to get orderbook price: %v", err)
+			// Fallback to outcomePrices
+			prices := market.GetOutcomePrices()
+			if idx < len(prices) {
+				fmt.Sscanf(prices[idx], "%f", &realPrice)
+			}
+			priceWarning = "\n⚠️ _Price is indicative, actual may vary_"
+		} else {
+			// Check if price differs significantly from displayed price
+			prices := market.GetOutcomePrices()
+			displayedPrice := 0.0
+			if idx < len(prices) {
+				fmt.Sscanf(prices[idx], "%f", &displayedPrice)
+			}
+			if displayedPrice > 0 && realPrice > displayedPrice*1.1 {
+				// Price is >10% higher than displayed
+				priceWarning = fmt.Sprintf("\n⚠️ _Orderbook price ($%.2f) is higher than displayed ($%.2f)!_", realPrice, displayedPrice)
+			}
+		}
+	}
+
+	log.Printf("handleAmountCallback: market=%s, outcomeIndex=%d, outcomeName=%s, realPrice=%.4f",
+		marketID, idx, outcomeName, realPrice)
+
+	// Calculate estimated shares
+	estimatedShares := 0.0
+	if realPrice > 0 {
+		estimatedShares = amount / realPrice
+	}
+
+	// Show order type selection with REAL price
 	message := fmt.Sprintf(`🎯 *Buy Order*
 
 *Market:* %s
 *Outcome:* %s
 *Amount:* $%.2f
-*Current Price:* $%.2f
+*Est. Price:* $%.2f (%.0f%%)
+*Est. Shares:* %.2f%s
 
 ───────────────
 
 📊 *Select order type:*
-`, marketName, outcomeName, amount, currentPrice)
+`, marketName, outcomeName, amount, realPrice, realPrice*100, estimatedShares, priceWarning)
 
 	// Create order type selection keyboard
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
