@@ -308,6 +308,9 @@ func (b *Bot) displayMarketForTrading(ctx context.Context, chatID int64, market 
 		endDate = endDate[:10]
 	}
 
+	// Build Polymarket URL
+	polymarketURL := fmt.Sprintf("https://polymarket.com/event/%s", market.Slug)
+
 	message := fmt.Sprintf(`📈 *%s*
 
 *Current Prices:*
@@ -321,6 +324,8 @@ func (b *Bot) displayMarketForTrading(ctx context.Context, chatID int64, market 
 
 *Status:* %s
 *End Date:* %s
+
+🔗 [View on Polymarket](%s)
 `,
 		market.Question,
 		outcome0Label, polymarket.FormatPrice(price0), price0,
@@ -330,11 +335,15 @@ func (b *Bot) displayMarketForTrading(ctx context.Context, chatID int64, market 
 		polymarket.FormatVolume(market.Liquidity),
 		getMarketStatusFromBot(market),
 		endDate,
+		polymarketURL,
 	)
 
 	// Create buy buttons using index 0 and 1 instead of yes/no
 	// This ensures the button matches the displayed price
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonURL("🌐 Open on Polymarket", polymarketURL),
+		),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("📈 Buy %s", outcome0Label), fmt.Sprintf("buy:0:%s", market.ID)),
 			tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("📉 Buy %s", outcome1Label), fmt.Sprintf("buy:1:%s", market.ID)),
