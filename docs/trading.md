@@ -11,11 +11,13 @@ This document describes the trading implementation for the Polymarket Telegram b
 5. [Code Structure](#code-structure)
 6. [Data Types](#data-types)
 7. [Token ID Resolution](#token-id-resolution)
-8. [Order Types](#order-types)
-9. [API Reference](#api-reference)
-10. [Dependencies](#dependencies)
-11. [Security Considerations](#security-considerations)
-12. [Troubleshooting](#troubleshooting)
+8. [Price Accuracy](#price-accuracy)
+9. [Deep Links for Copy Trading](#deep-links-for-copy-trading)
+10. [Order Types](#order-types)
+11. [API Reference](#api-reference)
+12. [Dependencies](#dependencies)
+13. [Security Considerations](#security-considerations)
+14. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -344,7 +346,7 @@ const (
 
 ## Token ID Resolution
 
-Each market outcome (YES/NO) has a unique ERC1155 token ID.
+Each market outcome has a unique ERC1155 token ID.
 
 ### Token ID Structure
 
@@ -352,31 +354,244 @@ The Gamma API returns token IDs in the `clobTokenIds` field as a JSON array stri
 ```json
 {
     "id": "0x1234...",
+    "outcomes": "[\"Yes\", \"No\"]",
     "clobTokenIds": "[\"12345678901234567890\", \"09876543210987654321\"]"
 }
 ```
 
-- Index 0 = YES token ID
-- Index 1 = NO token ID
+**Important**: The token ID mapping follows the `outcomes` array order:
+- `outcomes[0]` → `clobTokenIds[0]`
+- `outcomes[1]` → `clobTokenIds[1]`
+
+**NOT** always "Index 0 = YES". Markets can have different outcome names:
+- Binary: `["Yes", "No"]`
+- Over/Under: `["Over", "Under"]`
+- Spreads: `["Lakers -5.5", "Celtics +5.5"]`
 
 ### Fetching Token IDs
 
+Use index-based lookup to match the displayed outcome:
+
 ```go
-func (tc *TradingClient) GetTokenIDForOutcome(ctx context.Context, market *GammaMarket, outcome string) (string, error) {
-    // Fetch market details
-    url := fmt.Sprintf("https://gamma-api.polymarket.com/markets/%s", market.ID)
+// GetTokenIDByIndex fetches token ID by outcome index (0 or 1)
+// This matches how outcomes are displayed in the UI
+func (tc *TradingClient) GetTokenIDByIndex(ctx context.Context, marketID string, outcomeIndex int) (string, error) {
+    // Fetch market details with clobTokenIds
+    url := fmt.Sprintf("https://gamma-api.polymarket.com/markets/%s", marketID)
 
     // Parse clobTokenIds JSON array
     var tokenIDs []string
     json.Unmarshal([]byte(marketDetail.ClobTokenIds), &tokenIDs)
 
-    // Return appropriate token ID
-    if outcome == "YES" {
-        return tokenIDs[0], nil
+    if outcomeIndex >= len(tokenIDs) {
+        return "", fmt.Errorf("invalid outcome index")
+    }
+
+    return tokenIDs[outcomeIndex], nil
+}
+```
+
+### UI Button Mapping
+
+When displaying buy buttons, use indices to ensure correct mapping:
+
+```go
+// outcomes[0] = "Yes", prices[0] = "0.57", tokenIDs[0] = "123..."
+// outcomes[1] = "No",  prices[1] = "0.43", tokenIDs[1] = "456..."
+
+// Button callback uses index, not outcome name
+tgbotapi.NewInlineKeyboardButtonData(
+    fmt.Sprintf("Buy %s", outcomes[0]),  // "Buy Yes"
+    fmt.Sprintf("buy:0:%s", market.ID),  // Index 0
+)
+```
+
+---
+
+## Price Accuracy
+
+### The Problem: Stale `outcomePrices`
+
+The Gamma API returns an `outcomePrices` field that appears to show current prices:
+
+```json
+{
+    "outcomePrices": "[\"0.52\", \"0.48\"]"
+}
+```
+
+**WARNING**: This price is **stale/mid-market** and NOT the executable orderbook price!
+
+Real-world example:
+- `outcomePrices` showed: `$0.52`
+- Actual orderbook best ask: `$0.88`
+- User expected to buy at $0.52 but executed at $0.88
+
+### Solution: Fetch Real Orderbook Price
+
+Before showing order confirmation, always fetch the actual orderbook price:
+
+```go
+// Get the REAL orderbook price (not stale outcomePrices)
+tokenID, err := tradingClient.GetTokenIDByIndex(ctx, marketID, outcomeIndex)
+if err != nil {
+    // Fallback to outcomePrices with warning
+    priceWarning = "Price is indicative, actual may vary"
+} else {
+    realPrice, err = tradingClient.GetBestPrice(ctx, tokenID, "BUY", amount)
+    if err != nil {
+        // Fallback with warning
     } else {
-        return tokenIDs[1], nil
+        // Check if price differs significantly
+        if realPrice > displayedPrice * 1.1 {
+            priceWarning = fmt.Sprintf("Orderbook price ($%.2f) is higher than displayed ($%.2f)!",
+                realPrice, displayedPrice)
+        }
     }
 }
+```
+
+### GetBestPrice Implementation
+
+```go
+// GetBestPrice calculates VWAP for a given order size
+func (tc *TradingClient) GetBestPrice(ctx context.Context, tokenID, side string, amount float64) (float64, error) {
+    // Fetch orderbook
+    orderbook, err := tc.GetOrderBook(ctx, tokenID)
+
+    // For BUY: walk through asks
+    // For SELL: walk through bids
+    // Calculate volume-weighted average price (VWAP)
+
+    return vwapPrice, nil
+}
+```
+
+### When to Use Each Price
+
+| Use Case | Price Source | Notes |
+|----------|--------------|-------|
+| Market list display | `outcomePrices` | OK for browsing, not trading |
+| Order confirmation | `GetBestPrice()` | Required for accurate estimates |
+| Order execution | `GetBestPrice()` | Always use real orderbook |
+
+---
+
+## Deep Links for Copy Trading
+
+The bot supports deep links for quick market access, useful for copy trading signals.
+
+### Supported Deep Link Formats
+
+| Format | Example | Use Case |
+|--------|---------|----------|
+| `s_<slug>` | `s_will-trump-win` | **Recommended** - Works reliably |
+| `m_<marketID>` | `m_666646` | Alternative - Uses numeric ID |
+
+### URL Structure
+
+```
+https://t.me/YOUR_BOT_NAME?start=s_<market-slug>
+```
+
+Example:
+```
+https://t.me/poly_trade_bot?start=s_lighter-market-cap-fdv-3b-one-day-after-launch-227
+```
+
+### Deep Link Handling
+
+```go
+func (b *Bot) handleDeepLink(ctx context.Context, update *tgbotapi.Update) {
+    parameter := strings.TrimPrefix(update.Message.Text, "/start ")
+
+    // Handle slug deep links: s_<slug>
+    if strings.HasPrefix(parameter, "s_") {
+        slug := strings.TrimPrefix(parameter, "s_")
+        b.handleMarketBySlug(ctx, update, slug)
+        return
+    }
+
+    // Handle market ID deep links: m_<marketID>
+    if strings.HasPrefix(parameter, "m_") {
+        marketID := strings.TrimPrefix(parameter, "m_")
+        b.handleMarketByID(ctx, update, marketID)
+        return
+    }
+}
+```
+
+### Why Slug Instead of ConditionId?
+
+We initially tried `conditionId` (64-char hex) for deep links:
+
+| Approach | Issues |
+|----------|--------|
+| `c_0x<conditionId>` | Exceeds Telegram's 64-char parameter limit |
+| `c_<conditionId>` (no 0x) | Still 64 chars, at the limit |
+| Base64URL encoding | Gamma API ignores `condition_id` query param |
+| **Slug-based** | Works reliably, human-readable |
+
+### Polymarket URL Generation
+
+When displaying market details, link to the actual Polymarket website:
+
+```go
+// Use eventSlug (parent event), NOT market slug
+polymarketURL := fmt.Sprintf("https://polymarket.com/event/%s", market.GetEventSlug())
+```
+
+**Important**: Market slug ≠ Event slug
+
+| Type | Example |
+|------|---------|
+| Market slug | `lighter-market-cap-fdv-3b-one-day-after-launch-227` |
+| Event slug | `lighter-market-cap-fdv-one-day-after-launch` |
+| Correct URL | `https://polymarket.com/event/lighter-market-cap-fdv-one-day-after-launch` |
+
+### GammaEvent Structure
+
+```go
+// GammaEvent represents a parent event from the Gamma API
+type GammaEvent struct {
+    ID    string `json:"id"`
+    Slug  string `json:"slug"`
+    Title string `json:"title"`
+}
+
+// GammaMarket includes parent events
+type GammaMarket struct {
+    // ... other fields
+    Events []*GammaEvent `json:"events"` // Parent events
+}
+
+// GetEventSlug returns parent event slug, or market slug as fallback
+func (m *GammaMarket) GetEventSlug() string {
+    if len(m.Events) > 0 && m.Events[0].Slug != "" {
+        return m.Events[0].Slug
+    }
+    return m.Slug // Fallback
+}
+```
+
+### Copy Trading Workflow
+
+```
+Smart Money Bot detects trade
+         │
+         ▼
+Sends signal with deep link:
+"BUY Under @ 0.52
+ https://t.me/poly_bot?start=s_lighter-market-cap-fdv-3b..."
+         │
+         ▼
+User clicks link → Bot opens
+         │
+         ▼
+Market details displayed with REAL orderbook price
+         │
+         ▼
+User selects outcome → Amount → Execute
 ```
 
 ---
