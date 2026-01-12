@@ -502,10 +502,9 @@ func (tc *TradingClient) ExecuteTrade(
 	// For SELL: makerAmount = shares sold, takerAmount = USDC received
 	//
 	// Polymarket decimal precision requirements:
-	// - BUY orders: makerAmount (USDC) max 5 decimals, takerAmount (shares) max 2 decimals
+	// - BUY orders: makerAmount (USDC) max 4 decimals, takerAmount (shares) max 2 decimals
 	// - SELL orders: makerAmount (shares) max 2 decimals, takerAmount (USDC) max 4 decimals
 	// With 6 decimal representation:
-	// - 5 decimals = must be divisible by 10
 	// - 4 decimals = must be divisible by 100
 	// - 2 decimals = must be divisible by 10000
 	var makerAmount, takerAmount string
@@ -521,9 +520,9 @@ func (tc *TradingClient) ExecuteTrade(
 		takerAmount = strconv.FormatInt(sharesRounded, 10)
 		// Step 2: Calculate makerAmount FROM shares * price to ensure consistency
 		// This is critical: Polymarket validates makerAmount == takerAmount * price
-		// makerAmount (USDC): max 5 decimals -> round to nearest 10
+		// makerAmount (USDC): max 4 decimals -> round to nearest 100
 		makerAmountRaw := int64(float64(sharesRounded) * price)
-		makerAmountRaw = (makerAmountRaw / 10) * 10
+		makerAmountRaw = (makerAmountRaw / 100) * 100
 		makerAmount = strconv.FormatInt(makerAmountRaw, 10)
 		log.Printf("ExecuteTrade BUY: makerAmount=%s USDC (calculated from shares*price), takerAmount=%s shares (raw=%d), price=%.6f, originalUSDC=%.2f",
 			makerAmount, takerAmount, shares, price, trade.Amount)
