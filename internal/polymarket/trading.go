@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/big"
 	"net/http"
 	"sort"
@@ -521,7 +522,8 @@ func (tc *TradingClient) ExecuteTrade(
 		// Step 2: Calculate makerAmount FROM shares * price to ensure consistency
 		// This is critical: Polymarket validates makerAmount == takerAmount * price
 		// makerAmount (USDC): max 4 decimals -> round to nearest 100
-		makerAmountRaw := int64(float64(sharesRounded) * price)
+		// Use math.Round to avoid floating-point truncation errors (e.g., 75*0.69 = 51.7499...)
+		makerAmountRaw := int64(math.Round(float64(sharesRounded) * price))
 		makerAmountRaw = (makerAmountRaw / 100) * 100
 		makerAmount = strconv.FormatInt(makerAmountRaw, 10)
 		log.Printf("ExecuteTrade BUY: makerAmount=%s USDC (calculated from shares*price), takerAmount=%s shares (raw=%d), price=%.6f, originalUSDC=%.2f",
@@ -544,7 +546,8 @@ func (tc *TradingClient) ExecuteTrade(
 		makerAmount = strconv.FormatInt(sharesRounded, 10)
 		// takerAmount (USDC): calculated from shares * price, max 4 decimals -> round down to nearest 100
 		// We calculate from shares to ensure amounts are consistent
-		takerAmountRaw := int64(float64(sharesRounded) * price)
+		// Use math.Round to avoid floating-point truncation errors (e.g., 75*0.69 = 51.7499...)
+		takerAmountRaw := int64(math.Round(float64(sharesRounded) * price))
 		takerAmountRaw = (takerAmountRaw / 100) * 100
 		takerAmount = strconv.FormatInt(takerAmountRaw, 10)
 		log.Printf("ExecuteTrade SELL: makerAmount=%s shares (raw=%d, rounded=%d), takerAmount=%s USDC (calculated from shares*price), impliedPrice=%.6f",
