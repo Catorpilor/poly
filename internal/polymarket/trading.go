@@ -524,7 +524,7 @@ func (tc *TradingClient) ExecuteTrade(
 		// makerAmount (USDC): max 4 decimals -> round to nearest 100
 		// Use math.Round to avoid floating-point truncation errors (e.g., 75*0.69 = 51.7499...)
 		makerAmountRaw := int64(math.Round(float64(sharesRounded) * price))
-		makerAmountRaw = (makerAmountRaw / 100) * 100
+		makerAmountRaw = ((makerAmountRaw + 50) / 100) * 100
 		makerAmount = strconv.FormatInt(makerAmountRaw, 10)
 		log.Printf("ExecuteTrade BUY: makerAmount=%s USDC (calculated from shares*price), takerAmount=%s shares (raw=%d), price=%.6f, originalUSDC=%.2f",
 			makerAmount, takerAmount, shares, price, trade.Amount)
@@ -544,11 +544,11 @@ func (tc *TradingClient) ExecuteTrade(
 		}
 		sharesRounded := (shares / 10000) * 10000
 		makerAmount = strconv.FormatInt(sharesRounded, 10)
-		// takerAmount (USDC): calculated from shares * price, max 4 decimals -> round down to nearest 100
+		// takerAmount (USDC): calculated from shares * price, max 4 decimals -> round to nearest 100
 		// We calculate from shares to ensure amounts are consistent
 		// Use math.Round to avoid floating-point truncation errors (e.g., 75*0.69 = 51.7499...)
 		takerAmountRaw := int64(math.Round(float64(sharesRounded) * price))
-		takerAmountRaw = (takerAmountRaw / 100) * 100
+		takerAmountRaw = ((takerAmountRaw + 50) / 100) * 100
 		takerAmount = strconv.FormatInt(takerAmountRaw, 10)
 		log.Printf("ExecuteTrade SELL: makerAmount=%s shares (raw=%d, rounded=%d), takerAmount=%s USDC (calculated from shares*price), impliedPrice=%.6f",
 			makerAmount, shares, sharesRounded, takerAmount, float64(takerAmountRaw)/float64(sharesRounded))
