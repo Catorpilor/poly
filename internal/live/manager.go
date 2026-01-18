@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
+	"os"
 	"sync"
 	"time"
 
@@ -324,12 +326,29 @@ func (m *LiveTradeManager) Start() error {
 	connectedCh := make(chan struct{})
 	var connectedOnce sync.Once
 
-	// Create client with options
-	m.client = polymarketrealtime.New(
+	// Build client options
+	opts := []polymarketrealtime.ClientOption{
 		polymarketrealtime.WithLogger(polymarketrealtime.NewSilentLogger()),
 		polymarketrealtime.WithAutoReconnect(true),
 		polymarketrealtime.WithMaxReconnectAttempts(10),
-		polymarketrealtime.WithPingInterval(5*time.Second),
+		polymarketrealtime.WithPingInterval(5 * time.Second),
+	}
+
+	// Configure proxy from environment if set
+	if proxyStr := os.Getenv("https_proxy"); proxyStr != "" {
+		if proxyURL, err := url.Parse(proxyStr); err == nil {
+			opts = append(opts, polymarketrealtime.WithProxyURL(proxyURL))
+			log.Printf("LiveTradeManager: Using proxy %s", proxyStr)
+		}
+	} else if proxyStr := os.Getenv("HTTPS_PROXY"); proxyStr != "" {
+		if proxyURL, err := url.Parse(proxyStr); err == nil {
+			opts = append(opts, polymarketrealtime.WithProxyURL(proxyURL))
+			log.Printf("LiveTradeManager: Using proxy %s", proxyStr)
+		}
+	}
+
+	// Add connection callbacks
+	opts = append(opts,
 		polymarketrealtime.WithOnConnect(func() {
 			log.Println("LiveTradeManager: Connected to RTDS WebSocket")
 			m.mu.Lock()
@@ -349,6 +368,9 @@ func (m *LiveTradeManager) Start() error {
 			m.mu.Unlock()
 		}),
 	)
+
+	// Create client with options
+	m.client = polymarketrealtime.New(opts...)
 
 	if err := m.client.Connect(); err != nil {
 		return err
