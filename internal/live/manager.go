@@ -311,11 +311,15 @@ func (m *LiveTradeManager) SetTelegramBot(bot TelegramSender) {
 // Start establishes connection to the RTDS WebSocket
 func (m *LiveTradeManager) Start() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if m.connected {
+		m.mu.Unlock()
 		return nil
 	}
+	m.mu.Unlock()
+
+	// Channel to signal connection is ready
+	connectedCh := make(chan struct{})
+	var connectedOnce sync.Once
 
 	// Create client with options
 	m.client = polymarketrealtime.New(
@@ -328,6 +332,10 @@ func (m *LiveTradeManager) Start() error {
 			m.mu.Lock()
 			m.connected = true
 			m.mu.Unlock()
+			// Signal that initial connection is ready
+			connectedOnce.Do(func() {
+				close(connectedCh)
+			})
 			// Re-subscribe to all tracked assets on reconnect
 			m.resubscribeAllAssets()
 		}),
@@ -343,7 +351,14 @@ func (m *LiveTradeManager) Start() error {
 		return err
 	}
 
-	log.Println("LiveTradeManager: Started and connected to RTDS WebSocket")
+	// Wait for connection to be established (with timeout)
+	select {
+	case <-connectedCh:
+		log.Println("LiveTradeManager: Started and connected to RTDS WebSocket")
+	case <-time.After(10 * time.Second):
+		log.Println("LiveTradeManager: Warning - connection timeout, continuing anyway")
+	}
+
 	return nil
 }
 
