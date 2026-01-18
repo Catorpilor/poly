@@ -532,11 +532,6 @@ func (m *LiveTradeManager) handleTrade(payload *rtdsTradePayload) {
 	}
 
 	if matchedSlug == "" {
-		// Log first few unmatched trades for debugging
-		if len(subscribedEvents) > 0 {
-			log.Printf("LiveTradeManager: Unmatched trade - event_slug=%s, asset=%s, subscribed=%v",
-				payload.EventSlug, payload.Asset[:min(16, len(payload.Asset))], subscribedEvents)
-		}
 		return
 	}
 

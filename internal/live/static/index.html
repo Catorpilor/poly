@@ -275,10 +275,21 @@
             return panel;
         }
 
+        function formatTimeUTC8(timestamp) {
+            const date = timestamp ? new Date(timestamp) : new Date();
+            return date.toLocaleTimeString('en-US', {
+                timeZone: 'Asia/Shanghai',
+                hour12: false,
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+        }
+
         function createTradeHTML(trade) {
             const isBuy = trade.side === 'BUY';
             const sideColor = isBuy ? 'text-green-400' : 'text-red-400';
-            const time = trade.timestamp ? new Date(trade.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
+            const time = formatTimeUTC8(trade.timestamp);
 
             // Build trader link
             const traderName = trade.trader || 'Anonymous';
