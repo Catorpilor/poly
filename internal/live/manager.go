@@ -388,6 +388,10 @@ func (m *LiveTradeManager) pingLoop() {
 }
 
 func (m *LiveTradeManager) readLoop() {
+	messageCount := 0
+	tradeCount := 0
+	lastLogTime := time.Now()
+
 	for {
 		m.mu.RLock()
 		conn := m.conn
@@ -405,6 +409,8 @@ func (m *LiveTradeManager) readLoop() {
 			return
 		}
 
+		messageCount++
+
 		// Skip PONG messages
 		if string(message) == "PONG" {
 			continue
@@ -418,7 +424,15 @@ func (m *LiveTradeManager) readLoop() {
 
 		// Handle activity trades
 		if event.Topic == "activity" && event.Type == "trades" {
+			tradeCount++
 			m.handleTrade(&event.Payload)
+		}
+
+		// Log stats every 60 seconds
+		if time.Since(lastLogTime) > 60*time.Second {
+			log.Printf("LiveTradeManager: Stats - messages=%d, trades=%d, subscribed_events=%v",
+				messageCount, tradeCount, m.subscriptions.GetAllSubscribedEvents())
+			lastLogTime = time.Now()
 		}
 	}
 }
@@ -518,6 +532,11 @@ func (m *LiveTradeManager) handleTrade(payload *rtdsTradePayload) {
 	}
 
 	if matchedSlug == "" {
+		// Log first few unmatched trades for debugging
+		if len(subscribedEvents) > 0 {
+			log.Printf("LiveTradeManager: Unmatched trade - event_slug=%s, asset=%s, subscribed=%v",
+				payload.EventSlug, payload.Asset[:min(16, len(payload.Asset))], subscribedEvents)
+		}
 		return
 	}
 
@@ -564,6 +583,18 @@ func (m *LiveTradeManager) IsConnected() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.connected
+}
+
+func (m *LiveTradeManager) IsSubscribed() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.subscribed
+}
+
+func (m *LiveTradeManager) GetTrackedAssetCount() int {
+	m.assetMu.RLock()
+	defer m.assetMu.RUnlock()
+	return len(m.assetToEvent)
 }
 
 func (m *LiveTradeManager) SubscribeTelegram(ctx context.Context, chatID int64, eventSlug string) (*EventInfo, error) {

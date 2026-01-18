@@ -241,9 +241,17 @@ func (ws *WebServer) sendResponse(conn *websocket.Conn, resp wsResponse) {
 // handleHealth returns a simple health check response
 func (ws *WebServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	connected := "false"
-	if ws.liveManager.IsConnected() {
-		connected = "true"
+
+	subscribedEvents := ws.liveManager.subscriptions.GetAllSubscribedEvents()
+	trackedAssets := ws.liveManager.GetTrackedAssetCount()
+
+	resp := map[string]interface{}{
+		"status":            "ok",
+		"rtds_connected":    ws.liveManager.IsConnected(),
+		"rtds_subscribed":   ws.liveManager.IsSubscribed(),
+		"subscribed_events": subscribedEvents,
+		"tracked_assets":    trackedAssets,
 	}
-	fmt.Fprintf(w, `{"status": "ok", "rtds_connected": %s}`, connected)
+
+	json.NewEncoder(w).Encode(resp)
 }
