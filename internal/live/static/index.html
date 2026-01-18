@@ -276,7 +276,15 @@
         }
 
         function formatTimeUTC8(timestamp) {
-            const date = timestamp ? new Date(timestamp) : new Date();
+            let date;
+            if (timestamp) {
+                // RTDS timestamps are in seconds, JavaScript expects milliseconds
+                // If timestamp is 10 digits (seconds), multiply by 1000
+                const ts = timestamp < 10000000000 ? timestamp * 1000 : timestamp;
+                date = new Date(ts);
+            } else {
+                date = new Date();
+            }
             return date.toLocaleTimeString('en-US', {
                 timeZone: 'Asia/Shanghai',
                 hour12: false,
