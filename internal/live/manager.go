@@ -426,22 +426,26 @@ func (m *LiveTradeManager) readLoop() {
 		// Handle activity trades
 		if event.Topic == "activity" && event.Type == "trades" {
 			tradeCount++
+			// Log first raw payload to see actual field names
+			if tradeCount == 1 {
+				log.Printf("LiveTradeManager: First trade payload (raw): %s", string(message))
+			}
 			// Track sample of incoming event slugs (keep up to 10 unique)
-			if len(sampleSlugs) < 10 && event.Payload.EventSlug != "" {
-				sampleSlugs[event.Payload.EventSlug]++
+			slug := event.Payload.EventSlug
+			if slug == "" {
+				slug = event.Payload.Slug // Try alternate field
+			}
+			if len(sampleSlugs) < 10 && slug != "" {
+				sampleSlugs[slug]++
 			}
 			m.handleTrade(&event.Payload)
 		}
 
 		// Log stats every 60 seconds
 		if time.Since(lastLogTime) > 60*time.Second {
-			log.Printf("LiveTradeManager: Stats - messages=%d, trades=%d, subscribed=%v",
-				messageCount, tradeCount, m.subscriptions.GetAllSubscribedEvents())
-			// Log sample of incoming slugs to debug matching
-			if len(sampleSlugs) > 0 {
-				log.Printf("LiveTradeManager: Sample incoming event_slugs: %v", sampleSlugs)
-				sampleSlugs = make(map[string]int) // Reset
-			}
+			log.Printf("LiveTradeManager: Stats - messages=%d, trades=%d, subscribed=%v, sample_slugs=%v",
+				messageCount, tradeCount, m.subscriptions.GetAllSubscribedEvents(), sampleSlugs)
+			sampleSlugs = make(map[string]int) // Reset
 			lastLogTime = time.Now()
 		}
 	}
