@@ -35,6 +35,9 @@ COPY --from=builder /app/polybot .
 # Use non-root user
 USER appuser
 
+# Expose web server port for live trade monitoring
+EXPOSE 8081
+
 # Health check (optional - bot doesn't expose HTTP but useful for debugging)
 # HEALTHCHECK --interval=30s --timeout=3s CMD pgrep polybot || exit 1
 
