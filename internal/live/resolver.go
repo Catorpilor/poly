@@ -149,6 +149,35 @@ func (r *EventSlugResolver) GetAllAssetIDs(event *EventInfo) []string {
 	return assetIDs
 }
 
+// GetPrimaryMarketAssetIDs returns asset IDs for only the primary (ML) market
+// The primary market is typically the first active market (index 0)
+func (r *EventSlugResolver) GetPrimaryMarketAssetIDs(event *EventInfo) []string {
+	// Find the first active, non-closed market
+	for _, market := range event.Markets {
+		if market.Active && !market.Closed {
+			return market.GetClobTokenIds()
+		}
+	}
+	// Fallback to first market if none are active
+	if len(event.Markets) > 0 {
+		return event.Markets[0].GetClobTokenIds()
+	}
+	return nil
+}
+
+// GetPrimaryMarket returns the primary (ML) market for an event
+func (r *EventSlugResolver) GetPrimaryMarket(event *EventInfo) *MarketInfo {
+	for i := range event.Markets {
+		if event.Markets[i].Active && !event.Markets[i].Closed {
+			return &event.Markets[i]
+		}
+	}
+	if len(event.Markets) > 0 {
+		return &event.Markets[0]
+	}
+	return nil
+}
+
 // GetAllConditionIDs returns all condition IDs for an event
 func (r *EventSlugResolver) GetAllConditionIDs(event *EventInfo) []string {
 	var conditionIDs []string

@@ -362,11 +362,18 @@ func (m *LiveTradeManager) Start() error {
 	return nil
 }
 
-// subscribeToEventAssets subscribes to all asset IDs for an event on the RTDS WebSocket
+// subscribeToEventAssets subscribes to the primary market's asset IDs for an event on the RTDS WebSocket
+// For sports/esports events, this is the Moneyline (ML) market - "who will win"
 func (m *LiveTradeManager) subscribeToEventAssets(eventSlug string, eventInfo *EventInfo) error {
-	assetIDs := m.resolver.GetAllAssetIDs(eventInfo)
+	// Only subscribe to primary market (ML), not all sub-markets
+	assetIDs := m.resolver.GetPrimaryMarketAssetIDs(eventInfo)
 	if len(assetIDs) == 0 {
 		return fmt.Errorf("no asset IDs found for event %s", eventSlug)
+	}
+
+	primaryMarket := m.resolver.GetPrimaryMarket(eventInfo)
+	if primaryMarket != nil {
+		log.Printf("LiveTradeManager: Subscribing to primary market: %s", primaryMarket.Question)
 	}
 
 	m.rtdsMu.Lock()
