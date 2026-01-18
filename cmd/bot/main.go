@@ -10,6 +10,7 @@ import (
 
 	"github.com/Catorpilor/poly/internal/config"
 	"github.com/Catorpilor/poly/internal/database"
+	"github.com/Catorpilor/poly/internal/live"
 	"github.com/Catorpilor/poly/internal/telegram"
 )
 
@@ -45,6 +46,18 @@ func main() {
 	bot, err := telegram.NewBot(cfg, db)
 	if err != nil {
 		log.Fatalf("Failed to create bot: %v", err)
+	}
+
+	// Start live monitoring web server
+	liveWebPort := 8081 // Default port for live monitoring web interface
+	if cfg.App.Port > 0 {
+		liveWebPort = cfg.App.Port + 1 // Use next port after app port
+	}
+	webServer := live.NewWebServer(bot.GetLiveManager(), liveWebPort)
+	if err := webServer.Start(); err != nil {
+		log.Printf("Warning: Failed to start live monitoring web server: %v", err)
+	} else {
+		log.Printf("Live monitoring web server started on port %d", liveWebPort)
 	}
 
 	// Set up graceful shutdown

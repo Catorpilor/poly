@@ -14,6 +14,7 @@ import (
 	"github.com/Catorpilor/poly/internal/config"
 	"github.com/Catorpilor/poly/internal/database"
 	"github.com/Catorpilor/poly/internal/database/repositories"
+	"github.com/Catorpilor/poly/internal/live"
 	"github.com/Catorpilor/poly/internal/polymarket"
 	"github.com/Catorpilor/poly/internal/wallet"
 )
@@ -31,6 +32,7 @@ type Bot struct {
 	blockchain    *blockchain.Client
 	proxyResolver *polymarket.ProxyResolver
 	tradingClient *polymarket.TradingClient
+	liveManager   *live.LiveTradeManager
 }
 
 // CommandHandler is a function that handles a command
@@ -66,6 +68,9 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 	// Create trading client
 	tradingClient := polymarket.NewTradingClient(cfg.Polymarket.CLOBAPIUrl, cfg.Blockchain.ChainID)
 
+	// Create live trade manager
+	liveManager := live.NewLiveTradeManager()
+
 	bot := &Bot{
 		api:           api,
 		config:        cfg,
@@ -78,6 +83,16 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 		blockchain:    blockchainClient,
 		proxyResolver: proxyResolver,
 		tradingClient: tradingClient,
+		liveManager:   liveManager,
+	}
+
+	// Set bot as telegram sender for live manager
+	liveManager.SetTelegramBot(bot)
+
+	// Start live trade manager
+	if err := liveManager.Start(); err != nil {
+		log.Printf("Warning: Failed to start live trade manager: %v", err)
+		// Don't fail completely, just log the error
 	}
 
 	// Register command handlers
@@ -108,6 +123,10 @@ func (b *Bot) registerHandlers() {
 	b.handlers["/gas"] = b.handleGas
 	b.handlers["/help"] = b.handleHelp
 	b.handlers["/refresh"] = b.handleRefresh
+	// Live monitoring commands
+	b.handlers["/live"] = b.handleLive
+	b.handlers["/stoplive"] = b.handleStopLive
+	b.handlers["/subs"] = b.handleSubs
 }
 
 // Start starts the bot and begins listening for updates
@@ -565,6 +584,16 @@ func (b *Bot) sendMessage(chatID int64, text string) {
 	if _, err := b.api.Send(msg); err != nil {
 		log.Printf("Error sending message: %v", err)
 	}
+}
+
+// SendMessage is a public wrapper for sendMessage to satisfy TelegramSender interface
+func (b *Bot) SendMessage(chatID int64, text string) {
+	b.sendMessage(chatID, text)
+}
+
+// GetLiveManager returns the live trade manager
+func (b *Bot) GetLiveManager() *live.LiveTradeManager {
+	return b.liveManager
 }
 
 // sendMessageAndReturn sends a message and returns the sent message
