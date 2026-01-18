@@ -14,7 +14,8 @@ type TradeInfo struct {
 	Pseudonym   string
 	Side        string // BUY or SELL
 	Outcome     string // YES, NO, or custom outcome
-	MarketName  string // Short market name (e.g., "WOL", "DRAW", "NEW" for 3-way)
+	MarketName  string // Short market name (e.g., "WOL", "DRAW", "NEW" for 3-way, or "Over 2.5" for sub-markets)
+	IsSubMarket bool   // True for over/under, btts, etc. (don't append Yes/No)
 	Size        decimal.Decimal
 	Price       decimal.Decimal
 	Timestamp   int64
@@ -30,7 +31,8 @@ func NewTradeFormatter() *TradeFormatter {
 
 // FormatForTelegram formats a trade for Telegram display
 // Format: "[LAL-POR] Whale123 BUY YES $500.00 @ $0.65"
-// For 3-way: "[WOL-NEW] Whale123 BUY WOL YES $500.00 @ $0.65"
+// For 3-way ML: "[WOL-NEW] Whale123 BUY DRAW YES $500.00 @ $0.65"
+// For sub-markets: "[AST-EVE] Whale123 BUY Over 2.5 $500.00 @ $0.65"
 func (f *TradeFormatter) FormatForTelegram(trade *TradeInfo) string {
 	trader := trade.Pseudonym
 	if trader == "" {
@@ -39,10 +41,18 @@ func (f *TradeFormatter) FormatForTelegram(trade *TradeInfo) string {
 
 	shortEvent := ShortenEventSlug(trade.EventSlug)
 
-	// Combine market name with outcome for clearer display
+	// Determine what to display as outcome
 	outcome := trade.Outcome
+	outcomeUpper := strings.ToUpper(trade.Outcome)
 	if trade.MarketName != "" {
-		outcome = trade.MarketName + " " + trade.Outcome
+		if trade.IsSubMarket {
+			// For sub-markets (Over 2.5, BTTS, etc.), just show the market name
+			outcome = trade.MarketName
+		} else if outcomeUpper == "YES" || outcomeUpper == "NO" {
+			// For ML markets with Yes/No outcomes (WOL, DRAW, NEW), show market name + YES/NO
+			outcome = trade.MarketName + " " + trade.Outcome
+		}
+		// Otherwise outcome is already a team name (e.g., "Grizzlies"), use as-is
 	}
 
 	return fmt.Sprintf("[%s] %s %s %s $%s @ $%s",
@@ -74,10 +84,18 @@ func (f *TradeFormatter) FormatForWeb(trade *TradeInfo) *WebTradeFormat {
 		trader = truncateAddress(trade.ProxyWallet)
 	}
 
-	// Combine market name with outcome for 3-way markets
+	// Determine what to display as outcome
 	outcome := trade.Outcome
+	outcomeUpper := strings.ToUpper(trade.Outcome)
 	if trade.MarketName != "" {
-		outcome = trade.MarketName + " " + trade.Outcome
+		if trade.IsSubMarket {
+			// For sub-markets (Over 2.5, BTTS, etc.), just show the market name
+			outcome = trade.MarketName
+		} else if outcomeUpper == "YES" || outcomeUpper == "NO" {
+			// For ML markets with Yes/No outcomes (WOL, DRAW, NEW), show market name + YES/NO
+			outcome = trade.MarketName + " " + trade.Outcome
+		}
+		// Otherwise outcome is already a team name (e.g., "Grizzlies"), use as-is
 	}
 
 	return &WebTradeFormat{

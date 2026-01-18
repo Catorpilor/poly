@@ -55,10 +55,14 @@
 
         <!-- Add Event Bar -->
         <div id="addEventSection" class="hidden mb-6">
-            <div class="flex gap-2">
+            <div class="flex gap-2 items-center">
                 <input type="text" id="eventSlug"
                        placeholder="Enter event slug (e.g., nba-lal-por-2026-01-17)"
                        class="flex-1 px-4 py-2 rounded bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500 text-white placeholder-gray-500 text-sm">
+                <label class="flex items-center gap-2 text-sm text-gray-400 cursor-pointer">
+                    <input type="checkbox" id="allMarketsToggle" class="w-4 h-4 rounded bg-gray-700 border-gray-600">
+                    <span>All Markets</span>
+                </label>
                 <button onclick="subscribeEvent()"
                         class="px-4 py-2 bg-green-600 hover:bg-green-700 rounded text-sm font-medium transition-colors">
                     Add Event
@@ -181,13 +185,15 @@
 
         function subscribeEvent() {
             const input = document.getElementById('eventSlug');
+            const allMarketsToggle = document.getElementById('allMarketsToggle');
             const eventSlug = input.value.trim();
+            const allMarkets = allMarketsToggle.checked;
 
             if (!eventSlug) return;
             if (subscriptions.has(eventSlug)) return;
 
             if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ action: 'subscribe', event: eventSlug }));
+                ws.send(JSON.stringify({ action: 'subscribe', event: eventSlug, allMarkets: allMarkets }));
                 input.value = '';
             }
         }

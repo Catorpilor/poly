@@ -14,8 +14,9 @@ import (
 
 // WebSocket message types
 type wsMessage struct {
-	Action string `json:"action"` // subscribe, unsubscribe, list
-	Event  string `json:"event"`  // event slug
+	Action     string `json:"action"`     // subscribe, unsubscribe, list
+	Event      string `json:"event"`      // event slug
+	AllMarkets bool   `json:"allMarkets"` // true to show all markets, false for ML only
 }
 
 type wsResponse struct {
@@ -129,7 +130,7 @@ func (ws *WebServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		// Handle the action
 		switch msg.Action {
 		case "subscribe":
-			ws.handleSubscribe(conn, msg.Event)
+			ws.handleSubscribe(conn, msg.Event, msg.AllMarkets)
 		case "unsubscribe":
 			ws.handleUnsubscribe(conn, msg.Event)
 		case "list":
@@ -146,7 +147,7 @@ func (ws *WebServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSubscribe handles a subscribe request
-func (ws *WebServer) handleSubscribe(conn *websocket.Conn, eventSlug string) {
+func (ws *WebServer) handleSubscribe(conn *websocket.Conn, eventSlug string, allMarkets bool) {
 	if eventSlug == "" {
 		ws.sendResponse(conn, wsResponse{
 			Type:    "error",
@@ -176,7 +177,7 @@ func (ws *WebServer) handleSubscribe(conn *websocket.Conn, eventSlug string) {
 		return
 	}
 
-	if err := ws.liveManager.SubscribeWeb(conn, eventSlug); err != nil {
+	if err := ws.liveManager.SubscribeWeb(conn, eventSlug, allMarkets); err != nil {
 		ws.sendResponse(conn, wsResponse{
 			Type:    "error",
 			Event:   eventSlug,

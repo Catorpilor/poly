@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -63,13 +64,16 @@ type SubscriptionRegistry struct {
 	telegramSubs map[string]map[int64]bool
 	userEvents   map[int64]map[string]bool
 	webSubs      map[string]map[*websocket.Conn]bool
+	// Track "all markets" flag per subscription (default false = ML only)
+	webSubsAllMarkets map[string]map[*websocket.Conn]bool
 }
 
 func NewSubscriptionRegistry() *SubscriptionRegistry {
 	return &SubscriptionRegistry{
-		telegramSubs: make(map[string]map[int64]bool),
-		userEvents:   make(map[int64]map[string]bool),
-		webSubs:      make(map[string]map[*websocket.Conn]bool),
+		telegramSubs:      make(map[string]map[int64]bool),
+		userEvents:        make(map[int64]map[string]bool),
+		webSubs:           make(map[string]map[*websocket.Conn]bool),
+		webSubsAllMarkets: make(map[string]map[*websocket.Conn]bool),
 	}
 }
 
@@ -184,7 +188,7 @@ func (r *SubscriptionRegistry) HasTelegramSubscribers(eventSlug string) bool {
 	return len(r.telegramSubs[eventSlug]) > 0
 }
 
-func (r *SubscriptionRegistry) SubscribeWeb(conn *websocket.Conn, eventSlug string) {
+func (r *SubscriptionRegistry) SubscribeWeb(conn *websocket.Conn, eventSlug string, allMarkets bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -192,6 +196,12 @@ func (r *SubscriptionRegistry) SubscribeWeb(conn *websocket.Conn, eventSlug stri
 		r.webSubs[eventSlug] = make(map[*websocket.Conn]bool)
 	}
 	r.webSubs[eventSlug][conn] = true
+
+	// Track allMarkets preference
+	if r.webSubsAllMarkets[eventSlug] == nil {
+		r.webSubsAllMarkets[eventSlug] = make(map[*websocket.Conn]bool)
+	}
+	r.webSubsAllMarkets[eventSlug][conn] = allMarkets
 }
 
 func (r *SubscriptionRegistry) UnsubscribeWeb(conn *websocket.Conn) {
@@ -202,6 +212,12 @@ func (r *SubscriptionRegistry) UnsubscribeWeb(conn *websocket.Conn) {
 		delete(conns, conn)
 		if len(conns) == 0 {
 			delete(r.webSubs, eventSlug)
+		}
+	}
+	for eventSlug, conns := range r.webSubsAllMarkets {
+		delete(conns, conn)
+		if len(conns) == 0 {
+			delete(r.webSubsAllMarkets, eventSlug)
 		}
 	}
 }
@@ -222,6 +238,14 @@ func (r *SubscriptionRegistry) UnsubscribeWebFromEvent(conn *websocket.Conn, eve
 	delete(conns, conn)
 	if len(conns) == 0 {
 		delete(r.webSubs, eventSlug)
+	}
+
+	// Also clean up allMarkets map
+	if allConns, ok := r.webSubsAllMarkets[eventSlug]; ok {
+		delete(allConns, conn)
+		if len(allConns) == 0 {
+			delete(r.webSubsAllMarkets, eventSlug)
+		}
 	}
 	return true
 }
@@ -266,6 +290,16 @@ func (r *SubscriptionRegistry) GetWebSubscribers(eventSlug string) []*websocket.
 	return result
 }
 
+func (r *SubscriptionRegistry) WantsAllMarkets(conn *websocket.Conn, eventSlug string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if conns, ok := r.webSubsAllMarkets[eventSlug]; ok {
+		return conns[conn]
+	}
+	return false
+}
+
 func (r *SubscriptionRegistry) GetAllSubscribedEvents() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -292,12 +326,13 @@ type LiveTradeManager struct {
 	formatter     *TradeFormatter
 	telegramBot   TelegramSender
 
-	mu         sync.RWMutex
-	conn       *websocket.Conn
-	connected  bool
-	subscribed bool // Whether we've sent the subscription message
-	ctx        context.Context
-	cancel     context.CancelFunc
+	mu              sync.RWMutex
+	conn            *websocket.Conn
+	connected       bool
+	subscribed      bool // Whether we've sent the subscription message
+	lastMessageTime time.Time
+	ctx             context.Context
+	cancel          context.CancelFunc
 
 	// Map asset ID to event slug for trade matching
 	assetToEvent map[string]string
@@ -372,9 +407,17 @@ func (m *LiveTradeManager) pingLoop() {
 			m.mu.RLock()
 			conn := m.conn
 			connected := m.connected
+			lastMsg := m.lastMessageTime
 			m.mu.RUnlock()
 
 			if !connected || conn == nil {
+				return
+			}
+
+			// Check for stale connection (no messages for 60 seconds)
+			if !lastMsg.IsZero() && time.Since(lastMsg) > 60*time.Second {
+				log.Printf("LiveTradeManager: No messages for 60s, forcing reconnect...")
+				m.handleDisconnect()
 				return
 			}
 
@@ -409,6 +452,11 @@ func (m *LiveTradeManager) readLoop() {
 			m.handleDisconnect()
 			return
 		}
+
+		// Update last message time for stale connection detection
+		m.mu.Lock()
+		m.lastMessageTime = time.Now()
+		m.mu.Unlock()
 
 		messageCount++
 
@@ -453,6 +501,11 @@ func (m *LiveTradeManager) readLoop() {
 
 func (m *LiveTradeManager) handleDisconnect() {
 	m.mu.Lock()
+	// Guard against double reconnect
+	if !m.connected {
+		m.mu.Unlock()
+		return
+	}
 	m.connected = false
 	m.subscribed = false
 	if m.conn != nil {
@@ -526,11 +579,17 @@ func (m *LiveTradeManager) subscribeToAllTrades() error {
 
 func (m *LiveTradeManager) handleTrade(payload *rtdsTradePayload) {
 	// Match by event slug from payload (primary method)
+	// RTDS sends slugs like "epl-ast-eve-2026-01-18-eve" but we subscribe to "epl-ast-eve-2026-01-18"
+	// So we use prefix matching
 	subscribedEvents := m.subscriptions.GetAllSubscribedEvents()
 
 	var matchedSlug string
+	eventSlug := payload.EventSlug
+	if eventSlug == "" {
+		eventSlug = payload.Slug
+	}
 	for _, slug := range subscribedEvents {
-		if slug == payload.EventSlug {
+		if strings.HasPrefix(eventSlug, slug) {
 			matchedSlug = slug
 			break
 		}
@@ -550,8 +609,15 @@ func (m *LiveTradeManager) handleTrade(payload *rtdsTradePayload) {
 	}
 
 	// Look up market name for 3-way markets (e.g., "WOL", "DRAW", "NEW")
+	// Or extract sub-market name from slug (e.g., "Over 2.5", "BTTS")
 	var marketName string
-	if payload.Asset != "" {
+	var isSubMarket bool
+	if isSubMarketSlug(eventSlug) {
+		// For sub-markets, extract name from slug (e.g., "over-2-5" → "Over 2.5")
+		marketName = extractSubMarketName(eventSlug, matchedSlug)
+		isSubMarket = true
+	} else if payload.Asset != "" {
+		// For ML markets, look up from asset mapping
 		m.assetMu.RLock()
 		marketName = m.assetToMarketName[payload.Asset]
 		m.assetMu.RUnlock()
@@ -564,13 +630,14 @@ func (m *LiveTradeManager) handleTrade(payload *rtdsTradePayload) {
 		Side:        payload.Side,
 		Outcome:     payload.Outcome,
 		MarketName:  marketName,
+		IsSubMarket: isSubMarket,
 		Size:        payload.Size,
 		Price:       payload.Price,
 		Timestamp:   payload.Timestamp,
 	}
 
 	m.broadcastToTelegram(matchedSlug, tradeInfo)
-	m.broadcastToWeb(matchedSlug, tradeInfo)
+	m.broadcastToWeb(matchedSlug, tradeInfo, eventSlug) // Pass original RTDS slug for filtering
 }
 
 func (m *LiveTradeManager) Stop() error {
@@ -633,20 +700,87 @@ func (m *LiveTradeManager) GetUserSubscriptions(chatID int64) []string {
 	return m.subscriptions.GetUserEvents(chatID)
 }
 
-func (m *LiveTradeManager) SubscribeWeb(conn *websocket.Conn, eventSlug string) error {
+func (m *LiveTradeManager) SubscribeWeb(conn *websocket.Conn, eventSlug string, allMarkets bool) error {
 	eventInfo, err := m.resolver.GetEventInfo(context.Background(), eventSlug)
 	if err != nil {
 		return err
 	}
 
 	isNew := !m.subscriptions.IsWebSubscribed(conn, eventSlug)
-	m.subscriptions.SubscribeWeb(conn, eventSlug)
+	m.subscriptions.SubscribeWeb(conn, eventSlug, allMarkets)
 
 	if isNew {
 		m.trackEventAssets(eventSlug, eventInfo)
 	}
 
 	return nil
+}
+
+// isSubMarketSlug checks if a slug indicates a sub-market (over/under, btts, handicap, etc.)
+func isSubMarketSlug(slug string) bool {
+	subMarketIndicators := []string{
+		"-over-", "-under-", "-btts", "-handicap", "-spread",
+		"-total-", "-first-", "-score-", "-goals-", "-points-",
+	}
+	slugLower := strings.ToLower(slug)
+	for _, indicator := range subMarketIndicators {
+		if strings.Contains(slugLower, indicator) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractSubMarketName extracts a human-readable sub-market name from the RTDS slug
+// e.g., "epl-ast-eve-2026-01-18-over-2-5" with base "epl-ast-eve-2026-01-18" → "Over 2.5"
+func extractSubMarketName(rtdsSlug, baseSlug string) string {
+	if !strings.HasPrefix(rtdsSlug, baseSlug) {
+		return ""
+	}
+
+	// Get the suffix after the base slug
+	suffix := strings.TrimPrefix(rtdsSlug, baseSlug)
+	suffix = strings.TrimPrefix(suffix, "-")
+
+	if suffix == "" {
+		return ""
+	}
+
+	// Format common patterns
+	suffix = strings.ToLower(suffix)
+
+	// Replace dashes with spaces and handle decimal numbers
+	// e.g., "over-2-5" → "Over 2.5"
+	parts := strings.Split(suffix, "-")
+	var result []string
+	for i := 0; i < len(parts); i++ {
+		part := parts[i]
+		// Check if this and next part form a decimal number (e.g., "2" "5" → "2.5")
+		if i+1 < len(parts) && isNumeric(part) && isNumeric(parts[i+1]) {
+			result = append(result, part+"."+parts[i+1])
+			i++ // Skip next part
+		} else {
+			result = append(result, part)
+		}
+	}
+
+	// Capitalize first letter of each word
+	for i, word := range result {
+		if len(word) > 0 {
+			result[i] = strings.ToUpper(word[:1]) + word[1:]
+		}
+	}
+
+	return strings.Join(result, " ")
+}
+
+func isNumeric(s string) bool {
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 
 func (m *LiveTradeManager) trackEventAssets(eventSlug string, eventInfo *EventInfo) {
@@ -706,11 +840,14 @@ func (m *LiveTradeManager) broadcastToTelegram(eventSlug string, trade *TradeInf
 	}
 }
 
-func (m *LiveTradeManager) broadcastToWeb(eventSlug string, trade *TradeInfo) {
+func (m *LiveTradeManager) broadcastToWeb(eventSlug string, trade *TradeInfo, rtdsSlug string) {
 	subscribers := m.subscriptions.GetWebSubscribers(eventSlug)
 	if len(subscribers) == 0 {
 		return
 	}
+
+	// Check if this is a sub-market trade
+	isSubMarket := isSubMarketSlug(rtdsSlug)
 
 	webFormat := m.formatter.FormatForWeb(trade)
 	data, err := json.Marshal(webFormat)
@@ -719,6 +856,10 @@ func (m *LiveTradeManager) broadcastToWeb(eventSlug string, trade *TradeInfo) {
 	}
 
 	for _, conn := range subscribers {
+		// Skip sub-market trades unless subscriber wants all markets
+		if isSubMarket && !m.subscriptions.WantsAllMarkets(conn, eventSlug) {
+			continue
+		}
 		conn.WriteMessage(websocket.TextMessage, data)
 	}
 }
