@@ -285,7 +285,9 @@ type LiveTradeManager struct {
 	rtdsSubscriptions map[string]bool
 	// Map asset ID to event slug for fast trade matching
 	assetToEvent map[string]string
-	rtdsMu       sync.Mutex
+	// Pending subscriptions to apply when connected
+	pendingAssets map[string]string // assetID -> eventSlug
+	rtdsMu        sync.Mutex
 }
 
 // NewLiveTradeManager creates a new live trade manager
@@ -300,6 +302,7 @@ func NewLiveTradeManager() *LiveTradeManager {
 		cancel:            cancel,
 		rtdsSubscriptions: make(map[string]bool),
 		assetToEvent:      make(map[string]string),
+		pendingAssets:     make(map[string]string),
 	}
 }
 
@@ -379,20 +382,34 @@ func (m *LiveTradeManager) subscribeToEventAssets(eventSlug string, eventInfo *E
 	m.rtdsMu.Lock()
 	defer m.rtdsMu.Unlock()
 
+	// Check if connected
+	m.mu.RLock()
+	isConnected := m.connected
+	m.mu.RUnlock()
+
 	for _, assetID := range assetIDs {
 		// Map asset to event for fast trade matching
 		m.assetToEvent[assetID] = eventSlug
 
-		// Skip RTDS subscription if already subscribed to this asset
+		// Skip if already subscribed to this asset
 		if m.rtdsSubscriptions[assetID] {
 			log.Printf("LiveTradeManager: Already subscribed to asset %s", assetID)
+			continue
+		}
+
+		// If not connected, queue for later
+		if !isConnected {
+			m.pendingAssets[assetID] = eventSlug
+			log.Printf("LiveTradeManager: Queued asset %s for event %s (will subscribe when connected)", assetID, eventSlug)
 			continue
 		}
 
 		// Subscribe to this specific asset on RTDS
 		filter := polymarketrealtime.NewActivityFilter().WithAssetID(assetID)
 		if err := m.client.SubscribeToActivityTrades(m.handleTrade, filter); err != nil {
-			log.Printf("LiveTradeManager: Failed to subscribe to asset %s: %v", assetID, err)
+			// Queue for retry on reconnect
+			m.pendingAssets[assetID] = eventSlug
+			log.Printf("LiveTradeManager: Failed to subscribe to asset %s: %v (queued for retry)", assetID, err)
 			continue
 		}
 
@@ -403,27 +420,44 @@ func (m *LiveTradeManager) subscribeToEventAssets(eventSlug string, eventInfo *E
 	return nil
 }
 
-// resubscribeAllAssets re-subscribes to all tracked assets (called on reconnect)
+// resubscribeAllAssets re-subscribes to all tracked assets and pending assets (called on reconnect)
 func (m *LiveTradeManager) resubscribeAllAssets() {
 	m.rtdsMu.Lock()
-	assets := make([]string, 0, len(m.rtdsSubscriptions))
+	// Collect all assets to subscribe: existing + pending
+	allAssets := make(map[string]string) // assetID -> eventSlug
 	for assetID := range m.rtdsSubscriptions {
-		assets = append(assets, assetID)
+		allAssets[assetID] = m.assetToEvent[assetID]
 	}
-	// Clear the map so we can re-add them
+	for assetID, eventSlug := range m.pendingAssets {
+		allAssets[assetID] = eventSlug
+	}
+	// Clear maps so we can re-add them
 	m.rtdsSubscriptions = make(map[string]bool)
+	m.pendingAssets = make(map[string]string)
 	m.rtdsMu.Unlock()
 
-	for _, assetID := range assets {
+	if len(allAssets) == 0 {
+		log.Println("LiveTradeManager: No assets to resubscribe")
+		return
+	}
+
+	log.Printf("LiveTradeManager: Resubscribing to %d assets", len(allAssets))
+
+	for assetID, eventSlug := range allAssets {
 		filter := polymarketrealtime.NewActivityFilter().WithAssetID(assetID)
 		if err := m.client.SubscribeToActivityTrades(m.handleTrade, filter); err != nil {
 			log.Printf("LiveTradeManager: Failed to resubscribe to asset %s: %v", assetID, err)
+			// Put back in pending for next reconnect
+			m.rtdsMu.Lock()
+			m.pendingAssets[assetID] = eventSlug
+			m.rtdsMu.Unlock()
 			continue
 		}
 		m.rtdsMu.Lock()
 		m.rtdsSubscriptions[assetID] = true
+		m.assetToEvent[assetID] = eventSlug
 		m.rtdsMu.Unlock()
-		log.Printf("LiveTradeManager: Resubscribed to asset %s", assetID)
+		log.Printf("LiveTradeManager: Resubscribed to asset %s for event %s", assetID, eventSlug)
 	}
 }
 
