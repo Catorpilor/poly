@@ -14,6 +14,7 @@ type TradeInfo struct {
 	Pseudonym   string
 	Side        string // BUY or SELL
 	Outcome     string // YES, NO, or custom outcome
+	MarketName  string // Short market name (e.g., "WOL", "DRAW", "NEW" for 3-way)
 	Size        decimal.Decimal
 	Price       decimal.Decimal
 	Timestamp   int64
@@ -29,6 +30,7 @@ func NewTradeFormatter() *TradeFormatter {
 
 // FormatForTelegram formats a trade for Telegram display
 // Format: "[LAL-POR] Whale123 BUY YES $500.00 @ $0.65"
+// For 3-way: "[WOL-NEW] Whale123 BUY WOL YES $500.00 @ $0.65"
 func (f *TradeFormatter) FormatForTelegram(trade *TradeInfo) string {
 	trader := trade.Pseudonym
 	if trader == "" {
@@ -37,11 +39,17 @@ func (f *TradeFormatter) FormatForTelegram(trade *TradeInfo) string {
 
 	shortEvent := ShortenEventSlug(trade.EventSlug)
 
+	// Combine market name with outcome for clearer display
+	outcome := trade.Outcome
+	if trade.MarketName != "" {
+		outcome = trade.MarketName + " " + trade.Outcome
+	}
+
 	return fmt.Sprintf("[%s] %s %s %s $%s @ $%s",
 		shortEvent,
 		trader,
 		strings.ToUpper(trade.Side),
-		trade.Outcome,
+		outcome,
 		trade.Size.StringFixed(2),
 		trade.Price.StringFixed(2),
 	)
@@ -66,12 +74,18 @@ func (f *TradeFormatter) FormatForWeb(trade *TradeInfo) *WebTradeFormat {
 		trader = truncateAddress(trade.ProxyWallet)
 	}
 
+	// Combine market name with outcome for 3-way markets
+	outcome := trade.Outcome
+	if trade.MarketName != "" {
+		outcome = trade.MarketName + " " + trade.Outcome
+	}
+
 	return &WebTradeFormat{
 		EventSlug:   trade.EventSlug,
 		Trader:      trader,
 		ProxyWallet: trade.ProxyWallet,
 		Side:        strings.ToUpper(trade.Side),
-		Outcome:     trade.Outcome,
+		Outcome:     outcome,
 		Size:        trade.Size.StringFixed(2),
 		Price:       trade.Price.StringFixed(2),
 		Timestamp:   trade.Timestamp,

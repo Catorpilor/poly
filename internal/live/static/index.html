@@ -7,103 +7,83 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         .trade-enter {
-            animation: slideIn 0.3s ease-out;
+            animation: slideIn 0.2s ease-out;
         }
         @keyframes slideIn {
-            from {
-                opacity: 0;
-                transform: translateY(-10px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
+            from { opacity: 0; transform: translateX(-10px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+        .event-panel {
+            min-height: 400px;
+            max-height: 600px;
+        }
+        .trade-list {
+            max-height: 450px;
+            overflow-y: auto;
+        }
+        .trade-list::-webkit-scrollbar {
+            width: 6px;
+        }
+        .trade-list::-webkit-scrollbar-track {
+            background: #1f2937;
+        }
+        .trade-list::-webkit-scrollbar-thumb {
+            background: #4b5563;
+            border-radius: 3px;
         }
     </style>
 </head>
 <body class="bg-gray-900 text-white min-h-screen">
-    <div class="container mx-auto px-4 py-8 max-w-4xl">
-        <h1 class="text-3xl font-bold mb-2">Polymarket Live Trades</h1>
-        <p class="text-gray-400 mb-6">Monitor real-time trades on multiple Polymarket events</p>
-
-        <!-- Connection Status -->
-        <div class="bg-gray-800 rounded-lg p-4 mb-6">
-            <div class="flex items-center justify-between mb-4">
+    <div class="container mx-auto px-4 py-6">
+        <!-- Header -->
+        <div class="flex items-center justify-between mb-6">
+            <div>
+                <h1 class="text-2xl font-bold">Polymarket Live Trades</h1>
+                <p class="text-gray-400 text-sm">Pro Trader View - Multi-Event Monitoring</p>
+            </div>
+            <div class="flex items-center gap-4">
                 <div class="flex items-center gap-2">
-                    <div id="statusDot" class="w-3 h-3 rounded-full bg-gray-500"></div>
-                    <span id="status" class="text-gray-400">Not connected</span>
+                    <div id="statusDot" class="w-2.5 h-2.5 rounded-full bg-gray-500"></div>
+                    <span id="status" class="text-gray-400 text-sm">Not connected</span>
                 </div>
                 <button onclick="toggleConnection()" id="connectBtn"
-                        class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded font-medium transition-colors">
+                        class="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 rounded text-sm font-medium transition-colors">
                     Connect
                 </button>
             </div>
-
-            <!-- Add Event Form -->
-            <div id="addEventSection" class="hidden">
-                <div class="flex flex-col md:flex-row gap-2">
-                    <input type="text" id="eventSlug"
-                           placeholder="Enter event slug (e.g., nba-lal-por-2026-01-17)"
-                           class="flex-1 px-4 py-2 rounded bg-gray-700 border border-gray-600 focus:outline-none focus:border-blue-500 text-white placeholder-gray-400">
-                    <button onclick="subscribeEvent()"
-                            class="px-4 py-2 bg-green-600 hover:bg-green-700 rounded font-medium transition-colors">
-                        Add Event
-                    </button>
-                </div>
-            </div>
         </div>
 
-        <!-- Active Subscriptions -->
-        <div id="subscriptionsSection" class="bg-gray-800 rounded-lg p-4 mb-6 hidden">
-            <h2 class="font-semibold mb-3">Active Subscriptions</h2>
-            <div id="subscriptionsList" class="space-y-2">
-                <!-- Subscriptions will be added here -->
-            </div>
-        </div>
-
-        <!-- Stats -->
-        <div class="grid grid-cols-3 gap-4 mb-6">
-            <div class="bg-gray-800 rounded-lg p-4 text-center">
-                <div id="tradeCount" class="text-2xl font-bold text-blue-400">0</div>
-                <div class="text-gray-400 text-sm">Total Trades</div>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-4 text-center">
-                <div id="buyCount" class="text-2xl font-bold text-green-400">0</div>
-                <div class="text-gray-400 text-sm">Buys</div>
-            </div>
-            <div class="bg-gray-800 rounded-lg p-4 text-center">
-                <div id="sellCount" class="text-2xl font-bold text-red-400">0</div>
-                <div class="text-gray-400 text-sm">Sells</div>
-            </div>
-        </div>
-
-        <!-- Trade Feed -->
-        <div class="bg-gray-800 rounded-lg overflow-hidden">
-            <div class="px-4 py-3 border-b border-gray-700 flex justify-between items-center">
-                <h2 class="font-semibold">Live Trade Feed</h2>
-                <button onclick="clearTrades()" class="text-sm text-gray-400 hover:text-white transition-colors">
-                    Clear
+        <!-- Add Event Bar -->
+        <div id="addEventSection" class="hidden mb-6">
+            <div class="flex gap-2">
+                <input type="text" id="eventSlug"
+                       placeholder="Enter event slug (e.g., nba-lal-por-2026-01-17)"
+                       class="flex-1 px-4 py-2 rounded bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500 text-white placeholder-gray-500 text-sm">
+                <button onclick="subscribeEvent()"
+                        class="px-4 py-2 bg-green-600 hover:bg-green-700 rounded text-sm font-medium transition-colors">
+                    Add Event
                 </button>
             </div>
-            <div id="trades" class="divide-y divide-gray-700 max-h-[600px] overflow-y-auto">
-                <div id="noTrades" class="p-8 text-center text-gray-500">
-                    No trades yet. Connect and add events to start monitoring.
-                </div>
+        </div>
+
+        <!-- Event Panels Grid -->
+        <div id="eventPanels" class="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
+            <!-- Placeholder when no events -->
+            <div id="noEventsPlaceholder" class="col-span-full bg-gray-800 rounded-lg p-12 text-center">
+                <div class="text-gray-500 text-lg mb-2">No events subscribed</div>
+                <div class="text-gray-600 text-sm">Connect and add events to start monitoring trades</div>
             </div>
         </div>
 
         <!-- Footer -->
-        <div class="mt-6 text-center text-gray-500 text-sm">
+        <div class="mt-6 text-center text-gray-600 text-xs">
             Powered by Polymarket RTDS WebSocket
         </div>
     </div>
 
     <script>
         let ws = null;
-        let tradeCount = 0;
-        let buyCount = 0;
-        let sellCount = 0;
-        let subscriptions = new Map(); // eventSlug -> title
+        let subscriptions = new Map(); // eventSlug -> { title, trades: [], buys: 0, sells: 0 }
 
         function toggleConnection() {
             if (ws && ws.readyState === WebSocket.OPEN) {
@@ -127,8 +107,6 @@
                 document.getElementById('connectBtn').classList.remove('bg-blue-600', 'hover:bg-blue-700');
                 document.getElementById('connectBtn').classList.add('bg-red-600', 'hover:bg-red-700');
                 document.getElementById('addEventSection').classList.remove('hidden');
-
-                // Request list of subscriptions (in case of reconnect)
                 ws.send(JSON.stringify({ action: 'list' }));
             };
 
@@ -147,13 +125,11 @@
                 document.getElementById('connectBtn').classList.remove('bg-red-600', 'hover:bg-red-700');
                 document.getElementById('connectBtn').classList.add('bg-blue-600', 'hover:bg-blue-700');
                 document.getElementById('addEventSection').classList.add('hidden');
-                subscriptions.clear();
-                updateSubscriptionsList();
             };
 
             ws.onerror = (err) => {
                 console.error('WebSocket error:', err);
-                setStatus('error', 'Connection error');
+                setStatus('error', 'Error');
             };
         }
 
@@ -167,35 +143,36 @@
         function handleMessage(data) {
             switch (data.type) {
                 case 'subscribed':
-                    subscriptions.set(data.event, data.title || data.event);
-                    updateSubscriptionsList();
-                    showNotification(`Subscribed to ${data.title || data.event}`, 'success');
+                    subscriptions.set(data.event, {
+                        title: data.title || data.event,
+                        trades: [],
+                        buys: 0,
+                        sells: 0
+                    });
+                    renderPanels();
                     break;
 
                 case 'unsubscribed':
                     subscriptions.delete(data.event);
-                    updateSubscriptionsList();
-                    showNotification(`Unsubscribed from ${data.event}`, 'info');
+                    renderPanels();
                     break;
 
                 case 'subscriptions':
-                    // Update subscriptions list from server
                     if (data.events) {
                         data.events.forEach(event => {
                             if (!subscriptions.has(event)) {
-                                subscriptions.set(event, event);
+                                subscriptions.set(event, { title: event, trades: [], buys: 0, sells: 0 });
                             }
                         });
                     }
-                    updateSubscriptionsList();
+                    renderPanels();
                     break;
 
                 case 'error':
-                    showNotification(data.message, 'error');
+                    console.error(data.message);
                     break;
 
                 default:
-                    // Assume it's a trade
                     if (data.trader && data.side) {
                         addTrade(data);
                     }
@@ -206,15 +183,8 @@
             const input = document.getElementById('eventSlug');
             const eventSlug = input.value.trim();
 
-            if (!eventSlug) {
-                showNotification('Please enter an event slug', 'error');
-                return;
-            }
-
-            if (subscriptions.has(eventSlug)) {
-                showNotification('Already subscribed to this event', 'error');
-                return;
-            }
+            if (!eventSlug) return;
+            if (subscriptions.has(eventSlug)) return;
 
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ action: 'subscribe', event: eventSlug }));
@@ -228,145 +198,159 @@
             }
         }
 
-        function updateSubscriptionsList() {
-            const section = document.getElementById('subscriptionsSection');
-            const list = document.getElementById('subscriptionsList');
-
-            if (subscriptions.size === 0) {
-                section.classList.add('hidden');
-                return;
-            }
-
-            section.classList.remove('hidden');
-            list.innerHTML = '';
-
-            subscriptions.forEach((title, slug) => {
-                const item = document.createElement('div');
-                item.className = 'flex items-center justify-between bg-gray-700 rounded px-3 py-2';
-                item.innerHTML = `
-                    <div>
-                        <span class="font-medium">${title}</span>
-                        <span class="text-gray-400 text-sm ml-2">${slug}</span>
-                    </div>
-                    <button onclick="unsubscribeEvent('${slug}')"
-                            class="text-red-400 hover:text-red-300 text-sm">
-                        Remove
-                    </button>
-                `;
-                list.appendChild(item);
-            });
-
-            // Update status with subscription count
-            setStatus('connected', `Connected (${subscriptions.size} event${subscriptions.size !== 1 ? 's' : ''})`);
-        }
-
-        function showNotification(message, type) {
-            // Simple notification - could be enhanced with a proper notification library
-            console.log(`[${type}] ${message}`);
-        }
-
         function setStatus(state, text) {
             const statusDot = document.getElementById('statusDot');
             const statusText = document.getElementById('status');
-
             statusText.textContent = text;
 
-            switch (state) {
-                case 'connected':
-                    statusDot.className = 'w-3 h-3 rounded-full bg-green-500';
-                    statusText.className = 'text-green-400';
-                    break;
-                case 'connecting':
-                    statusDot.className = 'w-3 h-3 rounded-full bg-yellow-500 animate-pulse';
-                    statusText.className = 'text-yellow-400';
-                    break;
-                case 'disconnected':
-                    statusDot.className = 'w-3 h-3 rounded-full bg-gray-500';
-                    statusText.className = 'text-gray-400';
-                    break;
-                case 'error':
-                    statusDot.className = 'w-3 h-3 rounded-full bg-red-500';
-                    statusText.className = 'text-red-400';
-                    break;
-            }
+            const colors = {
+                connected: ['bg-green-500', 'text-green-400'],
+                connecting: ['bg-yellow-500 animate-pulse', 'text-yellow-400'],
+                disconnected: ['bg-gray-500', 'text-gray-400'],
+                error: ['bg-red-500', 'text-red-400']
+            };
+
+            statusDot.className = `w-2.5 h-2.5 rounded-full ${colors[state][0]}`;
+            statusText.className = `text-sm ${colors[state][1]}`;
         }
 
-        function addTrade(trade) {
-            const tradesDiv = document.getElementById('trades');
-            const noTrades = document.getElementById('noTrades');
+        function renderPanels() {
+            const container = document.getElementById('eventPanels');
+            const placeholder = document.getElementById('noEventsPlaceholder');
 
-            if (noTrades) {
-                noTrades.style.display = 'none';
+            if (subscriptions.size === 0) {
+                container.innerHTML = '';
+                container.appendChild(placeholder);
+                placeholder.classList.remove('hidden');
+                return;
             }
 
-            const tradeEl = document.createElement('div');
+            container.innerHTML = '';
 
+            subscriptions.forEach((eventData, slug) => {
+                const panel = createEventPanel(slug, eventData);
+                container.appendChild(panel);
+            });
+        }
+
+        function createEventPanel(slug, eventData) {
+            const panel = document.createElement('div');
+            panel.id = `panel-${slug}`;
+            panel.className = 'event-panel bg-gray-800 rounded-lg overflow-hidden flex flex-col';
+
+            panel.innerHTML = `
+                <div class="px-4 py-3 border-b border-gray-700 flex items-center justify-between">
+                    <div class="flex-1 min-w-0">
+                        <div class="font-semibold text-sm truncate" title="${eventData.title}">${eventData.title}</div>
+                        <div class="text-gray-500 text-xs truncate">${slug}</div>
+                    </div>
+                    <button onclick="unsubscribeEvent('${slug}')"
+                            class="ml-2 text-gray-500 hover:text-red-400 transition-colors">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="grid grid-cols-3 gap-2 p-3 border-b border-gray-700 bg-gray-800/50">
+                    <div class="text-center">
+                        <div id="total-${slug}" class="text-lg font-bold text-blue-400">${eventData.buys + eventData.sells}</div>
+                        <div class="text-gray-500 text-xs">Total</div>
+                    </div>
+                    <div class="text-center">
+                        <div id="buys-${slug}" class="text-lg font-bold text-green-400">${eventData.buys}</div>
+                        <div class="text-gray-500 text-xs">Buys</div>
+                    </div>
+                    <div class="text-center">
+                        <div id="sells-${slug}" class="text-lg font-bold text-red-400">${eventData.sells}</div>
+                        <div class="text-gray-500 text-xs">Sells</div>
+                    </div>
+                </div>
+                <div id="trades-${slug}" class="trade-list flex-1">
+                    ${eventData.trades.length === 0 ?
+                        '<div class="p-6 text-center text-gray-600 text-sm">Waiting for trades...</div>' :
+                        eventData.trades.map(t => createTradeHTML(t)).join('')}
+                </div>
+            `;
+
+            return panel;
+        }
+
+        function createTradeHTML(trade) {
             const isBuy = trade.side === 'BUY';
             const sideColor = isBuy ? 'text-green-400' : 'text-red-400';
-            const sideBg = isBuy ? 'bg-green-900/20' : 'bg-red-900/20';
-
             const time = trade.timestamp ? new Date(trade.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
-            const shortEvent = trade.eventSlug ? trade.eventSlug.substring(0, 15) : '';
 
-            tradeEl.innerHTML = `
-                <div class="flex items-center justify-between ${sideBg} px-4 py-3">
-                    <div class="flex items-center gap-3">
-                        <span class="text-gray-500 text-sm w-20">${time}</span>
-                        <span class="text-purple-400 text-xs font-mono bg-purple-900/30 px-2 py-0.5 rounded">${shortEvent}</span>
-                        <span class="text-yellow-400 font-medium truncate max-w-[120px]" title="${trade.proxyWallet}">${trade.trader}</span>
-                        <span class="${sideColor} font-bold w-12">${trade.side}</span>
-                        <span class="text-white w-16">${trade.outcome}</span>
+            // Build trader link
+            const traderName = trade.trader || 'Anonymous';
+            const traderLink = trade.proxyWallet ?
+                `https://polymarket.com/profile/${trade.proxyWallet}?tab=activity` : '#';
+
+            return `
+                <div class="trade-enter flex items-center justify-between px-3 py-2 border-b border-gray-700/50 hover:bg-gray-700/30 text-sm">
+                    <div class="flex items-center gap-2 min-w-0 flex-1">
+                        <span class="text-gray-500 text-xs w-16 flex-shrink-0">${time}</span>
+                        <a href="${traderLink}" target="_blank" rel="noopener"
+                           class="text-yellow-400 hover:text-yellow-300 hover:underline font-medium truncate max-w-[100px]"
+                           title="${traderName}">
+                            ${traderName}
+                        </a>
+                        <span class="${sideColor} font-bold w-10 flex-shrink-0">${trade.side}</span>
+                        <span class="text-gray-300 truncate">${trade.outcome}</span>
                     </div>
-                    <div class="flex items-center gap-4 text-right">
-                        <span class="text-blue-400 font-medium">$${trade.size}</span>
-                        <span class="text-gray-400">@</span>
-                        <span class="text-purple-400 font-medium">$${trade.price}</span>
+                    <div class="flex items-center gap-1 flex-shrink-0 ml-2">
+                        <span class="text-blue-400 font-medium">$${parseFloat(trade.size).toFixed(2)}</span>
+                        <span class="text-gray-500">@</span>
+                        <span class="text-purple-400">$${parseFloat(trade.price).toFixed(2)}</span>
                     </div>
                 </div>
             `;
-            tradeEl.className = 'trade-enter';
+        }
 
-            // Prepend new trades at top
-            tradesDiv.insertBefore(tradeEl, tradesDiv.firstChild);
+        function addTrade(trade) {
+            const eventSlug = trade.eventSlug;
+            if (!eventSlug || !subscriptions.has(eventSlug)) return;
 
-            // Update counts
-            tradeCount++;
-            if (isBuy) buyCount++;
-            else sellCount++;
+            const eventData = subscriptions.get(eventSlug);
+            const isBuy = trade.side === 'BUY';
 
-            document.getElementById('tradeCount').textContent = tradeCount;
-            document.getElementById('buyCount').textContent = buyCount;
-            document.getElementById('sellCount').textContent = sellCount;
+            // Update stats
+            if (isBuy) eventData.buys++;
+            else eventData.sells++;
 
-            // Limit to 200 trades
-            while (tradesDiv.children.length > 200) {
-                tradesDiv.removeChild(tradesDiv.lastChild);
+            // Add trade to beginning
+            eventData.trades.unshift(trade);
+            if (eventData.trades.length > 100) eventData.trades.pop();
+
+            // Update panel stats
+            const totalEl = document.getElementById(`total-${eventSlug}`);
+            const buysEl = document.getElementById(`buys-${eventSlug}`);
+            const sellsEl = document.getElementById(`sells-${eventSlug}`);
+
+            if (totalEl) totalEl.textContent = eventData.buys + eventData.sells;
+            if (buysEl) buysEl.textContent = eventData.buys;
+            if (sellsEl) sellsEl.textContent = eventData.sells;
+
+            // Add trade to list
+            const tradesEl = document.getElementById(`trades-${eventSlug}`);
+            if (tradesEl) {
+                // Remove "waiting" message if present
+                const waiting = tradesEl.querySelector('.text-gray-600');
+                if (waiting) waiting.remove();
+
+                const tradeEl = document.createElement('div');
+                tradeEl.innerHTML = createTradeHTML(trade);
+                tradesEl.insertBefore(tradeEl.firstElementChild, tradesEl.firstChild);
+
+                // Limit displayed trades
+                while (tradesEl.children.length > 100) {
+                    tradesEl.removeChild(tradesEl.lastChild);
+                }
             }
         }
 
-        function clearTrades() {
-            const tradesDiv = document.getElementById('trades');
-            tradesDiv.innerHTML = '<div id="noTrades" class="p-8 text-center text-gray-500" style="display: none;">No trades yet. Connect and add events to start monitoring.</div>';
-
-            if (subscriptions.size > 0) {
-                document.getElementById('noTrades').style.display = 'none';
-            } else {
-                document.getElementById('noTrades').style.display = 'block';
-            }
-
-            tradeCount = 0;
-            buyCount = 0;
-            sellCount = 0;
-            document.getElementById('tradeCount').textContent = '0';
-            document.getElementById('buyCount').textContent = '0';
-            document.getElementById('sellCount').textContent = '0';
-        }
-
-        // Handle Enter key in input
+        // Handle Enter key
         document.getElementById('eventSlug').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                subscribeEvent();
-            }
+            if (e.key === 'Enter') subscribeEvent();
         });
     </script>
 </body>

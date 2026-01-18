@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/url"
-	"os"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-	polymarketrealtime "github.com/ivanzzeth/polymarket-go-real-time-data-client"
+	"github.com/shopspring/decimal"
+)
+
+const (
+	rtdsURL      = "wss://ws-live-data.polymarket.com"
+	pingInterval = 5 * time.Second
 )
 
 // TelegramSender interface for sending messages to Telegram
@@ -19,18 +22,49 @@ type TelegramSender interface {
 	SendMessage(chatID int64, text string)
 }
 
-// SubscriptionRegistry tracks all active subscriptions
-type SubscriptionRegistry struct {
-	mu sync.RWMutex
-	// eventSlug -> set of chatIDs subscribed
-	telegramSubs map[string]map[int64]bool
-	// chatID -> set of eventSlugs (for multi-event support)
-	userEvents map[int64]map[string]bool
-	// eventSlug -> set of WebSocket connections
-	webSubs map[string]map[*websocket.Conn]bool
+// RTDS message types
+type rtdsSubscription struct {
+	Topic   string `json:"topic"`
+	Type    string `json:"type"`
+	Filters string `json:"filters,omitempty"`
 }
 
-// NewSubscriptionRegistry creates a new subscription registry
+type rtdsMessage struct {
+	Action        string             `json:"action,omitempty"`
+	Subscriptions []rtdsSubscription `json:"subscriptions,omitempty"`
+}
+
+type rtdsTradePayload struct {
+	Asset           string          `json:"asset"`
+	Side            string          `json:"side"`
+	Price           decimal.Decimal `json:"price"`
+	Size            decimal.Decimal `json:"size"`
+	Outcome         string          `json:"outcome"`
+	Slug            string          `json:"slug"`
+	ConditionID     string          `json:"conditionId"`
+	ProxyWallet     string          `json:"proxyWallet"`
+	TransactionHash string          `json:"transactionHash"`
+	Timestamp       int64           `json:"timestamp"`
+	Name            string          `json:"name"`
+	EventSlug       string          `json:"event_slug"`
+	EventTitle      string          `json:"event_title"`
+}
+
+type rtdsEvent struct {
+	Topic     string           `json:"topic"`
+	Type      string           `json:"type"`
+	Timestamp int64            `json:"timestamp"`
+	Payload   rtdsTradePayload `json:"payload"`
+}
+
+// SubscriptionRegistry tracks all active subscriptions
+type SubscriptionRegistry struct {
+	mu           sync.RWMutex
+	telegramSubs map[string]map[int64]bool
+	userEvents   map[int64]map[string]bool
+	webSubs      map[string]map[*websocket.Conn]bool
+}
+
 func NewSubscriptionRegistry() *SubscriptionRegistry {
 	return &SubscriptionRegistry{
 		telegramSubs: make(map[string]map[int64]bool),
@@ -39,25 +73,21 @@ func NewSubscriptionRegistry() *SubscriptionRegistry {
 	}
 }
 
-// SubscribeTelegram adds a telegram user to an event subscription
 func (r *SubscriptionRegistry) SubscribeTelegram(chatID int64, eventSlug string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Check if already subscribed
 	if events, ok := r.userEvents[chatID]; ok {
 		if events[eventSlug] {
-			return false // Already subscribed
+			return false
 		}
 	}
 
-	// Add to event -> users mapping
 	if r.telegramSubs[eventSlug] == nil {
 		r.telegramSubs[eventSlug] = make(map[int64]bool)
 	}
 	r.telegramSubs[eventSlug][chatID] = true
 
-	// Add to user -> events mapping
 	if r.userEvents[chatID] == nil {
 		r.userEvents[chatID] = make(map[string]bool)
 	}
@@ -66,12 +96,10 @@ func (r *SubscriptionRegistry) SubscribeTelegram(chatID int64, eventSlug string)
 	return true
 }
 
-// UnsubscribeTelegram removes a telegram user from an event subscription
 func (r *SubscriptionRegistry) UnsubscribeTelegram(chatID int64, eventSlug string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Remove from event -> users mapping
 	if users, ok := r.telegramSubs[eventSlug]; ok {
 		delete(users, chatID)
 		if len(users) == 0 {
@@ -79,10 +107,9 @@ func (r *SubscriptionRegistry) UnsubscribeTelegram(chatID int64, eventSlug strin
 		}
 	}
 
-	// Remove from user -> events mapping
 	if events, ok := r.userEvents[chatID]; ok {
 		if !events[eventSlug] {
-			return false // Wasn't subscribed
+			return false
 		}
 		delete(events, eventSlug)
 		if len(events) == 0 {
@@ -95,7 +122,6 @@ func (r *SubscriptionRegistry) UnsubscribeTelegram(chatID int64, eventSlug strin
 	return true
 }
 
-// UnsubscribeAllTelegram removes all subscriptions for a user
 func (r *SubscriptionRegistry) UnsubscribeAllTelegram(chatID int64) []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -108,7 +134,6 @@ func (r *SubscriptionRegistry) UnsubscribeAllTelegram(chatID int64) []string {
 	unsubscribed := make([]string, 0, len(events))
 	for eventSlug := range events {
 		unsubscribed = append(unsubscribed, eventSlug)
-		// Remove from event -> users mapping
 		if users, ok := r.telegramSubs[eventSlug]; ok {
 			delete(users, chatID)
 			if len(users) == 0 {
@@ -121,7 +146,6 @@ func (r *SubscriptionRegistry) UnsubscribeAllTelegram(chatID int64) []string {
 	return unsubscribed
 }
 
-// GetUserEvents returns all events a user is subscribed to
 func (r *SubscriptionRegistry) GetUserEvents(chatID int64) []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -138,7 +162,6 @@ func (r *SubscriptionRegistry) GetUserEvents(chatID int64) []string {
 	return result
 }
 
-// GetTelegramSubscribers returns all chatIDs subscribed to an event
 func (r *SubscriptionRegistry) GetTelegramSubscribers(eventSlug string) []int64 {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -155,14 +178,12 @@ func (r *SubscriptionRegistry) GetTelegramSubscribers(eventSlug string) []int64 
 	return result
 }
 
-// HasTelegramSubscribers checks if an event has any telegram subscribers
 func (r *SubscriptionRegistry) HasTelegramSubscribers(eventSlug string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.telegramSubs[eventSlug]) > 0
 }
 
-// SubscribeWeb adds a web client to an event subscription
 func (r *SubscriptionRegistry) SubscribeWeb(conn *websocket.Conn, eventSlug string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -173,7 +194,6 @@ func (r *SubscriptionRegistry) SubscribeWeb(conn *websocket.Conn, eventSlug stri
 	r.webSubs[eventSlug][conn] = true
 }
 
-// UnsubscribeWeb removes a web client from all subscriptions
 func (r *SubscriptionRegistry) UnsubscribeWeb(conn *websocket.Conn) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -186,7 +206,6 @@ func (r *SubscriptionRegistry) UnsubscribeWeb(conn *websocket.Conn) {
 	}
 }
 
-// UnsubscribeWebFromEvent removes a web client from a specific event subscription
 func (r *SubscriptionRegistry) UnsubscribeWebFromEvent(conn *websocket.Conn, eventSlug string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -207,7 +226,6 @@ func (r *SubscriptionRegistry) UnsubscribeWebFromEvent(conn *websocket.Conn, eve
 	return true
 }
 
-// GetWebConnectionEvents returns all events a web connection is subscribed to
 func (r *SubscriptionRegistry) GetWebConnectionEvents(conn *websocket.Conn) []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -221,7 +239,6 @@ func (r *SubscriptionRegistry) GetWebConnectionEvents(conn *websocket.Conn) []st
 	return events
 }
 
-// IsWebSubscribed checks if a web connection is subscribed to an event
 func (r *SubscriptionRegistry) IsWebSubscribed(conn *websocket.Conn, eventSlug string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -233,7 +250,6 @@ func (r *SubscriptionRegistry) IsWebSubscribed(conn *websocket.Conn, eventSlug s
 	return conns[conn]
 }
 
-// GetWebSubscribers returns all web connections subscribed to an event
 func (r *SubscriptionRegistry) GetWebSubscribers(eventSlug string) []*websocket.Conn {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -250,7 +266,6 @@ func (r *SubscriptionRegistry) GetWebSubscribers(eventSlug string) []*websocket.
 	return result
 }
 
-// GetAllSubscribedEvents returns all events with at least one subscriber
 func (r *SubscriptionRegistry) GetAllSubscribedEvents() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -272,27 +287,25 @@ func (r *SubscriptionRegistry) GetAllSubscribedEvents() []string {
 
 // LiveTradeManager manages WebSocket connections and trade broadcasting
 type LiveTradeManager struct {
-	client        *polymarketrealtime.Client
 	subscriptions *SubscriptionRegistry
 	resolver      *EventSlugResolver
 	formatter     *TradeFormatter
 	telegramBot   TelegramSender
 
-	mu        sync.RWMutex
-	connected bool
-	ctx       context.Context
-	cancel    context.CancelFunc
+	mu         sync.RWMutex
+	conn       *websocket.Conn
+	connected  bool
+	subscribed bool // Whether we've sent the subscription message
+	ctx        context.Context
+	cancel     context.CancelFunc
 
-	// Track which assets we're subscribed to at the RTDS level
-	rtdsSubscriptions map[string]bool
-	// Map asset ID to event slug for fast trade matching
+	// Map asset ID to event slug for trade matching
 	assetToEvent map[string]string
-	// Pending subscriptions to apply when connected
-	pendingAssets map[string]string // assetID -> eventSlug
-	rtdsMu        sync.Mutex
+	// Map asset ID to market short name (e.g., "WOL", "DRAW", "NEW" for 3-way)
+	assetToMarketName map[string]string
+	assetMu           sync.RWMutex
 }
 
-// NewLiveTradeManager creates a new live trade manager
 func NewLiveTradeManager() *LiveTradeManager {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -302,19 +315,20 @@ func NewLiveTradeManager() *LiveTradeManager {
 		formatter:         NewTradeFormatter(),
 		ctx:               ctx,
 		cancel:            cancel,
-		rtdsSubscriptions: make(map[string]bool),
 		assetToEvent:      make(map[string]string),
-		pendingAssets:     make(map[string]string),
+		assetToMarketName: make(map[string]string),
 	}
 }
 
-// SetTelegramBot sets the telegram sender for broadcasting messages
 func (m *LiveTradeManager) SetTelegramBot(bot TelegramSender) {
 	m.telegramBot = bot
 }
 
-// Start establishes connection to the RTDS WebSocket
 func (m *LiveTradeManager) Start() error {
+	return m.connect()
+}
+
+func (m *LiveTradeManager) connect() error {
 	m.mu.Lock()
 	if m.connected {
 		m.mu.Unlock()
@@ -322,375 +336,320 @@ func (m *LiveTradeManager) Start() error {
 	}
 	m.mu.Unlock()
 
-	// Channel to signal connection is ready
-	connectedCh := make(chan struct{})
-	var connectedOnce sync.Once
-
-	// Build client options
-	opts := []polymarketrealtime.ClientOption{
-		polymarketrealtime.WithLogger(polymarketrealtime.NewSilentLogger()),
-		polymarketrealtime.WithAutoReconnect(true),
-		polymarketrealtime.WithMaxReconnectAttempts(10),
-		polymarketrealtime.WithPingInterval(5 * time.Second),
+	conn, _, err := websocket.DefaultDialer.Dial(rtdsURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to connect to RTDS: %w", err)
 	}
 
-	// Configure proxy from environment if set
-	if proxyStr := os.Getenv("https_proxy"); proxyStr != "" {
-		if proxyURL, err := url.Parse(proxyStr); err == nil {
-			opts = append(opts, polymarketrealtime.WithProxyURL(proxyURL))
-			log.Printf("LiveTradeManager: Using proxy %s", proxyStr)
-		}
-	} else if proxyStr := os.Getenv("HTTPS_PROXY"); proxyStr != "" {
-		if proxyURL, err := url.Parse(proxyStr); err == nil {
-			opts = append(opts, polymarketrealtime.WithProxyURL(proxyURL))
-			log.Printf("LiveTradeManager: Using proxy %s", proxyStr)
+	m.mu.Lock()
+	m.conn = conn
+	m.connected = true
+	m.mu.Unlock()
+
+	log.Println("LiveTradeManager: Connected to RTDS")
+
+	// Start ping routine
+	go m.pingLoop()
+
+	// Start read loop
+	go m.readLoop()
+
+	// Resubscribe to all tracked assets
+	m.resubscribeAll()
+
+	return nil
+}
+
+func (m *LiveTradeManager) pingLoop() {
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-ticker.C:
+			m.mu.RLock()
+			conn := m.conn
+			connected := m.connected
+			m.mu.RUnlock()
+
+			if !connected || conn == nil {
+				return
+			}
+
+			if err := conn.WriteMessage(websocket.TextMessage, []byte("PING")); err != nil {
+				log.Printf("LiveTradeManager: Ping failed: %v", err)
+				m.handleDisconnect()
+				return
+			}
 		}
 	}
+}
 
-	// Add connection callbacks
-	opts = append(opts,
-		polymarketrealtime.WithOnConnect(func() {
-			log.Println("LiveTradeManager: Connected to RTDS WebSocket")
-			m.mu.Lock()
-			m.connected = true
-			m.mu.Unlock()
-			// Signal that initial connection is ready
-			connectedOnce.Do(func() {
-				close(connectedCh)
-			})
-			// Re-subscribe to all tracked assets on reconnect
-			m.resubscribeAllAssets()
-		}),
-		polymarketrealtime.WithOnDisconnect(func(err error) {
-			log.Printf("LiveTradeManager: Disconnected from RTDS WebSocket: %v", err)
-			m.mu.Lock()
-			m.connected = false
-			m.mu.Unlock()
-		}),
-	)
+func (m *LiveTradeManager) readLoop() {
+	for {
+		m.mu.RLock()
+		conn := m.conn
+		connected := m.connected
+		m.mu.RUnlock()
 
-	// Create client with options
-	m.client = polymarketrealtime.New(opts...)
+		if !connected || conn == nil {
+			return
+		}
 
-	if err := m.client.Connect(); err != nil {
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			log.Printf("LiveTradeManager: Read error: %v", err)
+			m.handleDisconnect()
+			return
+		}
+
+		// Skip PONG messages
+		if string(message) == "PONG" {
+			continue
+		}
+
+		// Parse the event
+		var event rtdsEvent
+		if err := json.Unmarshal(message, &event); err != nil {
+			continue
+		}
+
+		// Handle activity trades
+		if event.Topic == "activity" && event.Type == "trades" {
+			m.handleTrade(&event.Payload)
+		}
+	}
+}
+
+func (m *LiveTradeManager) handleDisconnect() {
+	m.mu.Lock()
+	m.connected = false
+	m.subscribed = false
+	if m.conn != nil {
+		m.conn.Close()
+		m.conn = nil
+	}
+	m.mu.Unlock()
+
+	log.Println("LiveTradeManager: Disconnected, reconnecting...")
+
+	// Reconnect after a delay
+	go func() {
+		time.Sleep(2 * time.Second)
+		if err := m.connect(); err != nil {
+			log.Printf("LiveTradeManager: Reconnect failed: %v", err)
+		}
+	}()
+}
+
+func (m *LiveTradeManager) resubscribeAll() {
+	m.assetMu.RLock()
+	hasAssets := len(m.assetToEvent) > 0
+	m.assetMu.RUnlock()
+
+	if hasAssets {
+		m.subscribeToAllTrades()
+	}
+}
+
+func (m *LiveTradeManager) subscribeToAllTrades() error {
+	m.mu.Lock()
+	if m.subscribed {
+		m.mu.Unlock()
+		return nil
+	}
+	conn := m.conn
+	connected := m.connected
+	m.mu.Unlock()
+
+	if !connected || conn == nil {
+		return fmt.Errorf("not connected")
+	}
+
+	// Subscribe to all trades, filter client-side by asset ID
+	msg := map[string]interface{}{
+		"action": "subscribe",
+		"subscriptions": []map[string]interface{}{
+			{
+				"topic": "activity",
+				"type":  "trades",
+			},
+		},
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
 		return err
 	}
 
-	// Wait for connection to be established (with timeout)
-	select {
-	case <-connectedCh:
-		log.Println("LiveTradeManager: Started and connected to RTDS WebSocket")
-	case <-time.After(10 * time.Second):
-		log.Println("LiveTradeManager: Warning - connection timeout, continuing anyway")
+	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		return err
 	}
+	log.Println("LiveTradeManager: Subscribed to activity trades")
+
+	m.mu.Lock()
+	m.subscribed = true
+	m.mu.Unlock()
 
 	return nil
 }
 
-// subscribeToEventAssets subscribes to the primary market's asset IDs for an event on the RTDS WebSocket
-// For sports/esports events, this is the Moneyline (ML) market - "who will win"
-func (m *LiveTradeManager) subscribeToEventAssets(eventSlug string, eventInfo *EventInfo) error {
-	// Only subscribe to primary market (ML), not all sub-markets
-	assetIDs := m.resolver.GetPrimaryMarketAssetIDs(eventInfo)
-	if len(assetIDs) == 0 {
-		return fmt.Errorf("no asset IDs found for event %s", eventSlug)
-	}
+func (m *LiveTradeManager) handleTrade(payload *rtdsTradePayload) {
+	// Match by event slug from payload (primary method)
+	subscribedEvents := m.subscriptions.GetAllSubscribedEvents()
 
-	primaryMarket := m.resolver.GetPrimaryMarket(eventInfo)
-	if primaryMarket != nil {
-		log.Printf("LiveTradeManager: Subscribing to primary market: %s", primaryMarket.Question)
-	}
-
-	m.rtdsMu.Lock()
-	defer m.rtdsMu.Unlock()
-
-	// Check if connected
-	m.mu.RLock()
-	isConnected := m.connected
-	m.mu.RUnlock()
-
-	for _, assetID := range assetIDs {
-		// Map asset to event for fast trade matching
-		m.assetToEvent[assetID] = eventSlug
-
-		// Skip if already subscribed to this asset
-		if m.rtdsSubscriptions[assetID] {
-			log.Printf("LiveTradeManager: Already subscribed to asset %s", assetID)
-			continue
+	var matchedSlug string
+	for _, slug := range subscribedEvents {
+		if slug == payload.EventSlug {
+			matchedSlug = slug
+			break
 		}
+	}
 
-		// If not connected, queue for later
-		if !isConnected {
-			m.pendingAssets[assetID] = eventSlug
-			log.Printf("LiveTradeManager: Queued asset %s for event %s (will subscribe when connected)", assetID, eventSlug)
-			continue
+	// Fallback: match by asset ID
+	if matchedSlug == "" && payload.Asset != "" {
+		m.assetMu.RLock()
+		if slug, found := m.assetToEvent[payload.Asset]; found {
+			matchedSlug = slug
 		}
-
-		// Subscribe to this specific asset on RTDS
-		filter := polymarketrealtime.NewActivityFilter().WithAssetID(assetID)
-		if err := m.client.SubscribeToActivityTrades(m.handleTrade, filter); err != nil {
-			// Queue for retry on reconnect
-			m.pendingAssets[assetID] = eventSlug
-			log.Printf("LiveTradeManager: Failed to subscribe to asset %s: %v (queued for retry)", assetID, err)
-			continue
-		}
-
-		m.rtdsSubscriptions[assetID] = true
-		log.Printf("LiveTradeManager: Subscribed to asset %s for event %s", assetID, eventSlug)
+		m.assetMu.RUnlock()
 	}
 
-	return nil
-}
-
-// resubscribeAllAssets re-subscribes to all tracked assets and pending assets (called on reconnect)
-func (m *LiveTradeManager) resubscribeAllAssets() {
-	m.rtdsMu.Lock()
-	// Collect all assets to subscribe: existing + pending
-	allAssets := make(map[string]string) // assetID -> eventSlug
-	for assetID := range m.rtdsSubscriptions {
-		allAssets[assetID] = m.assetToEvent[assetID]
-	}
-	for assetID, eventSlug := range m.pendingAssets {
-		allAssets[assetID] = eventSlug
-	}
-	// Clear maps so we can re-add them
-	m.rtdsSubscriptions = make(map[string]bool)
-	m.pendingAssets = make(map[string]string)
-	m.rtdsMu.Unlock()
-
-	if len(allAssets) == 0 {
-		log.Println("LiveTradeManager: No assets to resubscribe")
+	if matchedSlug == "" {
 		return
 	}
 
-	log.Printf("LiveTradeManager: Resubscribing to %d assets", len(allAssets))
-
-	for assetID, eventSlug := range allAssets {
-		filter := polymarketrealtime.NewActivityFilter().WithAssetID(assetID)
-		if err := m.client.SubscribeToActivityTrades(m.handleTrade, filter); err != nil {
-			log.Printf("LiveTradeManager: Failed to resubscribe to asset %s: %v", assetID, err)
-			// Put back in pending for next reconnect
-			m.rtdsMu.Lock()
-			m.pendingAssets[assetID] = eventSlug
-			m.rtdsMu.Unlock()
-			continue
-		}
-		m.rtdsMu.Lock()
-		m.rtdsSubscriptions[assetID] = true
-		m.assetToEvent[assetID] = eventSlug
-		m.rtdsMu.Unlock()
-		log.Printf("LiveTradeManager: Resubscribed to asset %s for event %s", assetID, eventSlug)
+	// Look up market name for 3-way markets (e.g., "WOL", "DRAW", "NEW")
+	var marketName string
+	if payload.Asset != "" {
+		m.assetMu.RLock()
+		marketName = m.assetToMarketName[payload.Asset]
+		m.assetMu.RUnlock()
 	}
+
+	tradeInfo := &TradeInfo{
+		EventSlug:   matchedSlug,
+		ProxyWallet: payload.ProxyWallet,
+		Pseudonym:   payload.Name,
+		Side:        payload.Side,
+		Outcome:     payload.Outcome,
+		MarketName:  marketName,
+		Size:        payload.Size,
+		Price:       payload.Price,
+		Timestamp:   payload.Timestamp,
+	}
+
+	m.broadcastToTelegram(matchedSlug, tradeInfo)
+	m.broadcastToWeb(matchedSlug, tradeInfo)
 }
 
-// Stop closes the WebSocket connection
 func (m *LiveTradeManager) Stop() error {
 	m.cancel()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.client != nil {
-		if err := m.client.Disconnect(); err != nil {
-			return err
-		}
+	if m.conn != nil {
+		m.conn.Close()
+		m.conn = nil
 	}
 
 	m.connected = false
 	return nil
 }
 
-// IsConnected returns whether the manager is connected to RTDS
 func (m *LiveTradeManager) IsConnected() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.connected
 }
 
-// SubscribeTelegram adds a telegram user to monitor an event
 func (m *LiveTradeManager) SubscribeTelegram(ctx context.Context, chatID int64, eventSlug string) (*EventInfo, error) {
-	// Validate event exists
 	eventInfo, err := m.resolver.GetEventInfo(ctx, eventSlug)
 	if err != nil {
 		return nil, err
 	}
 
-	// Add to registry
 	isNew := m.subscriptions.SubscribeTelegram(chatID, eventSlug)
 
-	// Subscribe to event assets on RTDS WebSocket if this is a new subscription
 	if isNew {
-		if err := m.subscribeToEventAssets(eventSlug, eventInfo); err != nil {
-			log.Printf("LiveTradeManager: Warning - failed to subscribe to RTDS for event %s: %v", eventSlug, err)
-			// Don't return error - user is still subscribed locally
-		}
+		m.trackEventAssets(eventSlug, eventInfo)
 	}
 
-	log.Printf("LiveTradeManager: User %d subscribed to event %s", chatID, eventSlug)
 	return eventInfo, nil
 }
 
-// UnsubscribeTelegram removes a telegram user from monitoring an event
 func (m *LiveTradeManager) UnsubscribeTelegram(chatID int64, eventSlug string) bool {
-	result := m.subscriptions.UnsubscribeTelegram(chatID, eventSlug)
-	if result {
-		log.Printf("LiveTradeManager: User %d unsubscribed from event %s", chatID, eventSlug)
-	}
-	return result
+	return m.subscriptions.UnsubscribeTelegram(chatID, eventSlug)
 }
 
-// UnsubscribeAllTelegram removes all subscriptions for a user
 func (m *LiveTradeManager) UnsubscribeAllTelegram(chatID int64) []string {
-	result := m.subscriptions.UnsubscribeAllTelegram(chatID)
-	if len(result) > 0 {
-		log.Printf("LiveTradeManager: User %d unsubscribed from all events: %v", chatID, result)
-	}
-	return result
+	return m.subscriptions.UnsubscribeAllTelegram(chatID)
 }
 
-// GetUserSubscriptions returns all events a user is subscribed to
 func (m *LiveTradeManager) GetUserSubscriptions(chatID int64) []string {
 	return m.subscriptions.GetUserEvents(chatID)
 }
 
-// SubscribeWeb adds a web client to monitor an event
 func (m *LiveTradeManager) SubscribeWeb(conn *websocket.Conn, eventSlug string) error {
-	// Validate event exists
 	eventInfo, err := m.resolver.GetEventInfo(context.Background(), eventSlug)
 	if err != nil {
 		return err
 	}
 
-	// Check if already subscribed
 	isNew := !m.subscriptions.IsWebSubscribed(conn, eventSlug)
-
 	m.subscriptions.SubscribeWeb(conn, eventSlug)
 
-	// Subscribe to event assets on RTDS WebSocket if this is a new event subscription
 	if isNew {
-		if err := m.subscribeToEventAssets(eventSlug, eventInfo); err != nil {
-			log.Printf("LiveTradeManager: Warning - failed to subscribe to RTDS for event %s: %v", eventSlug, err)
-			// Don't return error - user is still subscribed locally
-		}
+		m.trackEventAssets(eventSlug, eventInfo)
 	}
 
-	log.Printf("LiveTradeManager: Web client subscribed to event %s", eventSlug)
 	return nil
 }
 
-// UnsubscribeWeb removes a web client from all subscriptions
+func (m *LiveTradeManager) trackEventAssets(eventSlug string, eventInfo *EventInfo) {
+	// Use GetAllMLMarketsAssetIDs to support both 2-way (NBA) and 3-way (Football) moneylines
+	assetIDs := m.resolver.GetAllMLMarketsAssetIDs(eventInfo)
+	if len(assetIDs) == 0 {
+		return
+	}
+
+	// Get asset to market name mapping (for 3-way markets)
+	marketNameMap := m.resolver.GetAssetToMarketNameMap(eventInfo)
+
+	m.assetMu.Lock()
+	for _, assetID := range assetIDs {
+		m.assetToEvent[assetID] = eventSlug
+		if marketName, ok := marketNameMap[assetID]; ok {
+			m.assetToMarketName[assetID] = marketName
+		}
+	}
+	m.assetMu.Unlock()
+
+	// Subscribe to all trades (only once), filter client-side
+	if err := m.subscribeToAllTrades(); err != nil {
+		log.Printf("LiveTradeManager: Failed to subscribe to trades: %v", err)
+	}
+}
+
 func (m *LiveTradeManager) UnsubscribeWeb(conn *websocket.Conn) {
 	m.subscriptions.UnsubscribeWeb(conn)
 }
 
-// UnsubscribeWebFromEvent removes a web client from a specific event
 func (m *LiveTradeManager) UnsubscribeWebFromEvent(conn *websocket.Conn, eventSlug string) bool {
-	result := m.subscriptions.UnsubscribeWebFromEvent(conn, eventSlug)
-	if result {
-		log.Printf("LiveTradeManager: Web client unsubscribed from event %s", eventSlug)
-	}
-	return result
+	return m.subscriptions.UnsubscribeWebFromEvent(conn, eventSlug)
 }
 
-// GetWebConnectionEvents returns all events a web connection is subscribed to
 func (m *LiveTradeManager) GetWebConnectionEvents(conn *websocket.Conn) []string {
 	return m.subscriptions.GetWebConnectionEvents(conn)
 }
 
-// IsWebSubscribed checks if a web connection is subscribed to an event
 func (m *LiveTradeManager) IsWebSubscribed(conn *websocket.Conn, eventSlug string) bool {
 	return m.subscriptions.IsWebSubscribed(conn, eventSlug)
 }
 
-// handleTrade processes incoming trades from RTDS
-func (m *LiveTradeManager) handleTrade(trade polymarketrealtime.Trade) error {
-	// Debug: Log all incoming trades
-	log.Printf("LiveTradeManager: Received trade - EventSlug: %s, ConditionID: %s, Side: %s, Size: %s, Price: %s",
-		trade.EventSlug, trade.ConditionID, trade.Side, trade.Size.String(), trade.Price.String())
-
-	// Get event slug from the trade
-	// The trade contains market/asset info we can use to match against subscriptions
-	eventSlug := m.matchTradeToEvent(trade)
-	if eventSlug == "" {
-		log.Printf("LiveTradeManager: No matching subscription for trade EventSlug=%s", trade.EventSlug)
-		return nil // No subscribers for this trade
-	}
-
-	// Convert to our TradeInfo format
-	tradeInfo := &TradeInfo{
-		EventSlug:   eventSlug,
-		ProxyWallet: trade.ProxyWallet,
-		Pseudonym:   trade.Pseudonym,
-		Side:        string(trade.Side),
-		Outcome:     trade.Outcome,
-		Size:        trade.Size,
-		Price:       trade.Price,
-		Timestamp:   trade.Timestamp,
-	}
-
-	// Broadcast to telegram subscribers
-	m.broadcastToTelegram(eventSlug, tradeInfo)
-
-	// Broadcast to web subscribers
-	m.broadcastToWeb(eventSlug, tradeInfo)
-
-	return nil
-}
-
-// matchTradeToEvent finds which subscribed event this trade belongs to
-func (m *LiveTradeManager) matchTradeToEvent(trade polymarketrealtime.Trade) string {
-	// Fast path: match by asset ID (most reliable since we subscribed by asset)
-	if trade.Asset != "" {
-		m.rtdsMu.Lock()
-		eventSlug, found := m.assetToEvent[trade.Asset]
-		m.rtdsMu.Unlock()
-		if found {
-			log.Printf("LiveTradeManager: Matched trade by Asset ID: %s -> %s", trade.Asset, eventSlug)
-			return eventSlug
-		}
-	}
-
-	// Get all subscribed events for fallback matching
-	subscribedEvents := m.subscriptions.GetAllSubscribedEvents()
-	if len(subscribedEvents) == 0 {
-		log.Printf("LiveTradeManager: No subscribed events")
-		return ""
-	}
-
-	log.Printf("LiveTradeManager: Matching trade (Asset=%s, EventSlug=%s, ConditionID=%s) against subscriptions: %v",
-		trade.Asset, trade.EventSlug, trade.ConditionID, subscribedEvents)
-
-	// Try matching by event slug from trade
-	if trade.EventSlug != "" {
-		for _, eventSlug := range subscribedEvents {
-			if eventSlug == trade.EventSlug {
-				log.Printf("LiveTradeManager: Matched by EventSlug: %s", eventSlug)
-				return eventSlug
-			}
-		}
-	}
-
-	// Try matching by condition ID
-	if trade.ConditionID != "" {
-		for _, eventSlug := range subscribedEvents {
-			eventInfo, err := m.resolver.GetEventInfo(context.Background(), eventSlug)
-			if err != nil {
-				continue
-			}
-			for _, market := range eventInfo.Markets {
-				if market.ConditionID == trade.ConditionID || market.ID == trade.ConditionID {
-					log.Printf("LiveTradeManager: Matched by ConditionID: %s -> %s", trade.ConditionID, eventSlug)
-					return eventSlug
-				}
-			}
-		}
-	}
-
-	log.Printf("LiveTradeManager: No match found for trade")
-	return ""
-}
-
-// broadcastToTelegram sends trade to all telegram subscribers
 func (m *LiveTradeManager) broadcastToTelegram(eventSlug string, trade *TradeInfo) {
 	if m.telegramBot == nil {
 		return
@@ -702,13 +661,11 @@ func (m *LiveTradeManager) broadcastToTelegram(eventSlug string, trade *TradeInf
 	}
 
 	message := m.formatter.FormatForTelegram(trade)
-
 	for _, chatID := range subscribers {
 		m.telegramBot.SendMessage(chatID, message)
 	}
 }
 
-// broadcastToWeb sends trade to all web subscribers
 func (m *LiveTradeManager) broadcastToWeb(eventSlug string, trade *TradeInfo) {
 	subscribers := m.subscriptions.GetWebSubscribers(eventSlug)
 	if len(subscribers) == 0 {
@@ -718,19 +675,14 @@ func (m *LiveTradeManager) broadcastToWeb(eventSlug string, trade *TradeInfo) {
 	webFormat := m.formatter.FormatForWeb(trade)
 	data, err := json.Marshal(webFormat)
 	if err != nil {
-		log.Printf("LiveTradeManager: Failed to marshal trade for web: %v", err)
 		return
 	}
 
 	for _, conn := range subscribers {
-		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-			log.Printf("LiveTradeManager: Failed to send to web client: %v", err)
-			// Connection will be cleaned up by the web server
-		}
+		conn.WriteMessage(websocket.TextMessage, data)
 	}
 }
 
-// GetResolver returns the event slug resolver
 func (m *LiveTradeManager) GetResolver() *EventSlugResolver {
 	return m.resolver
 }

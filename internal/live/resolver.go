@@ -160,6 +160,85 @@ func (r *EventSlugResolver) GetPrimaryMarketAssetIDs(event *EventInfo) []string 
 	return nil
 }
 
+// GetAllMLMarkets returns all moneyline markets for an event
+// This handles both 2-way (e.g., NBA: Team A vs Team B) and 3-way (e.g., Football: Team A/Draw/Team B)
+func (r *EventSlugResolver) GetAllMLMarkets(event *EventInfo) []*MarketInfo {
+	subMarketKeywords := []string{
+		"handicap", "kills", "first", "total", "over", "under",
+		"map ", "maps", "series:", "inhibitor", "dragon", "baron",
+		"tower", "blood", "score", "spread", "points", "goals",
+	}
+
+	var mlMarkets []*MarketInfo
+
+	// Find all markets without sub-market keywords (these are ML markets)
+	for i := range event.Markets {
+		m := &event.Markets[i]
+		if !m.Active || m.Closed {
+			continue
+		}
+
+		questionLower := strings.ToLower(m.Question)
+		isSubMarket := false
+		for _, keyword := range subMarketKeywords {
+			if strings.Contains(questionLower, keyword) {
+				isSubMarket = true
+				break
+			}
+		}
+
+		if !isSubMarket {
+			mlMarkets = append(mlMarkets, m)
+		}
+	}
+
+	// If we found ML markets, return them
+	if len(mlMarkets) > 0 {
+		return mlMarkets
+	}
+
+	// Fallback: look for markets with "win" in question
+	for i := range event.Markets {
+		m := &event.Markets[i]
+		if !m.Active || m.Closed {
+			continue
+		}
+		if strings.Contains(strings.ToLower(m.Question), "win") {
+			mlMarkets = append(mlMarkets, m)
+		}
+	}
+
+	if len(mlMarkets) > 0 {
+		return mlMarkets
+	}
+
+	// Last resort: return first active market
+	for i := range event.Markets {
+		if event.Markets[i].Active && !event.Markets[i].Closed {
+			return []*MarketInfo{&event.Markets[i]}
+		}
+	}
+
+	return nil
+}
+
+// GetAllMLMarketsAssetIDs returns asset IDs from all moneyline markets
+// For 2-way moneyline (NBA), this returns 2 asset IDs (Yes/No for the single ML market)
+// For 3-way moneyline (Football), this returns 6 asset IDs (Yes/No for each of 3 markets: Team A/Draw/Team B)
+func (r *EventSlugResolver) GetAllMLMarketsAssetIDs(event *EventInfo) []string {
+	markets := r.GetAllMLMarkets(event)
+	if len(markets) == 0 {
+		return nil
+	}
+
+	var assetIDs []string
+	for _, market := range markets {
+		tokenIds := market.GetClobTokenIds()
+		assetIDs = append(assetIDs, tokenIds...)
+	}
+	return assetIDs
+}
+
 // GetPrimaryMarket returns the primary (ML) market for an event
 // ML markets typically ask "Who will win?" or just have team names as the question
 // Sub-markets have keywords like: handicap, kills, first, total, over, under, map, series
@@ -238,4 +317,65 @@ func (r *EventSlugResolver) CleanupCache() {
 			delete(r.cache, slug)
 		}
 	}
+}
+
+// ExtractMarketShortName extracts a short display name from market question
+// e.g., "Will Wolverhampton Wanderers FC win?" -> "WOL"
+// e.g., "Draw?" -> "DRAW"
+// e.g., "Will Newcastle United FC win?" -> "NEW"
+func ExtractMarketShortName(question string) string {
+	questionLower := strings.ToLower(question)
+
+	// Check for draw first
+	if strings.Contains(questionLower, "draw") {
+		return "DRAW"
+	}
+
+	// Remove common prefixes
+	q := question
+	q = strings.TrimPrefix(q, "Will ")
+	q = strings.TrimPrefix(q, "will ")
+
+	// Remove common suffixes
+	q = strings.TrimSuffix(q, " win?")
+	q = strings.TrimSuffix(q, " Win?")
+	q = strings.TrimSuffix(q, "?")
+
+	// Try to extract short code from team name
+	// Common patterns: "Team Name FC", "Team Name United", etc.
+	parts := strings.Fields(q)
+	if len(parts) == 0 {
+		return strings.ToUpper(q)
+	}
+
+	// Use first word, max 3-4 chars for short code
+	shortName := strings.ToUpper(parts[0])
+	if len(shortName) > 4 {
+		shortName = shortName[:3]
+	}
+
+	return shortName
+}
+
+// GetAssetToMarketNameMap returns a mapping from asset ID to market short name
+// This is used to display which market a trade belongs to (e.g., "WOL", "DRAW", "NEW")
+func (r *EventSlugResolver) GetAssetToMarketNameMap(event *EventInfo) map[string]string {
+	result := make(map[string]string)
+
+	markets := r.GetAllMLMarkets(event)
+	if len(markets) <= 1 {
+		// For 2-way markets, no need for market name prefix
+		return result
+	}
+
+	// For 3-way (or more) markets, map each asset to its market short name
+	for _, market := range markets {
+		shortName := ExtractMarketShortName(market.Question)
+		tokenIds := market.GetClobTokenIds()
+		for _, tokenId := range tokenIds {
+			result[tokenId] = shortName
+		}
+	}
+
+	return result
 }
