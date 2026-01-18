@@ -3,6 +3,7 @@ package live
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -280,9 +281,11 @@ type LiveTradeManager struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 
-	// Track which events we're subscribed to at the RTDS level
+	// Track which assets we're subscribed to at the RTDS level
 	rtdsSubscriptions map[string]bool
-	rtdsMu            sync.Mutex
+	// Map asset ID to event slug for fast trade matching
+	assetToEvent map[string]string
+	rtdsMu       sync.Mutex
 }
 
 // NewLiveTradeManager creates a new live trade manager
@@ -296,6 +299,7 @@ func NewLiveTradeManager() *LiveTradeManager {
 		ctx:               ctx,
 		cancel:            cancel,
 		rtdsSubscriptions: make(map[string]bool),
+		assetToEvent:      make(map[string]string),
 	}
 }
 
@@ -324,6 +328,8 @@ func (m *LiveTradeManager) Start() error {
 			m.mu.Lock()
 			m.connected = true
 			m.mu.Unlock()
+			// Re-subscribe to all tracked assets on reconnect
+			m.resubscribeAllAssets()
 		}),
 		polymarketrealtime.WithOnDisconnect(func(err error) {
 			log.Printf("LiveTradeManager: Disconnected from RTDS WebSocket: %v", err)
@@ -337,15 +343,66 @@ func (m *LiveTradeManager) Start() error {
 		return err
 	}
 
-	// Subscribe to all activity trades
-	// The Client embeds RealtimeTypedSubscriptionHandler, so we can call Subscribe methods directly
-	if err := m.client.SubscribeToActivityTrades(m.handleTrade, nil); err != nil {
-		log.Printf("LiveTradeManager: Failed to subscribe to activity trades: %v", err)
-		return err
+	log.Println("LiveTradeManager: Started and connected to RTDS WebSocket")
+	return nil
+}
+
+// subscribeToEventAssets subscribes to all asset IDs for an event on the RTDS WebSocket
+func (m *LiveTradeManager) subscribeToEventAssets(eventSlug string, eventInfo *EventInfo) error {
+	assetIDs := m.resolver.GetAllAssetIDs(eventInfo)
+	if len(assetIDs) == 0 {
+		return fmt.Errorf("no asset IDs found for event %s", eventSlug)
 	}
 
-	log.Println("LiveTradeManager: Started and subscribed to activity trades")
+	m.rtdsMu.Lock()
+	defer m.rtdsMu.Unlock()
+
+	for _, assetID := range assetIDs {
+		// Map asset to event for fast trade matching
+		m.assetToEvent[assetID] = eventSlug
+
+		// Skip RTDS subscription if already subscribed to this asset
+		if m.rtdsSubscriptions[assetID] {
+			log.Printf("LiveTradeManager: Already subscribed to asset %s", assetID)
+			continue
+		}
+
+		// Subscribe to this specific asset on RTDS
+		filter := polymarketrealtime.NewActivityFilter().WithAssetID(assetID)
+		if err := m.client.SubscribeToActivityTrades(m.handleTrade, filter); err != nil {
+			log.Printf("LiveTradeManager: Failed to subscribe to asset %s: %v", assetID, err)
+			continue
+		}
+
+		m.rtdsSubscriptions[assetID] = true
+		log.Printf("LiveTradeManager: Subscribed to asset %s for event %s", assetID, eventSlug)
+	}
+
 	return nil
+}
+
+// resubscribeAllAssets re-subscribes to all tracked assets (called on reconnect)
+func (m *LiveTradeManager) resubscribeAllAssets() {
+	m.rtdsMu.Lock()
+	assets := make([]string, 0, len(m.rtdsSubscriptions))
+	for assetID := range m.rtdsSubscriptions {
+		assets = append(assets, assetID)
+	}
+	// Clear the map so we can re-add them
+	m.rtdsSubscriptions = make(map[string]bool)
+	m.rtdsMu.Unlock()
+
+	for _, assetID := range assets {
+		filter := polymarketrealtime.NewActivityFilter().WithAssetID(assetID)
+		if err := m.client.SubscribeToActivityTrades(m.handleTrade, filter); err != nil {
+			log.Printf("LiveTradeManager: Failed to resubscribe to asset %s: %v", assetID, err)
+			continue
+		}
+		m.rtdsMu.Lock()
+		m.rtdsSubscriptions[assetID] = true
+		m.rtdsMu.Unlock()
+		log.Printf("LiveTradeManager: Resubscribed to asset %s", assetID)
+	}
 }
 
 // Stop closes the WebSocket connection
@@ -381,9 +438,14 @@ func (m *LiveTradeManager) SubscribeTelegram(ctx context.Context, chatID int64, 
 	}
 
 	// Add to registry
-	if !m.subscriptions.SubscribeTelegram(chatID, eventSlug) {
-		// Already subscribed, but return event info anyway
-		return eventInfo, nil
+	isNew := m.subscriptions.SubscribeTelegram(chatID, eventSlug)
+
+	// Subscribe to event assets on RTDS WebSocket if this is a new subscription
+	if isNew {
+		if err := m.subscribeToEventAssets(eventSlug, eventInfo); err != nil {
+			log.Printf("LiveTradeManager: Warning - failed to subscribe to RTDS for event %s: %v", eventSlug, err)
+			// Don't return error - user is still subscribed locally
+		}
 	}
 
 	log.Printf("LiveTradeManager: User %d subscribed to event %s", chatID, eventSlug)
@@ -416,12 +478,24 @@ func (m *LiveTradeManager) GetUserSubscriptions(chatID int64) []string {
 // SubscribeWeb adds a web client to monitor an event
 func (m *LiveTradeManager) SubscribeWeb(conn *websocket.Conn, eventSlug string) error {
 	// Validate event exists
-	_, err := m.resolver.GetEventInfo(context.Background(), eventSlug)
+	eventInfo, err := m.resolver.GetEventInfo(context.Background(), eventSlug)
 	if err != nil {
 		return err
 	}
 
+	// Check if already subscribed
+	isNew := !m.subscriptions.IsWebSubscribed(conn, eventSlug)
+
 	m.subscriptions.SubscribeWeb(conn, eventSlug)
+
+	// Subscribe to event assets on RTDS WebSocket if this is a new event subscription
+	if isNew {
+		if err := m.subscribeToEventAssets(eventSlug, eventInfo); err != nil {
+			log.Printf("LiveTradeManager: Warning - failed to subscribe to RTDS for event %s: %v", eventSlug, err)
+			// Don't return error - user is still subscribed locally
+		}
+	}
+
 	log.Printf("LiveTradeManager: Web client subscribed to event %s", eventSlug)
 	return nil
 }
@@ -452,10 +526,15 @@ func (m *LiveTradeManager) IsWebSubscribed(conn *websocket.Conn, eventSlug strin
 
 // handleTrade processes incoming trades from RTDS
 func (m *LiveTradeManager) handleTrade(trade polymarketrealtime.Trade) error {
+	// Debug: Log all incoming trades
+	log.Printf("LiveTradeManager: Received trade - EventSlug: %s, ConditionID: %s, Side: %s, Size: %s, Price: %s",
+		trade.EventSlug, trade.ConditionID, trade.Side, trade.Size.String(), trade.Price.String())
+
 	// Get event slug from the trade
 	// The trade contains market/asset info we can use to match against subscriptions
 	eventSlug := m.matchTradeToEvent(trade)
 	if eventSlug == "" {
+		log.Printf("LiveTradeManager: No matching subscription for trade EventSlug=%s", trade.EventSlug)
 		return nil // No subscribers for this trade
 	}
 
@@ -482,39 +561,54 @@ func (m *LiveTradeManager) handleTrade(trade polymarketrealtime.Trade) error {
 
 // matchTradeToEvent finds which subscribed event this trade belongs to
 func (m *LiveTradeManager) matchTradeToEvent(trade polymarketrealtime.Trade) string {
-	// Get all subscribed events
+	// Fast path: match by asset ID (most reliable since we subscribed by asset)
+	if trade.Asset != "" {
+		m.rtdsMu.Lock()
+		eventSlug, found := m.assetToEvent[trade.Asset]
+		m.rtdsMu.Unlock()
+		if found {
+			log.Printf("LiveTradeManager: Matched trade by Asset ID: %s -> %s", trade.Asset, eventSlug)
+			return eventSlug
+		}
+	}
+
+	// Get all subscribed events for fallback matching
 	subscribedEvents := m.subscriptions.GetAllSubscribedEvents()
 	if len(subscribedEvents) == 0 {
+		log.Printf("LiveTradeManager: No subscribed events")
 		return ""
 	}
 
-	// Check if trade's event slug matches any subscription
-	// The trade may have EventSlug or we need to look it up
-	tradeEventSlug := trade.EventSlug
-	if tradeEventSlug != "" {
+	log.Printf("LiveTradeManager: Matching trade (Asset=%s, EventSlug=%s, ConditionID=%s) against subscriptions: %v",
+		trade.Asset, trade.EventSlug, trade.ConditionID, subscribedEvents)
+
+	// Try matching by event slug from trade
+	if trade.EventSlug != "" {
 		for _, eventSlug := range subscribedEvents {
-			if eventSlug == tradeEventSlug {
+			if eventSlug == trade.EventSlug {
+				log.Printf("LiveTradeManager: Matched by EventSlug: %s", eventSlug)
 				return eventSlug
 			}
 		}
 	}
 
-	// Try matching by market/condition ID
-	tradeConditionID := trade.ConditionID
-	if tradeConditionID != "" {
+	// Try matching by condition ID
+	if trade.ConditionID != "" {
 		for _, eventSlug := range subscribedEvents {
 			eventInfo, err := m.resolver.GetEventInfo(context.Background(), eventSlug)
 			if err != nil {
 				continue
 			}
 			for _, market := range eventInfo.Markets {
-				if market.ConditionID == tradeConditionID || market.ID == tradeConditionID {
+				if market.ConditionID == trade.ConditionID || market.ID == trade.ConditionID {
+					log.Printf("LiveTradeManager: Matched by ConditionID: %s -> %s", trade.ConditionID, eventSlug)
 					return eventSlug
 				}
 			}
 		}
 	}
 
+	log.Printf("LiveTradeManager: No match found for trade")
 	return ""
 }
 
