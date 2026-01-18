@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -150,28 +151,65 @@ func (r *EventSlugResolver) GetAllAssetIDs(event *EventInfo) []string {
 }
 
 // GetPrimaryMarketAssetIDs returns asset IDs for only the primary (ML) market
-// The primary market is typically the first active market (index 0)
+// The ML market is identified by NOT having sub-market keywords in the question
 func (r *EventSlugResolver) GetPrimaryMarketAssetIDs(event *EventInfo) []string {
-	// Find the first active, non-closed market
-	for _, market := range event.Markets {
-		if market.Active && !market.Closed {
-			return market.GetClobTokenIds()
-		}
-	}
-	// Fallback to first market if none are active
-	if len(event.Markets) > 0 {
-		return event.Markets[0].GetClobTokenIds()
+	market := r.GetPrimaryMarket(event)
+	if market != nil {
+		return market.GetClobTokenIds()
 	}
 	return nil
 }
 
 // GetPrimaryMarket returns the primary (ML) market for an event
+// ML markets typically ask "Who will win?" or just have team names as the question
+// Sub-markets have keywords like: handicap, kills, first, total, over, under, map, series
 func (r *EventSlugResolver) GetPrimaryMarket(event *EventInfo) *MarketInfo {
+	subMarketKeywords := []string{
+		"handicap", "kills", "first", "total", "over", "under",
+		"map ", "maps", "series:", "inhibitor", "dragon", "baron",
+		"tower", "blood", "score", "spread", "points", "goals",
+	}
+
+	// First pass: find ML market (no sub-market keywords, active, not closed)
+	for i := range event.Markets {
+		m := &event.Markets[i]
+		if !m.Active || m.Closed {
+			continue
+		}
+
+		questionLower := strings.ToLower(m.Question)
+		isSubMarket := false
+		for _, keyword := range subMarketKeywords {
+			if strings.Contains(questionLower, keyword) {
+				isSubMarket = true
+				break
+			}
+		}
+
+		if !isSubMarket {
+			return m
+		}
+	}
+
+	// Second pass: look for "win" in question
+	for i := range event.Markets {
+		m := &event.Markets[i]
+		if !m.Active || m.Closed {
+			continue
+		}
+		if strings.Contains(strings.ToLower(m.Question), "win") {
+			return m
+		}
+	}
+
+	// Fallback to first active market
 	for i := range event.Markets {
 		if event.Markets[i].Active && !event.Markets[i].Closed {
 			return &event.Markets[i]
 		}
 	}
+
+	// Last resort: first market
 	if len(event.Markets) > 0 {
 		return &event.Markets[0]
 	}
