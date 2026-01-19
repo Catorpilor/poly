@@ -66,6 +66,8 @@ type SubscriptionRegistry struct {
 	webSubs      map[string]map[*websocket.Conn]bool
 	// Track "all markets" flag per subscription (default false = ML only)
 	webSubsAllMarkets map[string]map[*websocket.Conn]bool
+	// Mutex per connection to prevent concurrent writes
+	connWriteMu map[*websocket.Conn]*sync.Mutex
 }
 
 func NewSubscriptionRegistry() *SubscriptionRegistry {
@@ -74,6 +76,7 @@ func NewSubscriptionRegistry() *SubscriptionRegistry {
 		userEvents:        make(map[int64]map[string]bool),
 		webSubs:           make(map[string]map[*websocket.Conn]bool),
 		webSubsAllMarkets: make(map[string]map[*websocket.Conn]bool),
+		connWriteMu:       make(map[*websocket.Conn]*sync.Mutex),
 	}
 }
 
@@ -202,6 +205,11 @@ func (r *SubscriptionRegistry) SubscribeWeb(conn *websocket.Conn, eventSlug stri
 		r.webSubsAllMarkets[eventSlug] = make(map[*websocket.Conn]bool)
 	}
 	r.webSubsAllMarkets[eventSlug][conn] = allMarkets
+
+	// Create write mutex for connection if not exists
+	if r.connWriteMu[conn] == nil {
+		r.connWriteMu[conn] = &sync.Mutex{}
+	}
 }
 
 func (r *SubscriptionRegistry) UnsubscribeWeb(conn *websocket.Conn) {
@@ -220,6 +228,8 @@ func (r *SubscriptionRegistry) UnsubscribeWeb(conn *websocket.Conn) {
 			delete(r.webSubsAllMarkets, eventSlug)
 		}
 	}
+	// Clean up write mutex
+	delete(r.connWriteMu, conn)
 }
 
 func (r *SubscriptionRegistry) UnsubscribeWebFromEvent(conn *websocket.Conn, eventSlug string) bool {
@@ -298,6 +308,12 @@ func (r *SubscriptionRegistry) WantsAllMarkets(conn *websocket.Conn, eventSlug s
 		return conns[conn]
 	}
 	return false
+}
+
+func (r *SubscriptionRegistry) GetConnWriteMutex(conn *websocket.Conn) *sync.Mutex {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.connWriteMu[conn]
 }
 
 func (r *SubscriptionRegistry) GetAllSubscribedEvents() []string {
@@ -545,8 +561,20 @@ func (m *LiveTradeManager) subscribeToAllTrades() error {
 	connected := m.connected
 	m.mu.Unlock()
 
+	// If not connected, try to connect first
 	if !connected || conn == nil {
-		return fmt.Errorf("not connected")
+		log.Println("LiveTradeManager: Not connected, attempting to connect...")
+		if err := m.connect(); err != nil {
+			return fmt.Errorf("not connected: %w", err)
+		}
+		// Re-check after connect
+		m.mu.Lock()
+		conn = m.conn
+		connected = m.connected
+		m.mu.Unlock()
+		if !connected || conn == nil {
+			return fmt.Errorf("failed to establish connection")
+		}
 	}
 
 	// Subscribe to all trades, filter client-side by asset ID
@@ -860,7 +888,12 @@ func (m *LiveTradeManager) broadcastToWeb(eventSlug string, trade *TradeInfo, rt
 		if isSubMarket && !m.subscriptions.WantsAllMarkets(conn, eventSlug) {
 			continue
 		}
-		conn.WriteMessage(websocket.TextMessage, data)
+		// Use mutex to prevent concurrent writes to the same connection
+		if mu := m.subscriptions.GetConnWriteMutex(conn); mu != nil {
+			mu.Lock()
+			conn.WriteMessage(websocket.TextMessage, data)
+			mu.Unlock()
+		}
 	}
 }
 
