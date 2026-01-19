@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -389,11 +392,31 @@ func (m *LiveTradeManager) connect() error {
 
 	// Use custom dialer with larger buffer for big messages
 	dialer := websocket.Dialer{
-		ReadBufferSize:  65536, // 64KB
-		WriteBufferSize: 4096,
+		ReadBufferSize:   65536, // 64KB
+		WriteBufferSize:  4096,
+		HandshakeTimeout: 30 * time.Second,
 	}
-	conn, _, err := dialer.Dial(rtdsURL, nil)
+
+	// Check for proxy from environment
+	if proxyURL := os.Getenv("HTTPS_PROXY"); proxyURL != "" {
+		if parsed, err := url.Parse(proxyURL); err == nil {
+			dialer.Proxy = http.ProxyURL(parsed)
+			log.Printf("LiveTradeManager: Using proxy %s", proxyURL)
+		}
+	} else if proxyURL := os.Getenv("HTTP_PROXY"); proxyURL != "" {
+		if parsed, err := url.Parse(proxyURL); err == nil {
+			dialer.Proxy = http.ProxyURL(parsed)
+			log.Printf("LiveTradeManager: Using proxy %s", proxyURL)
+		}
+	}
+
+	log.Printf("LiveTradeManager: Connecting to %s...", rtdsURL)
+	conn, resp, err := dialer.Dial(rtdsURL, nil)
 	if err != nil {
+		if resp != nil {
+			log.Printf("LiveTradeManager: Connection failed with status %d", resp.StatusCode)
+		}
+		log.Printf("LiveTradeManager: Connection error: %v", err)
 		return fmt.Errorf("failed to connect to RTDS: %w", err)
 	}
 
