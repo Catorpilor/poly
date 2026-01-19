@@ -387,7 +387,12 @@ func (m *LiveTradeManager) connect() error {
 	}
 	m.mu.Unlock()
 
-	conn, _, err := websocket.DefaultDialer.Dial(rtdsURL, nil)
+	// Use custom dialer with larger buffer for big messages
+	dialer := websocket.Dialer{
+		ReadBufferSize:  65536, // 64KB
+		WriteBufferSize: 4096,
+	}
+	conn, _, err := dialer.Dial(rtdsURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to connect to RTDS: %w", err)
 	}

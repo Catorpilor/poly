@@ -87,17 +87,65 @@
 
     <script>
         let ws = null;
-        let subscriptions = new Map(); // eventSlug -> { title, trades: [], buys: 0, sells: 0 }
+        let subscriptions = new Map(); // eventSlug -> { title, trades: [], buys: 0, sells: 0, allMarkets: bool }
+        let reconnectTimer = null;
+        let manualDisconnect = false;
+        const RECONNECT_DELAY = 3000; // 3 seconds
+        const STORAGE_KEY = 'polymarket_live_subscriptions';
+
+        // Load saved subscriptions from localStorage
+        function loadSavedSubscriptions() {
+            try {
+                const saved = localStorage.getItem(STORAGE_KEY);
+                if (saved) {
+                    return JSON.parse(saved);
+                }
+            } catch (e) {
+                console.error('Failed to load saved subscriptions:', e);
+            }
+            return [];
+        }
+
+        // Save subscriptions to localStorage
+        function saveSubscriptions() {
+            try {
+                const toSave = [];
+                subscriptions.forEach((data, slug) => {
+                    toSave.push({ slug, allMarkets: data.allMarkets || false });
+                });
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave));
+            } catch (e) {
+                console.error('Failed to save subscriptions:', e);
+            }
+        }
+
+        // Re-subscribe to all saved events
+        function resubscribeAll() {
+            const saved = loadSavedSubscriptions();
+            saved.forEach(({ slug, allMarkets }) => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    console.log('Re-subscribing to:', slug);
+                    ws.send(JSON.stringify({ action: 'subscribe', event: slug, allMarkets: allMarkets }));
+                }
+            });
+        }
 
         function toggleConnection() {
             if (ws && ws.readyState === WebSocket.OPEN) {
+                manualDisconnect = true;
                 disconnect();
             } else {
+                manualDisconnect = false;
                 connect();
             }
         }
 
         function connect() {
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
+
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}/ws`;
 
@@ -111,7 +159,9 @@
                 document.getElementById('connectBtn').classList.remove('bg-blue-600', 'hover:bg-blue-700');
                 document.getElementById('connectBtn').classList.add('bg-red-600', 'hover:bg-red-700');
                 document.getElementById('addEventSection').classList.remove('hidden');
-                ws.send(JSON.stringify({ action: 'list' }));
+
+                // Re-subscribe to saved events
+                resubscribeAll();
             };
 
             ws.onmessage = (event) => {
@@ -129,6 +179,15 @@
                 document.getElementById('connectBtn').classList.remove('bg-red-600', 'hover:bg-red-700');
                 document.getElementById('connectBtn').classList.add('bg-blue-600', 'hover:bg-blue-700');
                 document.getElementById('addEventSection').classList.add('hidden');
+
+                // Auto-reconnect unless manually disconnected
+                if (!manualDisconnect) {
+                    setStatus('disconnected', 'Reconnecting...');
+                    reconnectTimer = setTimeout(() => {
+                        console.log('Auto-reconnecting...');
+                        connect();
+                    }, RECONNECT_DELAY);
+                }
             };
 
             ws.onerror = (err) => {
@@ -138,6 +197,10 @@
         }
 
         function disconnect() {
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
             if (ws) {
                 ws.close();
                 ws = null;
@@ -147,17 +210,26 @@
         function handleMessage(data) {
             switch (data.type) {
                 case 'subscribed':
+                    // Preserve allMarkets flag from saved data or current subscription
+                    const existing = subscriptions.get(data.event);
+                    const savedSubs = loadSavedSubscriptions();
+                    const savedItem = savedSubs.find(s => s.slug === data.event);
+                    const allMarkets = existing?.allMarkets || savedItem?.allMarkets || false;
+
                     subscriptions.set(data.event, {
                         title: data.title || data.event,
-                        trades: [],
-                        buys: 0,
-                        sells: 0
+                        trades: existing?.trades || [],
+                        buys: existing?.buys || 0,
+                        sells: existing?.sells || 0,
+                        allMarkets: allMarkets
                     });
+                    saveSubscriptions();
                     renderPanels();
                     break;
 
                 case 'unsubscribed':
                     subscriptions.delete(data.event);
+                    saveSubscriptions();
                     renderPanels();
                     break;
 
@@ -386,6 +458,15 @@
         // Handle Enter key
         document.getElementById('eventSlug').addEventListener('keypress', function(e) {
             if (e.key === 'Enter') subscribeEvent();
+        });
+
+        // Auto-connect on page load if there are saved subscriptions
+        window.addEventListener('load', function() {
+            const saved = loadSavedSubscriptions();
+            if (saved.length > 0) {
+                console.log('Found saved subscriptions, auto-connecting...');
+                connect();
+            }
         });
     </script>
 </body>
