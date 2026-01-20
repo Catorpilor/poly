@@ -135,6 +135,7 @@
         let sportsReconnectDelay = 1000; // Start with 1 second, exponential backoff
         let gameStates = new Map(); // gameId -> game data
         let eventToGameId = new Map(); // eventSlug -> gameId
+        let eventGameData = new Map(); // eventSlug -> { homeTeam, awayTeam } from Sports WS
         let previousScores = new Map(); // eventSlug -> { home: string, away: string }
 
         // US leagues use away-home format in slug
@@ -259,12 +260,48 @@
             subscriptions.forEach((eventData, slug) => {
                 if (matchEventToGame(slug, data)) {
                     eventToGameId.set(slug, gameId);
+                    // Store team names from Sports WS for display
+                    eventGameData.set(slug, {
+                        homeTeam: data.homeTeam,
+                        awayTeam: data.awayTeam
+                    });
                     updateGameStateUI(slug, data);
                 }
             });
         }
 
         function matchEventToGame(eventSlug, gameData) {
+            // Get subscription data for title-based matching
+            const subData = subscriptions.get(eventSlug);
+            const eventTitle = subData?.title || '';
+
+            const gameHome = gameData.homeTeam || '';
+            const gameAway = gameData.awayTeam || '';
+            const gameLeague = (gameData.leagueAbbreviation || '').toLowerCase();
+
+            // Method 1: Match by title (most reliable)
+            // Check if event title contains both team names from Sports WS
+            if (eventTitle && gameHome && gameAway) {
+                const titleNorm = normalizeText(eventTitle.toUpperCase());
+                const homeNorm = normalizeText(gameHome.toUpperCase());
+                const awayNorm = normalizeText(gameAway.toUpperCase());
+
+                const homeMatch = titleNorm.includes(homeNorm);
+                const awayMatch = titleNorm.includes(awayNorm);
+
+                // Debug logging
+                console.log(`[Match] Slug: ${eventSlug}`);
+                console.log(`[Match] Title: "${eventTitle}" → "${titleNorm}"`);
+                console.log(`[Match] Home: "${gameHome}" → "${homeNorm}" → ${homeMatch}`);
+                console.log(`[Match] Away: "${gameAway}" → "${awayNorm}" → ${awayMatch}`);
+
+                if (homeMatch && awayMatch) {
+                    console.log(`[Match] ✓ MATCHED!`);
+                    return true;
+                }
+            }
+
+            // Method 2: Fallback to slug-based matching
             const parts = eventSlug.toLowerCase().split('-');
             if (parts.length < 4) return false;
 
@@ -272,50 +309,65 @@
             const team1 = parts[1].toUpperCase();
             const team2 = parts[2].toUpperCase();
 
-            const gameHome = (gameData.homeTeam || '').toUpperCase();
-            const gameAway = (gameData.awayTeam || '').toUpperCase();
-            const gameLeague = (gameData.leagueAbbreviation || '').toLowerCase();
-
-            // League must match
+            // League must match for slug-based matching
             if (league !== gameLeague) return false;
 
             // US sports: slug format is away-home
             if (US_LEAGUES.includes(league)) {
-                return fuzzyTeamMatch(team1, gameAway) && fuzzyTeamMatch(team2, gameHome);
+                return fuzzyTeamMatch(team1, gameAway.toUpperCase()) && fuzzyTeamMatch(team2, gameHome.toUpperCase());
             }
 
             // Football/Soccer/Esports: slug format is home-away
-            return fuzzyTeamMatch(team1, gameHome) && fuzzyTeamMatch(team2, gameAway);
+            return fuzzyTeamMatch(team1, gameHome.toUpperCase()) && fuzzyTeamMatch(team2, gameAway.toUpperCase());
+        }
+
+        // Normalize special characters for matching (ø→o, ü→u, é→e, etc.)
+        function normalizeText(text) {
+            return text
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '') // Remove diacritics
+                .replace(/ø/gi, 'o')
+                .replace(/æ/gi, 'ae')
+                .replace(/ß/g, 'ss')
+                .replace(/[\/\-_\.]/g, ' ')      // Replace separators with space
+                .replace(/[^a-zA-Z0-9\s]/g, '')  // Remove other special chars
+                .replace(/\s+/g, ' ')            // Collapse multiple spaces
+                .trim();
         }
 
         // Fuzzy match team abbreviation to full team name
         // e.g., "NOLOGO" matches "NOLOGOJUSTMMR", "LYNX" matches "TEAM LYNX"
         // e.g., "SPIRIT1" matches "SPIRIT ACADEMY" (trailing numbers stripped)
         // e.g., "RE" matches "RUNE EATERS" (initials)
+        // e.g., "BOG" matches "FK Bodø/Glimt" (normalized ø→o)
         function fuzzyTeamMatch(slugTeam, gameTeam) {
             if (!slugTeam || !gameTeam) return false;
 
+            // Normalize both teams for comparison
+            const slugNorm = normalizeText(slugTeam);
+            const gameNorm = normalizeText(gameTeam);
+
             // Strip trailing numbers from slug team (e.g., "SPIRIT1" -> "SPIRIT")
-            const slugTeamClean = slugTeam.replace(/\d+$/, '');
+            const slugTeamClean = slugNorm.replace(/\d+$/, '');
 
             // Try matching with both original and cleaned slug team
-            const candidates = [slugTeam];
-            if (slugTeamClean !== slugTeam && slugTeamClean.length > 0) {
+            const candidates = [slugNorm];
+            if (slugTeamClean !== slugNorm && slugTeamClean.length > 0) {
                 candidates.push(slugTeamClean);
             }
 
-            const gameTeamNoSpaces = gameTeam.replace(/\s+/g, '');
-            const words = gameTeam.split(/\s+/);
+            const gameTeamNoSpaces = gameNorm.replace(/\s+/g, '');
+            const words = gameNorm.split(/\s+/).filter(w => w.length > 0);
 
             for (const candidate of candidates) {
                 // Exact match
-                if (candidate === gameTeam) return true;
+                if (candidate === gameNorm) return true;
 
                 // Slug team is contained in game team (handles "LYNX" in "TEAM LYNX")
-                if (gameTeam.includes(candidate)) return true;
+                if (gameNorm.includes(candidate)) return true;
 
                 // Game team starts with slug team (handles "NOLOGO" -> "NOLOGOJUSTMMR")
-                if (gameTeam.startsWith(candidate)) return true;
+                if (gameNorm.startsWith(candidate)) return true;
 
                 // Remove spaces and check (handles "SPIRIT" in "SPIRITACADEMY")
                 if (gameTeamNoSpaces.includes(candidate)) return true;
@@ -333,9 +385,30 @@
                     // Also check first N letters match initials
                     if (initials.startsWith(candidate) || candidate.startsWith(initials)) return true;
                 }
+
+                // Check if slug chars appear as subsequence across all words
+                // "MNC" matches "MaNChester CITY" (M...N...C in order)
+                if (candidate.length >= 2) {
+                    if (isSubsequence(candidate, gameTeamNoSpaces)) {
+                        return true;
+                    }
+                }
             }
 
             return false;
+        }
+
+        // Check if 'sub' appears as subsequence in 'str'
+        // e.g., "MNC" in "MANCHESTER" → M(a)N(chester)C(ity)... wait that's across words
+        // Better: check if chars appear in order
+        function isSubsequence(sub, str) {
+            let subIdx = 0;
+            for (let i = 0; i < str.length && subIdx < sub.length; i++) {
+                if (str[i] === sub[subIdx]) {
+                    subIdx++;
+                }
+            }
+            return subIdx === sub.length;
         }
 
         function setSportsStatus(state, text) {
@@ -384,6 +457,18 @@
                 }
             }
 
+            // Update team names from Sports WS data
+            const homeTeamEl = gamePanel.querySelector('.home-team');
+            const awayTeamEl = gamePanel.querySelector('.away-team');
+            if (homeTeamEl && gameData.homeTeam) {
+                homeTeamEl.textContent = gameData.homeTeam;
+                homeTeamEl.title = gameData.homeTeam;
+            }
+            if (awayTeamEl && gameData.awayTeam) {
+                awayTeamEl.textContent = gameData.awayTeam;
+                awayTeamEl.title = gameData.awayTeam;
+            }
+
             // Update scores with flash animation on change
             const homeScoreEl = gamePanel.querySelector('.home-score');
             const awayScoreEl = gamePanel.querySelector('.away-score');
@@ -409,29 +494,25 @@
                 periodEl.textContent = periodText;
             }
 
-            // Update possession indicator
+            // Update possession indicator (for NFL/CFB)
             const homePoss = gamePanel.querySelector('.home-possession');
             const awayPoss = gamePanel.querySelector('.away-possession');
-            if (homePoss && awayPoss) {
-                const parts = eventSlug.toLowerCase().split('-');
-                const league = parts[0];
-                const team1 = parts[1].toUpperCase();
-                const team2 = parts[2].toUpperCase();
-
-                let homeTeam, awayTeam;
-                if (US_LEAGUES.includes(league)) {
-                    awayTeam = team1;
-                    homeTeam = team2;
-                } else {
-                    homeTeam = team1;
-                    awayTeam = team2;
-                }
-
+            if (homePoss && awayPoss && possession) {
+                // Possession is typically team abbreviation like "lac", "buf"
+                // Compare with team names (check if possession matches start of team name)
                 const possUpper = possession.toUpperCase();
-                homePoss.classList.toggle('opacity-100', possUpper === homeTeam);
-                homePoss.classList.toggle('opacity-0', possUpper !== homeTeam);
-                awayPoss.classList.toggle('opacity-100', possUpper === awayTeam);
-                awayPoss.classList.toggle('opacity-0', possUpper !== awayTeam);
+                const homeTeamUpper = (gameData.homeTeam || '').toUpperCase();
+                const awayTeamUpper = (gameData.awayTeam || '').toUpperCase();
+
+                const isHomePoss = homeTeamUpper.startsWith(possUpper) ||
+                                   homeTeamUpper.includes(possUpper);
+                const isAwayPoss = awayTeamUpper.startsWith(possUpper) ||
+                                   awayTeamUpper.includes(possUpper);
+
+                homePoss.classList.toggle('opacity-100', isHomePoss);
+                homePoss.classList.toggle('opacity-0', !isHomePoss);
+                awayPoss.classList.toggle('opacity-100', isAwayPoss);
+                awayPoss.classList.toggle('opacity-0', !isAwayPoss);
             }
 
             // Show the game panel if it was hidden
@@ -720,10 +801,16 @@
             panel.id = `panel-${slug}`;
             panel.className = 'event-panel bg-gray-800 rounded-lg overflow-hidden flex flex-col';
 
-            const teams = getTeamsFromSlug(slug);
             const gameId = eventToGameId.get(slug);
             const gameData = gameId ? gameStates.get(gameId) : null;
+            const storedTeams = eventGameData.get(slug);
             const hasGameData = !!gameData;
+
+            // Use full team names from Sports WS, fallback to slug
+            const teams = storedTeams ? {
+                home: storedTeams.homeTeam,
+                away: storedTeams.awayTeam
+            } : getTeamsFromSlug(slug);
 
             panel.innerHTML = `
                 <div class="px-4 py-3 border-b border-gray-700 flex items-center justify-between">
@@ -750,18 +837,18 @@
                     <div class="flex items-center justify-center gap-4">
                         <div class="text-center flex-1">
                             <div class="flex items-center justify-center gap-1">
-                                <span class="away-possession text-yellow-400 text-xs opacity-0">●</span>
-                                <span class="text-gray-300 font-medium text-sm">${teams.away}</span>
+                                <span class="home-possession text-yellow-400 text-xs opacity-0">●</span>
+                                <span class="home-team text-gray-300 font-medium text-sm truncate max-w-[120px]" title="${teams.home}">${teams.home}</span>
                             </div>
-                            <div class="away-score text-3xl font-bold text-white">0</div>
+                            <div class="home-score text-3xl font-bold text-white">0</div>
                         </div>
                         <div class="text-gray-600 text-xl">-</div>
                         <div class="text-center flex-1">
                             <div class="flex items-center justify-center gap-1">
-                                <span class="text-gray-300 font-medium text-sm">${teams.home}</span>
-                                <span class="home-possession text-yellow-400 text-xs opacity-0">●</span>
+                                <span class="away-team text-gray-300 font-medium text-sm truncate max-w-[120px]" title="${teams.away}">${teams.away}</span>
+                                <span class="away-possession text-yellow-400 text-xs opacity-0">●</span>
                             </div>
-                            <div class="home-score text-3xl font-bold text-white">0</div>
+                            <div class="away-score text-3xl font-bold text-white">0</div>
                         </div>
                     </div>
                 </div>
