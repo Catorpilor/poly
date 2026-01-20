@@ -477,8 +477,10 @@ func (m *LiveTradeManager) pingLoop() {
 func (m *LiveTradeManager) readLoop() {
 	messageCount := 0
 	tradeCount := 0
+	matchedCount := 0
 	lastLogTime := time.Now()
-	sampleSlugs := make(map[string]int) // Sample of incoming event slugs
+	sampleSlugs := make(map[string]int)          // Sample of incoming event slugs
+	unmatchedSamples := make(map[string]string)  // Sample of unmatched slugs with their full info
 
 	for {
 		m.mu.RLock()
@@ -530,14 +532,30 @@ func (m *LiveTradeManager) readLoop() {
 			if len(sampleSlugs) < 10 && slug != "" {
 				sampleSlugs[slug]++
 			}
-			m.handleTrade(&event.Payload)
+			if m.handleTrade(&event.Payload) {
+				matchedCount++
+			} else if slug != "" && len(unmatchedSamples) < 20 {
+				// Track unmatched trades to help debug
+				unmatchedSamples[slug] = fmt.Sprintf("event_slug=%s, slug=%s, asset=%s",
+					event.Payload.EventSlug, event.Payload.Slug, event.Payload.Asset)
+			}
 		}
 
 		// Log stats every 60 seconds
 		if time.Since(lastLogTime) > 60*time.Second {
-			log.Printf("LiveTradeManager: Stats - messages=%d, trades=%d, subscribed=%v, sample_slugs=%v",
-				messageCount, tradeCount, m.subscriptions.GetAllSubscribedEvents(), sampleSlugs)
-			sampleSlugs = make(map[string]int) // Reset
+			subscribedEvents := m.subscriptions.GetAllSubscribedEvents()
+			log.Printf("LiveTradeManager: Stats - messages=%d, trades=%d, matched=%d", messageCount, tradeCount, matchedCount)
+			log.Printf("LiveTradeManager: Subscribed events: %v", subscribedEvents)
+			log.Printf("LiveTradeManager: Sample incoming slugs: %v", sampleSlugs)
+			if len(unmatchedSamples) > 0 {
+				log.Printf("LiveTradeManager: Unmatched samples (first %d):", len(unmatchedSamples))
+				for slug, info := range unmatchedSamples {
+					log.Printf("  - %s: %s", slug, info)
+				}
+			}
+			sampleSlugs = make(map[string]int)          // Reset
+			unmatchedSamples = make(map[string]string)  // Reset
+			matchedCount = 0
 			lastLogTime = time.Now()
 		}
 	}
@@ -633,7 +651,7 @@ func (m *LiveTradeManager) subscribeToAllTrades() error {
 	return nil
 }
 
-func (m *LiveTradeManager) handleTrade(payload *rtdsTradePayload) {
+func (m *LiveTradeManager) handleTrade(payload *rtdsTradePayload) bool {
 	// Match by event slug from payload (primary method)
 	// RTDS sends slugs like "epl-ast-eve-2026-01-18-eve" but we subscribe to "epl-ast-eve-2026-01-18"
 	// So we use prefix matching
@@ -661,7 +679,7 @@ func (m *LiveTradeManager) handleTrade(payload *rtdsTradePayload) {
 	}
 
 	if matchedSlug == "" {
-		return
+		return false
 	}
 
 	// Look up market name for 3-way markets (e.g., "WOL", "DRAW", "NEW")
@@ -694,6 +712,7 @@ func (m *LiveTradeManager) handleTrade(payload *rtdsTradePayload) {
 
 	m.broadcastToTelegram(matchedSlug, tradeInfo)
 	m.broadcastToWeb(matchedSlug, tradeInfo, eventSlug) // Pass original RTDS slug for filtering
+	return true
 }
 
 func (m *LiveTradeManager) Stop() error {

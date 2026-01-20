@@ -18,7 +18,7 @@
             max-height: 600px;
         }
         .trade-list {
-            max-height: 450px;
+            max-height: 350px;
             overflow-y: auto;
         }
         .trade-list::-webkit-scrollbar {
@@ -30,6 +30,37 @@
         .trade-list::-webkit-scrollbar-thumb {
             background: #4b5563;
             border-radius: 3px;
+        }
+        .live-pulse {
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .score-box {
+            background: linear-gradient(135deg, #1e3a5f 0%, #1a1a2e 100%);
+        }
+        .score-flash {
+            animation: scoreFlash 0.6s ease-out;
+        }
+        @keyframes scoreFlash {
+            0% { transform: scale(1); color: white; }
+            30% { transform: scale(1.3); color: #fbbf24; text-shadow: 0 0 20px #fbbf24; }
+            100% { transform: scale(1); color: white; text-shadow: none; }
+        }
+        .score-delta {
+            position: absolute;
+            top: -8px;
+            right: -20px;
+            font-size: 12px;
+            font-weight: bold;
+            color: #4ade80;
+            animation: deltaFade 1.5s ease-out forwards;
+        }
+        @keyframes deltaFade {
+            0% { opacity: 1; transform: translateY(0); }
+            100% { opacity: 0; transform: translateY(-10px); }
         }
     </style>
 </head>
@@ -45,6 +76,10 @@
                 <div class="flex items-center gap-2">
                     <div id="statusDot" class="w-2.5 h-2.5 rounded-full bg-gray-500"></div>
                     <span id="status" class="text-gray-400 text-sm">Not connected</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <div id="sportsStatusDot" class="w-2.5 h-2.5 rounded-full bg-gray-500"></div>
+                    <span id="sportsStatus" class="text-gray-400 text-sm">Sports: Off</span>
                 </div>
                 <button onclick="toggleConnection()" id="connectBtn"
                         class="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 rounded text-sm font-medium transition-colors">
@@ -81,17 +116,29 @@
 
         <!-- Footer -->
         <div class="mt-6 text-center text-gray-600 text-xs">
-            Powered by Polymarket RTDS WebSocket
+            Powered by Polymarket RTDS & Sports WebSocket
         </div>
     </div>
 
     <script>
+        // Trade WebSocket
         let ws = null;
         let subscriptions = new Map(); // eventSlug -> { title, trades: [], buys: 0, sells: 0, allMarkets: bool }
         let reconnectTimer = null;
         let manualDisconnect = false;
-        const RECONNECT_DELAY = 3000; // 3 seconds
+        const RECONNECT_DELAY = 3000;
         const STORAGE_KEY = 'polymarket_live_subscriptions';
+
+        // Sports WebSocket
+        let sportsWs = null;
+        let sportsReconnectTimer = null;
+        let sportsReconnectDelay = 1000; // Start with 1 second, exponential backoff
+        let gameStates = new Map(); // gameId -> game data
+        let eventToGameId = new Map(); // eventSlug -> gameId
+        let previousScores = new Map(); // eventSlug -> { home: string, away: string }
+
+        // US leagues use away-home format in slug
+        const US_LEAGUES = ['nba', 'nfl', 'mlb', 'nhl', 'ncaab', 'ncaaf', 'wnba'];
 
         // Load saved subscriptions from localStorage
         function loadSavedSubscriptions() {
@@ -130,6 +177,342 @@
             });
         }
 
+        // ==================== Sports WebSocket ====================
+
+        function connectSportsWs() {
+            if (sportsWs && sportsWs.readyState === WebSocket.OPEN) return;
+
+            // Clear any existing reconnect timer
+            if (sportsReconnectTimer) {
+                clearTimeout(sportsReconnectTimer);
+                sportsReconnectTimer = null;
+            }
+
+            console.log('Connecting to Sports WebSocket...');
+            setSportsStatus('connecting', 'Sports: Connecting...');
+
+            sportsWs = new WebSocket('wss://sports-api.polymarket.com/ws');
+
+            sportsWs.onopen = () => {
+                console.log('Sports WebSocket connected');
+                setSportsStatus('connected', 'Sports: Live');
+                // Reset reconnect delay on successful connection
+                sportsReconnectDelay = 1000;
+            };
+
+            sportsWs.onmessage = (event) => {
+                // CRITICAL: Handle ping/pong first (lowercase!)
+                // Server sends 'ping' every 5 seconds, must respond with 'pong' within 10 seconds
+                if (event.data === 'ping') {
+                    if (sportsWs && sportsWs.readyState === WebSocket.OPEN) {
+                        sportsWs.send('pong');
+                    }
+                    return;
+                }
+
+                // Try to parse JSON for game data
+                try {
+                    const data = JSON.parse(event.data);
+                    handleSportsMessage(data);
+                } catch (e) {
+                    // Ignore non-JSON messages
+                    console.log('Sports WS non-JSON message:', event.data);
+                }
+            };
+
+            sportsWs.onclose = (e) => {
+                console.log('Sports WebSocket disconnected:', e.code, e.reason);
+                setSportsStatus('disconnected', 'Sports: Off');
+
+                // Auto-reconnect with exponential backoff (max 30 seconds)
+                sportsReconnectTimer = setTimeout(() => {
+                    connectSportsWs();
+                }, sportsReconnectDelay);
+                sportsReconnectDelay = Math.min(sportsReconnectDelay * 2, 30000);
+            };
+
+            sportsWs.onerror = (err) => {
+                console.error('Sports WebSocket error:', err);
+                setSportsStatus('error', 'Sports: Error');
+            };
+        }
+
+        function disconnectSportsWs() {
+            if (sportsReconnectTimer) {
+                clearTimeout(sportsReconnectTimer);
+                sportsReconnectTimer = null;
+            }
+            if (sportsWs) {
+                sportsWs.close();
+                sportsWs = null;
+            }
+        }
+
+        function handleSportsMessage(data) {
+            // Sports WebSocket sends game state updates
+            if (!data.gameId) return;
+
+            const gameId = data.gameId;
+            gameStates.set(gameId, data);
+
+            // Try to match this game to subscribed events
+            subscriptions.forEach((eventData, slug) => {
+                if (matchEventToGame(slug, data)) {
+                    eventToGameId.set(slug, gameId);
+                    updateGameStateUI(slug, data);
+                }
+            });
+        }
+
+        function matchEventToGame(eventSlug, gameData) {
+            const parts = eventSlug.toLowerCase().split('-');
+            if (parts.length < 4) return false;
+
+            const league = parts[0];
+            const team1 = parts[1].toUpperCase();
+            const team2 = parts[2].toUpperCase();
+
+            const gameHome = (gameData.homeTeam || '').toUpperCase();
+            const gameAway = (gameData.awayTeam || '').toUpperCase();
+            const gameLeague = (gameData.leagueAbbreviation || '').toLowerCase();
+
+            // League must match
+            if (league !== gameLeague) return false;
+
+            // US sports: slug format is away-home
+            if (US_LEAGUES.includes(league)) {
+                return fuzzyTeamMatch(team1, gameAway) && fuzzyTeamMatch(team2, gameHome);
+            }
+
+            // Football/Soccer/Esports: slug format is home-away
+            return fuzzyTeamMatch(team1, gameHome) && fuzzyTeamMatch(team2, gameAway);
+        }
+
+        // Fuzzy match team abbreviation to full team name
+        // e.g., "NOLOGO" matches "NOLOGOJUSTMMR", "LYNX" matches "TEAM LYNX"
+        // e.g., "SPIRIT1" matches "SPIRIT ACADEMY" (trailing numbers stripped)
+        // e.g., "RE" matches "RUNE EATERS" (initials)
+        function fuzzyTeamMatch(slugTeam, gameTeam) {
+            if (!slugTeam || !gameTeam) return false;
+
+            // Strip trailing numbers from slug team (e.g., "SPIRIT1" -> "SPIRIT")
+            const slugTeamClean = slugTeam.replace(/\d+$/, '');
+
+            // Try matching with both original and cleaned slug team
+            const candidates = [slugTeam];
+            if (slugTeamClean !== slugTeam && slugTeamClean.length > 0) {
+                candidates.push(slugTeamClean);
+            }
+
+            const gameTeamNoSpaces = gameTeam.replace(/\s+/g, '');
+            const words = gameTeam.split(/\s+/);
+
+            for (const candidate of candidates) {
+                // Exact match
+                if (candidate === gameTeam) return true;
+
+                // Slug team is contained in game team (handles "LYNX" in "TEAM LYNX")
+                if (gameTeam.includes(candidate)) return true;
+
+                // Game team starts with slug team (handles "NOLOGO" -> "NOLOGOJUSTMMR")
+                if (gameTeam.startsWith(candidate)) return true;
+
+                // Remove spaces and check (handles "SPIRIT" in "SPIRITACADEMY")
+                if (gameTeamNoSpaces.includes(candidate)) return true;
+
+                // Check if any word in game team starts with slug team
+                for (const word of words) {
+                    if (word.startsWith(candidate)) return true;
+                }
+
+                // Check if slug is initials of game team words
+                // "RE" matches "Rune Eaters" (R + E)
+                if (words.length >= 2 && candidate.length >= 2) {
+                    const initials = words.map(w => w[0]).join('');
+                    if (initials === candidate) return true;
+                    // Also check first N letters match initials
+                    if (initials.startsWith(candidate) || candidate.startsWith(initials)) return true;
+                }
+            }
+
+            return false;
+        }
+
+        function setSportsStatus(state, text) {
+            const statusDot = document.getElementById('sportsStatusDot');
+            const statusText = document.getElementById('sportsStatus');
+            statusText.textContent = text;
+
+            const colors = {
+                connected: 'bg-green-500',
+                connecting: 'bg-yellow-500 animate-pulse',
+                disconnected: 'bg-gray-500',
+                error: 'bg-red-500'
+            };
+
+            statusDot.className = `w-2.5 h-2.5 rounded-full ${colors[state]}`;
+        }
+
+        function updateGameStateUI(eventSlug, gameData) {
+            const gamePanel = document.getElementById(`game-${eventSlug}`);
+            if (!gamePanel) return;
+
+            const isLive = gameData.live && !gameData.ended;
+            const score = gameData.score || '0-0';
+            const [homeScore, awayScore] = parseScore(score, eventSlug);
+            const period = gameData.period || '';
+            const elapsed = gameData.elapsed || '';
+            const possession = gameData.turn || '';
+
+            // Get previous scores for change detection
+            const prevScores = previousScores.get(eventSlug) || { home: '0', away: '0' };
+            const homeChanged = prevScores.home !== homeScore && prevScores.home !== '0';
+            const awayChanged = prevScores.away !== awayScore && prevScores.away !== '0';
+
+            // Store current scores for next comparison
+            previousScores.set(eventSlug, { home: homeScore, away: awayScore });
+
+            // Update live indicator
+            const liveIndicator = gamePanel.querySelector('.live-indicator');
+            if (liveIndicator) {
+                if (isLive) {
+                    liveIndicator.innerHTML = '<span class="live-pulse text-red-500 font-bold text-xs">● LIVE</span>';
+                } else if (gameData.ended) {
+                    liveIndicator.innerHTML = '<span class="text-gray-400 text-xs">FINAL</span>';
+                } else {
+                    liveIndicator.innerHTML = '<span class="text-gray-500 text-xs">UPCOMING</span>';
+                }
+            }
+
+            // Update scores with flash animation on change
+            const homeScoreEl = gamePanel.querySelector('.home-score');
+            const awayScoreEl = gamePanel.querySelector('.away-score');
+
+            if (homeScoreEl) {
+                homeScoreEl.textContent = homeScore;
+                if (homeChanged) {
+                    triggerScoreFlash(homeScoreEl, parseInt(homeScore) - parseInt(prevScores.home));
+                }
+            }
+            if (awayScoreEl) {
+                awayScoreEl.textContent = awayScore;
+                if (awayChanged) {
+                    triggerScoreFlash(awayScoreEl, parseInt(awayScore) - parseInt(prevScores.away));
+                }
+            }
+
+            // Update period/time
+            const periodEl = gamePanel.querySelector('.game-period');
+            if (periodEl) {
+                let periodText = period;
+                if (elapsed) periodText += ` ${elapsed}`;
+                periodEl.textContent = periodText;
+            }
+
+            // Update possession indicator
+            const homePoss = gamePanel.querySelector('.home-possession');
+            const awayPoss = gamePanel.querySelector('.away-possession');
+            if (homePoss && awayPoss) {
+                const parts = eventSlug.toLowerCase().split('-');
+                const league = parts[0];
+                const team1 = parts[1].toUpperCase();
+                const team2 = parts[2].toUpperCase();
+
+                let homeTeam, awayTeam;
+                if (US_LEAGUES.includes(league)) {
+                    awayTeam = team1;
+                    homeTeam = team2;
+                } else {
+                    homeTeam = team1;
+                    awayTeam = team2;
+                }
+
+                const possUpper = possession.toUpperCase();
+                homePoss.classList.toggle('opacity-100', possUpper === homeTeam);
+                homePoss.classList.toggle('opacity-0', possUpper !== homeTeam);
+                awayPoss.classList.toggle('opacity-100', possUpper === awayTeam);
+                awayPoss.classList.toggle('opacity-0', possUpper !== awayTeam);
+            }
+
+            // Show the game panel if it was hidden
+            gamePanel.classList.remove('hidden');
+        }
+
+        // Trigger score flash animation and show delta
+        function triggerScoreFlash(scoreEl, delta) {
+            // Add flash animation
+            scoreEl.classList.remove('score-flash');
+            // Force reflow to restart animation
+            void scoreEl.offsetWidth;
+            scoreEl.classList.add('score-flash');
+
+            // Show delta indicator if positive
+            if (delta > 0) {
+                // Remove existing delta if any
+                const existingDelta = scoreEl.parentElement.querySelector('.score-delta');
+                if (existingDelta) existingDelta.remove();
+
+                const deltaEl = document.createElement('span');
+                deltaEl.className = 'score-delta';
+                deltaEl.textContent = `+${delta}`;
+                scoreEl.parentElement.style.position = 'relative';
+                scoreEl.parentElement.appendChild(deltaEl);
+
+                // Remove delta after animation
+                setTimeout(() => deltaEl.remove(), 1500);
+            }
+
+            // Remove flash class after animation
+            setTimeout(() => scoreEl.classList.remove('score-flash'), 600);
+        }
+
+        function parseScore(score, eventSlug) {
+            if (!score) return ['0', '0'];
+
+            // Esports format: "000-000|2-1|Bo3" - series score is middle part
+            if (score.includes('|')) {
+                const segments = score.split('|');
+                // Find the segment that looks like a series score (e.g., "2-1")
+                for (const seg of segments) {
+                    if (seg.match(/^\d+-\d+$/) && !seg.match(/^0+-0+$/)) {
+                        const parts = seg.split('-');
+                        return [parts[0].trim(), parts[1].trim()];
+                    }
+                }
+                // Fallback to second segment if exists
+                if (segments.length >= 2) {
+                    const parts = segments[1].split('-');
+                    if (parts.length === 2) {
+                        return [parts[0].trim(), parts[1].trim()];
+                    }
+                }
+            }
+
+            // Standard format: "homeScore-awayScore" (e.g., "102-98")
+            const parts = score.split('-');
+            if (parts.length === 2) {
+                return [parts[0].trim(), parts[1].trim()];
+            }
+
+            return ['0', '0'];
+        }
+
+        function getTeamsFromSlug(eventSlug) {
+            const parts = eventSlug.toLowerCase().split('-');
+            if (parts.length < 3) return { home: '???', away: '???' };
+
+            const league = parts[0];
+            const team1 = parts[1].toUpperCase();
+            const team2 = parts[2].toUpperCase();
+
+            if (US_LEAGUES.includes(league)) {
+                return { home: team2, away: team1 };
+            }
+            return { home: team1, away: team2 };
+        }
+
+        // ==================== Trade WebSocket ====================
+
         function toggleConnection() {
             if (ws && ws.readyState === WebSocket.OPEN) {
                 manualDisconnect = true;
@@ -159,6 +542,9 @@
                 document.getElementById('connectBtn').classList.remove('bg-blue-600', 'hover:bg-blue-700');
                 document.getElementById('connectBtn').classList.add('bg-red-600', 'hover:bg-red-700');
                 document.getElementById('addEventSection').classList.remove('hidden');
+
+                // Connect to sports WebSocket
+                connectSportsWs();
 
                 // Re-subscribe to saved events
                 resubscribeAll();
@@ -210,7 +596,6 @@
         function handleMessage(data) {
             switch (data.type) {
                 case 'subscribed':
-                    // Preserve allMarkets flag from saved data or current subscription
                     const existing = subscriptions.get(data.event);
                     const savedSubs = loadSavedSubscriptions();
                     const savedItem = savedSubs.find(s => s.slug === data.event);
@@ -225,10 +610,19 @@
                     });
                     saveSubscriptions();
                     renderPanels();
+
+                    // Try to match with existing game states
+                    gameStates.forEach((gameData, gameId) => {
+                        if (matchEventToGame(data.event, gameData)) {
+                            eventToGameId.set(data.event, gameId);
+                            setTimeout(() => updateGameStateUI(data.event, gameData), 100);
+                        }
+                    });
                     break;
 
                 case 'unsubscribed':
                     subscriptions.delete(data.event);
+                    eventToGameId.delete(data.event);
                     saveSubscriptions();
                     renderPanels();
                     break;
@@ -326,6 +720,11 @@
             panel.id = `panel-${slug}`;
             panel.className = 'event-panel bg-gray-800 rounded-lg overflow-hidden flex flex-col';
 
+            const teams = getTeamsFromSlug(slug);
+            const gameId = eventToGameId.get(slug);
+            const gameData = gameId ? gameStates.get(gameId) : null;
+            const hasGameData = !!gameData;
+
             panel.innerHTML = `
                 <div class="px-4 py-3 border-b border-gray-700 flex items-center justify-between">
                     <div class="flex-1 min-w-0">
@@ -339,6 +738,35 @@
                         </svg>
                     </button>
                 </div>
+
+                <!-- Game State Panel -->
+                <div id="game-${slug}" class="score-box p-3 border-b border-gray-700 ${hasGameData ? '' : 'hidden'}">
+                    <div class="flex items-center justify-between mb-2">
+                        <div class="live-indicator">
+                            <span class="text-gray-500 text-xs">UPCOMING</span>
+                        </div>
+                        <div class="game-period text-gray-400 text-xs"></div>
+                    </div>
+                    <div class="flex items-center justify-center gap-4">
+                        <div class="text-center flex-1">
+                            <div class="flex items-center justify-center gap-1">
+                                <span class="away-possession text-yellow-400 text-xs opacity-0">●</span>
+                                <span class="text-gray-300 font-medium text-sm">${teams.away}</span>
+                            </div>
+                            <div class="away-score text-3xl font-bold text-white">0</div>
+                        </div>
+                        <div class="text-gray-600 text-xl">-</div>
+                        <div class="text-center flex-1">
+                            <div class="flex items-center justify-center gap-1">
+                                <span class="text-gray-300 font-medium text-sm">${teams.home}</span>
+                                <span class="home-possession text-yellow-400 text-xs opacity-0">●</span>
+                            </div>
+                            <div class="home-score text-3xl font-bold text-white">0</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Stats Row -->
                 <div class="grid grid-cols-3 gap-2 p-3 border-b border-gray-700 bg-gray-800/50">
                     <div class="text-center">
                         <div id="total-${slug}" class="text-lg font-bold text-blue-400">${eventData.buys + eventData.sells}</div>
@@ -353,6 +781,8 @@
                         <div class="text-gray-500 text-xs">Sells</div>
                     </div>
                 </div>
+
+                <!-- Trades List -->
                 <div id="trades-${slug}" class="trade-list flex-1">
                     ${eventData.trades.length === 0 ?
                         '<div class="p-6 text-center text-gray-600 text-sm">Waiting for trades...</div>' :
@@ -360,14 +790,17 @@
                 </div>
             `;
 
+            // If we have game data, update the UI
+            if (gameData) {
+                setTimeout(() => updateGameStateUI(slug, gameData), 50);
+            }
+
             return panel;
         }
 
         function formatTimeUTC8(timestamp) {
             let date;
             if (timestamp) {
-                // RTDS timestamps are in seconds, JavaScript expects milliseconds
-                // If timestamp is 10 digits (seconds), multiply by 1000
                 const ts = timestamp < 10000000000 ? timestamp * 1000 : timestamp;
                 date = new Date(ts);
             } else {
@@ -387,7 +820,6 @@
             const sideColor = isBuy ? 'text-green-400' : 'text-red-400';
             const time = formatTimeUTC8(trade.timestamp);
 
-            // Build trader link
             const traderName = trade.trader || 'Anonymous';
             const traderLink = trade.proxyWallet ?
                 `https://polymarket.com/profile/${trade.proxyWallet}?tab=activity` : '#';
@@ -420,15 +852,12 @@
             const eventData = subscriptions.get(eventSlug);
             const isBuy = trade.side === 'BUY';
 
-            // Update stats
             if (isBuy) eventData.buys++;
             else eventData.sells++;
 
-            // Add trade to beginning
             eventData.trades.unshift(trade);
             if (eventData.trades.length > 100) eventData.trades.pop();
 
-            // Update panel stats
             const totalEl = document.getElementById(`total-${eventSlug}`);
             const buysEl = document.getElementById(`buys-${eventSlug}`);
             const sellsEl = document.getElementById(`sells-${eventSlug}`);
@@ -437,10 +866,8 @@
             if (buysEl) buysEl.textContent = eventData.buys;
             if (sellsEl) sellsEl.textContent = eventData.sells;
 
-            // Add trade to list
             const tradesEl = document.getElementById(`trades-${eventSlug}`);
             if (tradesEl) {
-                // Remove "waiting" message if present
                 const waiting = tradesEl.querySelector('.text-gray-600');
                 if (waiting) waiting.remove();
 
@@ -448,7 +875,6 @@
                 tradeEl.innerHTML = createTradeHTML(trade);
                 tradesEl.insertBefore(tradeEl.firstElementChild, tradesEl.firstChild);
 
-                // Limit displayed trades
                 while (tradesEl.children.length > 100) {
                     tradesEl.removeChild(tradesEl.lastChild);
                 }
@@ -466,6 +892,36 @@
             if (saved.length > 0) {
                 console.log('Found saved subscriptions, auto-connecting...');
                 connect();
+            }
+        });
+
+        // Reconnect when tab becomes visible
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) {
+                // Tab became visible, check connections
+                if (ws && ws.readyState !== WebSocket.OPEN && !manualDisconnect) {
+                    console.log('Tab visible, reconnecting trade WS...');
+                    connect();
+                }
+                if (sportsWs && sportsWs.readyState !== WebSocket.OPEN) {
+                    console.log('Tab visible, reconnecting sports WS...');
+                    connectSportsWs();
+                }
+            }
+        });
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            manualDisconnect = true; // Prevent reconnect attempts
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            if (sportsReconnectTimer) clearTimeout(sportsReconnectTimer);
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            if (sportsWs) {
+                sportsWs.close();
+                sportsWs = null;
             }
         });
     </script>
