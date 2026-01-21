@@ -457,7 +457,6 @@
 
             const isLive = gameData.live && !gameData.ended;
             const score = gameData.score || '0-0';
-            const [homeScore, awayScore] = parseScore(score, eventSlug);
             const period = gameData.period || '';
             const elapsed = gameData.elapsed || '';
             const possession = gameData.turn || '';
@@ -467,7 +466,14 @@
             const league = parts[0] || '';
             const isUSLeague = US_LEAGUES.includes(league);
 
-            // For display: US leagues show Away-Home, others show Home-Away
+            // Parse score - format depends on league convention
+            // US sports WebSocket: "awayScore-homeScore" (e.g., 38-36 means away=38, home=36)
+            // Soccer/Other: "homeScore-awayScore"
+            const [score1, score2] = parseScore(score, eventSlug);
+            const homeScore = isUSLeague ? score2 : score1;
+            const awayScore = isUSLeague ? score1 : score2;
+
+            // For display: US leagues show Away @ Home, others show Home vs Away
             const leftScore = isUSLeague ? awayScore : homeScore;
             const rightScore = isUSLeague ? homeScore : awayScore;
 
