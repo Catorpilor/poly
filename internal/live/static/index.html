@@ -135,7 +135,7 @@
         let sportsReconnectDelay = 1000; // Start with 1 second, exponential backoff
         let gameStates = new Map(); // gameId -> game data
         let eventToGameId = new Map(); // eventSlug -> gameId
-        let eventGameData = new Map(); // eventSlug -> { homeTeam, awayTeam } from Sports WS
+        let eventGameData = new Map(); // eventSlug -> { homeTeam, awayTeam } - full names
         let previousScores = new Map(); // eventSlug -> { home: string, away: string }
 
         // US leagues use away-home format in slug
@@ -260,11 +260,21 @@
             subscriptions.forEach((eventData, slug) => {
                 if (matchEventToGame(slug, data)) {
                     eventToGameId.set(slug, gameId);
-                    // Store team names from Sports WS for display
-                    eventGameData.set(slug, {
-                        homeTeam: data.homeTeam,
-                        awayTeam: data.awayTeam
-                    });
+
+                    // Prefer full team names from title, fallback to Sports WS data
+                    const titleTeams = getTeamsFromTitle(slug, eventData.title);
+                    if (titleTeams) {
+                        eventGameData.set(slug, {
+                            homeTeam: titleTeams.home,
+                            awayTeam: titleTeams.away
+                        });
+                    } else {
+                        // Fallback to Sports WS data (might be abbreviations)
+                        eventGameData.set(slug, {
+                            homeTeam: data.homeTeam,
+                            awayTeam: data.awayTeam
+                        });
+                    }
                     updateGameStateUI(slug, data);
                 }
             });
@@ -295,6 +305,10 @@
                 console.log(`[Match] Home: "${gameHome}" → "${homeNorm}" → ${homeMatch}`);
                 console.log(`[Match] Away: "${gameAway}" → "${awayNorm}" → ${awayMatch}`);
 
+                // Also log title parsing
+                const parsedTeams = parseTeamsFromTitle(eventTitle);
+                console.log(`[Match] Parsed from title:`, parsedTeams);
+
                 if (homeMatch && awayMatch) {
                     console.log(`[Match] ✓ MATCHED!`);
                     return true;
@@ -314,7 +328,10 @@
 
             // US sports: slug format is away-home
             if (US_LEAGUES.includes(league)) {
-                return fuzzyTeamMatch(team1, gameAway.toUpperCase()) && fuzzyTeamMatch(team2, gameHome.toUpperCase());
+                const awayMatch = fuzzyTeamMatch(team1, gameAway.toUpperCase());
+                const homeMatch = fuzzyTeamMatch(team2, gameHome.toUpperCase());
+                console.log(`[Match] Slug fallback: ${team1} vs ${gameAway.toUpperCase()} = ${awayMatch}, ${team2} vs ${gameHome.toUpperCase()} = ${homeMatch}`);
+                return awayMatch && homeMatch;
             }
 
             // Football/Soccer/Esports: slug format is home-away
@@ -393,6 +410,14 @@
                         return true;
                     }
                 }
+
+                // For short abbreviations (3-4 chars), match if first 2 chars are same
+                // This handles PHX vs PHO (both Phoenix), LAL vs LAK, etc.
+                if (candidate.length <= 4 && gameNorm.length <= 4) {
+                    if (candidate.substring(0, 2) === gameNorm.substring(0, 2)) {
+                        return true;
+                    }
+                }
             }
 
             return false;
@@ -437,13 +462,22 @@
             const elapsed = gameData.elapsed || '';
             const possession = gameData.turn || '';
 
+            // Determine if US league for display order
+            const parts = eventSlug.toLowerCase().split('-');
+            const league = parts[0] || '';
+            const isUSLeague = US_LEAGUES.includes(league);
+
+            // For display: US leagues show Away-Home, others show Home-Away
+            const leftScore = isUSLeague ? awayScore : homeScore;
+            const rightScore = isUSLeague ? homeScore : awayScore;
+
             // Get previous scores for change detection
-            const prevScores = previousScores.get(eventSlug) || { home: '0', away: '0' };
-            const homeChanged = prevScores.home !== homeScore && prevScores.home !== '0';
-            const awayChanged = prevScores.away !== awayScore && prevScores.away !== '0';
+            const prevScores = previousScores.get(eventSlug) || { left: '0', right: '0' };
+            const leftChanged = prevScores.left !== leftScore && prevScores.left !== '0';
+            const rightChanged = prevScores.right !== rightScore && prevScores.right !== '0';
 
             // Store current scores for next comparison
-            previousScores.set(eventSlug, { home: homeScore, away: awayScore });
+            previousScores.set(eventSlug, { left: leftScore, right: rightScore });
 
             // Update live indicator
             const liveIndicator = gamePanel.querySelector('.live-indicator');
@@ -457,32 +491,39 @@
                 }
             }
 
-            // Update team names from Sports WS data
-            const homeTeamEl = gamePanel.querySelector('.home-team');
-            const awayTeamEl = gamePanel.querySelector('.away-team');
-            if (homeTeamEl && gameData.homeTeam) {
-                homeTeamEl.textContent = gameData.homeTeam;
-                homeTeamEl.title = gameData.homeTeam;
-            }
-            if (awayTeamEl && gameData.awayTeam) {
-                awayTeamEl.textContent = gameData.awayTeam;
-                awayTeamEl.title = gameData.awayTeam;
+            // Update team names (prefer stored full names over Sports WS abbreviations)
+            const storedTeams = eventGameData.get(eventSlug);
+            const leftTeamEl = gamePanel.querySelector('.left-team');
+            const rightTeamEl = gamePanel.querySelector('.right-team');
+
+            if (storedTeams) {
+                const leftTeamName = isUSLeague ? storedTeams.awayTeam : storedTeams.homeTeam;
+                const rightTeamName = isUSLeague ? storedTeams.homeTeam : storedTeams.awayTeam;
+
+                if (leftTeamEl && leftTeamName) {
+                    leftTeamEl.textContent = leftTeamName;
+                    leftTeamEl.title = leftTeamName;
+                }
+                if (rightTeamEl && rightTeamName) {
+                    rightTeamEl.textContent = rightTeamName;
+                    rightTeamEl.title = rightTeamName;
+                }
             }
 
             // Update scores with flash animation on change
-            const homeScoreEl = gamePanel.querySelector('.home-score');
-            const awayScoreEl = gamePanel.querySelector('.away-score');
+            const leftScoreEl = gamePanel.querySelector('.left-score');
+            const rightScoreEl = gamePanel.querySelector('.right-score');
 
-            if (homeScoreEl) {
-                homeScoreEl.textContent = homeScore;
-                if (homeChanged) {
-                    triggerScoreFlash(homeScoreEl, parseInt(homeScore) - parseInt(prevScores.home));
+            if (leftScoreEl) {
+                leftScoreEl.textContent = leftScore;
+                if (leftChanged) {
+                    triggerScoreFlash(leftScoreEl, parseInt(leftScore) - parseInt(prevScores.left));
                 }
             }
-            if (awayScoreEl) {
-                awayScoreEl.textContent = awayScore;
-                if (awayChanged) {
-                    triggerScoreFlash(awayScoreEl, parseInt(awayScore) - parseInt(prevScores.away));
+            if (rightScoreEl) {
+                rightScoreEl.textContent = rightScore;
+                if (rightChanged) {
+                    triggerScoreFlash(rightScoreEl, parseInt(rightScore) - parseInt(prevScores.right));
                 }
             }
 
@@ -495,11 +536,10 @@
             }
 
             // Update possession indicator (for NFL/CFB)
-            const homePoss = gamePanel.querySelector('.home-possession');
-            const awayPoss = gamePanel.querySelector('.away-possession');
-            if (homePoss && awayPoss && possession) {
+            const leftPoss = gamePanel.querySelector('.left-possession');
+            const rightPoss = gamePanel.querySelector('.right-possession');
+            if (leftPoss && rightPoss && possession) {
                 // Possession is typically team abbreviation like "lac", "buf"
-                // Compare with team names (check if possession matches start of team name)
                 const possUpper = possession.toUpperCase();
                 const homeTeamUpper = (gameData.homeTeam || '').toUpperCase();
                 const awayTeamUpper = (gameData.awayTeam || '').toUpperCase();
@@ -509,10 +549,15 @@
                 const isAwayPoss = awayTeamUpper.startsWith(possUpper) ||
                                    awayTeamUpper.includes(possUpper);
 
-                homePoss.classList.toggle('opacity-100', isHomePoss);
-                homePoss.classList.toggle('opacity-0', !isHomePoss);
-                awayPoss.classList.toggle('opacity-100', isAwayPoss);
-                awayPoss.classList.toggle('opacity-0', !isAwayPoss);
+                // For US leagues: left=away, right=home
+                // For others: left=home, right=away
+                const isLeftPoss = isUSLeague ? isAwayPoss : isHomePoss;
+                const isRightPoss = isUSLeague ? isHomePoss : isAwayPoss;
+
+                leftPoss.classList.toggle('opacity-100', isLeftPoss);
+                leftPoss.classList.toggle('opacity-0', !isLeftPoss);
+                rightPoss.classList.toggle('opacity-100', isRightPoss);
+                rightPoss.classList.toggle('opacity-0', !isRightPoss);
             }
 
             // Show the game panel if it was hidden
@@ -590,6 +635,45 @@
                 return { home: team2, away: team1 };
             }
             return { home: team1, away: team2 };
+        }
+
+        // Parse team names from event title
+        // e.g., "Philadelphia 76ers vs Phoenix Suns" → { team1: "Philadelphia 76ers", team2: "Phoenix Suns" }
+        // e.g., "FK Bodø/Glimt vs. Manchester City FC" → { team1: "FK Bodø/Glimt", team2: "Manchester City FC" }
+        function parseTeamsFromTitle(title) {
+            if (!title) return null;
+
+            // Try different separators
+            const separators = [' vs. ', ' vs ', ' v. ', ' v ', ' - '];
+            for (const sep of separators) {
+                const idx = title.toLowerCase().indexOf(sep.toLowerCase());
+                if (idx > 0) {
+                    const team1 = title.substring(0, idx).trim();
+                    const team2 = title.substring(idx + sep.length).trim();
+                    // Remove common suffixes like "(BO3)", "- ESL One...", etc.
+                    const cleanTeam2 = team2.split(/\s*[\(\-\|]/)[0].trim();
+                    if (team1 && cleanTeam2) {
+                        return { team1, team2: cleanTeam2 };
+                    }
+                }
+            }
+            return null;
+        }
+
+        // Determine home/away from title based on league convention
+        function getTeamsFromTitle(eventSlug, title) {
+            const parsed = parseTeamsFromTitle(title);
+            if (!parsed) return null;
+
+            const parts = eventSlug.toLowerCase().split('-');
+            const league = parts[0] || '';
+
+            // US sports: title is "Away @ Home" or "Away vs Home" (away first)
+            // Soccer/Esports: title is "Home vs Away" (home first)
+            if (US_LEAGUES.includes(league)) {
+                return { home: parsed.team2, away: parsed.team1 };
+            }
+            return { home: parsed.team1, away: parsed.team2 };
         }
 
         // ==================== Trade WebSocket ====================
@@ -812,6 +896,15 @@
                 away: storedTeams.awayTeam
             } : getTeamsFromSlug(slug);
 
+            // Determine display order based on league
+            // US sports: Away @ Home (away on left, home on right)
+            // Soccer/Esports: Home vs Away (home on left, away on right)
+            const parts = slug.toLowerCase().split('-');
+            const league = parts[0] || '';
+            const isUSLeague = US_LEAGUES.includes(league);
+            const leftTeam = isUSLeague ? teams.away : teams.home;
+            const rightTeam = isUSLeague ? teams.home : teams.away;
+
             panel.innerHTML = `
                 <div class="px-4 py-3 border-b border-gray-700 flex items-center justify-between">
                     <div class="flex-1 min-w-0">
@@ -837,20 +930,21 @@
                     <div class="flex items-center justify-center gap-4">
                         <div class="text-center flex-1">
                             <div class="flex items-center justify-center gap-1">
-                                <span class="home-possession text-yellow-400 text-xs opacity-0">●</span>
-                                <span class="home-team text-gray-300 font-medium text-sm truncate max-w-[120px]" title="${teams.home}">${teams.home}</span>
+                                <span class="left-possession text-yellow-400 text-xs opacity-0">●</span>
+                                <span class="left-team text-gray-300 font-medium text-sm truncate max-w-[120px]" title="${leftTeam}">${leftTeam}</span>
                             </div>
-                            <div class="home-score text-3xl font-bold text-white">0</div>
+                            <div class="left-score text-3xl font-bold text-white">0</div>
                         </div>
                         <div class="text-gray-600 text-xl">-</div>
                         <div class="text-center flex-1">
                             <div class="flex items-center justify-center gap-1">
-                                <span class="away-team text-gray-300 font-medium text-sm truncate max-w-[120px]" title="${teams.away}">${teams.away}</span>
-                                <span class="away-possession text-yellow-400 text-xs opacity-0">●</span>
+                                <span class="right-team text-gray-300 font-medium text-sm truncate max-w-[120px]" title="${rightTeam}">${rightTeam}</span>
+                                <span class="right-possession text-yellow-400 text-xs opacity-0">●</span>
                             </div>
-                            <div class="away-score text-3xl font-bold text-white">0</div>
+                            <div class="right-score text-3xl font-bold text-white">0</div>
                         </div>
                     </div>
+                    <input type="hidden" class="is-us-league" value="${isUSLeague}">
                 </div>
 
                 <!-- Stats Row -->
