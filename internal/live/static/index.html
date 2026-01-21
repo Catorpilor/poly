@@ -139,7 +139,8 @@
         let previousScores = new Map(); // eventSlug -> { home: string, away: string }
 
         // US leagues use away-home format in slug
-        const US_LEAGUES = ['nba', 'nfl', 'mlb', 'nhl', 'ncaab', 'ncaaf', 'wnba'];
+        // Include both common abbreviations (cbb/cfb) and full forms (ncaab/ncaaf)
+        const US_LEAGUES = ['nba', 'nfl', 'mlb', 'nhl', 'ncaab', 'ncaaf', 'wnba', 'cbb', 'cfb', 'mls'];
 
         // Load saved subscriptions from localStorage
         function loadSavedSubscriptions() {
@@ -281,61 +282,71 @@
         }
 
         function matchEventToGame(eventSlug, gameData) {
-            // Get subscription data for title-based matching
-            const subData = subscriptions.get(eventSlug);
-            const eventTitle = subData?.title || '';
-
-            const gameHome = gameData.homeTeam || '';
-            const gameAway = gameData.awayTeam || '';
-            const gameLeague = (gameData.leagueAbbreviation || '').toLowerCase();
-
-            // Method 1: Match by title (most reliable)
-            // Check if event title contains both team names from Sports WS
-            if (eventTitle && gameHome && gameAway) {
-                const titleNorm = normalizeText(eventTitle.toUpperCase());
-                const homeNorm = normalizeText(gameHome.toUpperCase());
-                const awayNorm = normalizeText(gameAway.toUpperCase());
-
-                const homeMatch = titleNorm.includes(homeNorm);
-                const awayMatch = titleNorm.includes(awayNorm);
-
-                // Debug logging
-                console.log(`[Match] Slug: ${eventSlug}`);
-                console.log(`[Match] Title: "${eventTitle}" → "${titleNorm}"`);
-                console.log(`[Match] Home: "${gameHome}" → "${homeNorm}" → ${homeMatch}`);
-                console.log(`[Match] Away: "${gameAway}" → "${awayNorm}" → ${awayMatch}`);
-
-                // Also log title parsing
-                const parsedTeams = parseTeamsFromTitle(eventTitle);
-                console.log(`[Match] Parsed from title:`, parsedTeams);
-
-                if (homeMatch && awayMatch) {
-                    console.log(`[Match] ✓ MATCHED!`);
-                    return true;
-                }
-            }
-
-            // Method 2: Fallback to slug-based matching
             const parts = eventSlug.toLowerCase().split('-');
             if (parts.length < 4) return false;
 
             const league = parts[0];
-            const team1 = parts[1].toUpperCase();
-            const team2 = parts[2].toUpperCase();
+            const gameLeague = (gameData.leagueAbbreviation || '').toLowerCase();
 
-            // League must match for slug-based matching
+            // League must match
             if (league !== gameLeague) return false;
 
-            // US sports: slug format is away-home
-            if (US_LEAGUES.includes(league)) {
-                const awayMatch = fuzzyTeamMatch(team1, gameAway.toUpperCase());
-                const homeMatch = fuzzyTeamMatch(team2, gameHome.toUpperCase());
-                console.log(`[Match] Slug fallback: ${team1} vs ${gameAway.toUpperCase()} = ${awayMatch}, ${team2} vs ${gameHome.toUpperCase()} = ${homeMatch}`);
-                return awayMatch && homeMatch;
+            const slugTeam1 = parts[1].toUpperCase();
+            const slugTeam2 = parts[2].toUpperCase();
+            const gameHome = (gameData.homeTeam || '').toUpperCase();
+            const gameAway = (gameData.awayTeam || '').toUpperCase();
+
+            // Get subscription data for title-based matching
+            const subData = subscriptions.get(eventSlug);
+            const eventTitle = subData?.title || '';
+
+            console.log(`[Match] Slug: ${eventSlug}, League: ${league}/${gameLeague}`);
+            console.log(`[Match] Slug teams: ${slugTeam1}, ${slugTeam2}`);
+            console.log(`[Match] Game teams: away=${gameAway}, home=${gameHome}`);
+            console.log(`[Match] Title: "${eventTitle}"`);
+
+            // Method 1: Direct slug abbreviation matching (most reliable for abbreviated names)
+            // Sports WS often uses same abbreviations as Polymarket slugs (UMASS, TOLEDO, etc.)
+            const isUSLeague = US_LEAGUES.includes(league);
+            if (isUSLeague) {
+                // US: slug is away-home format
+                const awayMatch = fuzzyTeamMatch(slugTeam1, gameAway);
+                const homeMatch = fuzzyTeamMatch(slugTeam2, gameHome);
+                console.log(`[Match] Slug match (US): ${slugTeam1}↔${gameAway}=${awayMatch}, ${slugTeam2}↔${gameHome}=${homeMatch}`);
+                if (awayMatch && homeMatch) {
+                    console.log(`[Match] ✓ MATCHED via slug!`);
+                    return true;
+                }
+            } else {
+                // Non-US: slug is home-away format
+                const homeMatch = fuzzyTeamMatch(slugTeam1, gameHome);
+                const awayMatch = fuzzyTeamMatch(slugTeam2, gameAway);
+                console.log(`[Match] Slug match (non-US): ${slugTeam1}↔${gameHome}=${homeMatch}, ${slugTeam2}↔${gameAway}=${awayMatch}`);
+                if (homeMatch && awayMatch) {
+                    console.log(`[Match] ✓ MATCHED via slug!`);
+                    return true;
+                }
             }
 
-            // Football/Soccer/Esports: slug format is home-away
-            return fuzzyTeamMatch(team1, gameHome.toUpperCase()) && fuzzyTeamMatch(team2, gameAway.toUpperCase());
+            // Method 2: Title-based matching (for cases where Sports WS uses different names)
+            if (eventTitle && gameHome && gameAway) {
+                const titleNorm = normalizeText(eventTitle.toUpperCase());
+                const homeNorm = normalizeText(gameHome);
+                const awayNorm = normalizeText(gameAway);
+
+                const homeInTitle = titleNorm.includes(homeNorm) || fuzzyTeamMatch(homeNorm, titleNorm);
+                const awayInTitle = titleNorm.includes(awayNorm) || fuzzyTeamMatch(awayNorm, titleNorm);
+
+                console.log(`[Match] Title match: ${homeNorm}→${homeInTitle}, ${awayNorm}→${awayInTitle}`);
+
+                if (homeInTitle && awayInTitle) {
+                    console.log(`[Match] ✓ MATCHED via title!`);
+                    return true;
+                }
+            }
+
+            console.log(`[Match] ✗ No match found`);
+            return false;
         }
 
         // Normalize special characters for matching (ø→o, ü→u, é→e, etc.)
