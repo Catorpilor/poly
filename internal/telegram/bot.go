@@ -750,6 +750,16 @@ func (b *Bot) GetLoginTokenRepo() repositories.LoginTokenRepository {
 	return b.loginTokenRepo
 }
 
+// GetWalletManager returns the wallet manager
+func (b *Bot) GetWalletManager() *wallet.Manager {
+	return b.walletManager
+}
+
+// GetTradingClient returns the trading client
+func (b *Bot) GetTradingClient() *polymarket.TradingClient {
+	return b.tradingClient
+}
+
 // sendMessageAndReturn sends a message and returns the sent message
 func (b *Bot) sendMessageAndReturn(chatID int64, text string) tgbotapi.Message {
 	msg := tgbotapi.NewMessage(chatID, text)
@@ -2138,6 +2148,15 @@ func (b *Bot) executeBuyOrder(ctx context.Context, user *database.User, market *
 		proxyAddress = common.HexToAddress(user.ProxyAddress)
 	}
 
+	// Fetch taker fee from CLOB API
+	var takerFeeBps int
+	marketInfo, err := b.tradingClient.GetMarketInfo(ctx, tokenID)
+	if err != nil {
+		log.Printf("Warning: Failed to get market info for taker fee: %v (using 0)", err)
+	} else {
+		takerFeeBps = marketInfo.TakerBaseFee
+	}
+
 	// Build trade request
 	tradeReq := &polymarket.TradeRequest{
 		MarketID:     market.ID,
@@ -2147,9 +2166,10 @@ func (b *Bot) executeBuyOrder(ctx context.Context, user *database.User, market *
 		Amount:       amount,
 		OrderType:    polymarket.OrderTypeGTC, // Good-til-cancelled
 		NegativeRisk: market.NegRisk,          // Use negRisk exchange if market is negRisk
+		TakerFeeBps: takerFeeBps,
 	}
 
-	log.Printf("Trade request: negRisk=%v, market.NegRisk=%v", tradeReq.NegativeRisk, market.NegRisk)
+	log.Printf("Trade request: negRisk=%v, market.NegRisk=%v, takerFeeBps=%d", tradeReq.NegativeRisk, market.NegRisk, takerFeeBps)
 
 	// Execute the trade
 	result, err := b.tradingClient.ExecuteTrade(ctx, userWallet.PrivateKey, proxyAddress, creds, tradeReq)
@@ -2214,6 +2234,15 @@ func (b *Bot) executeBuyOrderByIndex(ctx context.Context, user *database.User, m
 		proxyAddress = common.HexToAddress(user.ProxyAddress)
 	}
 
+	// Fetch taker fee from CLOB API
+	var takerFeeBps int
+	marketInfo, err := b.tradingClient.GetMarketInfo(ctx, tokenID)
+	if err != nil {
+		log.Printf("Warning: Failed to get market info for taker fee: %v (using 0)", err)
+	} else {
+		takerFeeBps = marketInfo.TakerBaseFee
+	}
+
 	// Build trade request
 	tradeReq := &polymarket.TradeRequest{
 		MarketID:     market.ID,
@@ -2224,10 +2253,11 @@ func (b *Bot) executeBuyOrderByIndex(ctx context.Context, user *database.User, m
 		Price:        limitPrice, // 0 = market order, >0 = limit order
 		OrderType:    polymarket.OrderTypeGTC,
 		NegativeRisk: market.NegRisk,
+		TakerFeeBps: takerFeeBps,
 	}
 
-	log.Printf("Trade request (by index): outcomeIndex=%d, outcomeName=%s, tokenID=%s, negRisk=%v, limitPrice=%.2f",
-		outcomeIndex, outcomeName, tokenID, tradeReq.NegativeRisk, limitPrice)
+	log.Printf("Trade request (by index): outcomeIndex=%d, outcomeName=%s, tokenID=%s, negRisk=%v, limitPrice=%.2f, takerFeeBps=%d",
+		outcomeIndex, outcomeName, tokenID, tradeReq.NegativeRisk, limitPrice, takerFeeBps)
 
 	// Execute the trade
 	result, err := b.tradingClient.ExecuteTrade(ctx, userWallet.PrivateKey, proxyAddress, creds, tradeReq)
@@ -2278,6 +2308,15 @@ func (b *Bot) executeSellOrder(ctx context.Context, user *database.User, market 
 		proxyAddress = common.HexToAddress(user.ProxyAddress)
 	}
 
+	// Fetch taker fee from CLOB API
+	var takerFeeBps int
+	marketInfo, err := b.tradingClient.GetMarketInfo(ctx, tokenID)
+	if err != nil {
+		log.Printf("Warning: Failed to get market info for taker fee: %v (using 0)", err)
+	} else {
+		takerFeeBps = marketInfo.TakerBaseFee
+	}
+
 	// Build trade request
 	tradeReq := &polymarket.TradeRequest{
 		MarketID:     market.ID,
@@ -2287,14 +2326,18 @@ func (b *Bot) executeSellOrder(ctx context.Context, user *database.User, market 
 		Amount:       amount,
 		OrderType:    polymarket.OrderTypeGTC,
 		NegativeRisk: market.NegRisk, // Use negRisk exchange if market is negRisk
+		TakerFeeBps: takerFeeBps,
 	}
 
+	log.Printf("Trade request (SELL): outcome=%s, tokenID=%s, negRisk=%v, takerFeeBps=%d",
+		outcome, tokenID, tradeReq.NegativeRisk, takerFeeBps)
+
 	// Execute the trade
-	result, err := b.tradingClient.ExecuteTrade(ctx, userWallet.PrivateKey, proxyAddress, creds, tradeReq)
-	if err != nil {
+	result, execErr := b.tradingClient.ExecuteTrade(ctx, userWallet.PrivateKey, proxyAddress, creds, tradeReq)
+	if execErr != nil {
 		return &polymarket.TradeResult{
 			Success:  false,
-			ErrorMsg: fmt.Sprintf("Trade execution failed: %v", err),
+			ErrorMsg: fmt.Sprintf("Trade execution failed: %v", execErr),
 		}
 	}
 
@@ -2331,6 +2374,15 @@ func (b *Bot) executeSellOrderFromPosition(ctx context.Context, user *database.U
 		proxyAddress = common.HexToAddress(user.ProxyAddress)
 	}
 
+	// Fetch taker fee from CLOB API
+	var takerFeeBps int
+	marketInfo, err := b.tradingClient.GetMarketInfo(ctx, pos.TokenID)
+	if err != nil {
+		log.Printf("Warning: Failed to get market info for taker fee: %v (using 0)", err)
+	} else {
+		takerFeeBps = marketInfo.TakerBaseFee
+	}
+
 	// Build trade request using position data directly
 	tradeReq := &polymarket.TradeRequest{
 		MarketID:     pos.ConditionID,
@@ -2342,10 +2394,11 @@ func (b *Bot) executeSellOrderFromPosition(ctx context.Context, user *database.U
 		Price:        limitPrice,  // 0 means market order, >0 means limit order
 		OrderType:    polymarket.OrderTypeGTC,
 		NegativeRisk: pos.NegativeRisk,
+		TakerFeeBps: takerFeeBps,
 	}
 
-	log.Printf("Sell trade request: tokenID=%s, negRisk=%v, conditionID=%s, amount=$%.2f, posShares=%s, posValue=$%.2f, limitPrice=%.2f",
-		tradeReq.TokenID, tradeReq.NegativeRisk, tradeReq.MarketID, amount, polymarket.FormatShares(pos.Shares), pos.Value, limitPrice)
+	log.Printf("Sell trade request: tokenID=%s, negRisk=%v, conditionID=%s, amount=$%.2f, posShares=%s, posValue=$%.2f, limitPrice=%.2f, takerFeeBps=%d",
+		tradeReq.TokenID, tradeReq.NegativeRisk, tradeReq.MarketID, amount, polymarket.FormatShares(pos.Shares), pos.Value, limitPrice, takerFeeBps)
 
 	// Check if exchange has approval to transfer shares
 	if b.blockchain != nil {

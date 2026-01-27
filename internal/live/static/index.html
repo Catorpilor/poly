@@ -807,7 +807,8 @@
                         trades: existing?.trades || [],
                         buys: existing?.buys || 0,
                         sells: existing?.sells || 0,
-                        allMarkets: allMarkets
+                        allMarkets: allMarkets,
+                        outcomes: data.outcomes || existing?.outcomes || null // Store outcome names
                     });
                     saveSubscriptions();
                     renderPanels();
@@ -938,6 +939,18 @@
             const parts = slug.toLowerCase().split('-');
             const league = parts[0] || '';
             const isUSLeague = US_LEAGUES.includes(league);
+
+            // Use outcomes from market data if available, otherwise use team names
+            // Outcomes are preferred for non-sports markets (e.g., "Up"/"Down" for crypto)
+            let leftLabel, rightLabel;
+            if (eventData.outcomes && eventData.outcomes.length >= 2) {
+                leftLabel = eventData.outcomes[0];
+                rightLabel = eventData.outcomes[1];
+            } else {
+                leftLabel = isUSLeague ? teams.away : teams.home;
+                rightLabel = isUSLeague ? teams.home : teams.away;
+            }
+            // Keep team variables for game state display
             const leftTeam = isUSLeague ? teams.away : teams.home;
             const rightTeam = isUSLeague ? teams.home : teams.away;
 
@@ -981,6 +994,26 @@
                         </div>
                     </div>
                     <input type="hidden" class="is-us-league" value="${isUSLeague}">
+                </div>
+
+                <!-- Trade Section (visible when logged in) -->
+                <div id="trade-${slug}" class="trade-section border-b border-gray-700 p-3 ${getSession()?.telegramId ? '' : 'hidden'}">
+                    <div class="flex items-center gap-2 mb-2">
+                        <span class="text-gray-400 text-xs">Amount:</span>
+                        <input type="number" id="amount-${slug}" value="10" min="1" max="1000" step="1"
+                               class="w-20 px-2 py-1 text-xs bg-gray-700 border border-gray-600 rounded focus:outline-none focus:border-blue-500">
+                        <span class="text-gray-500 text-xs">USDC</span>
+                    </div>
+                    <div class="flex gap-2">
+                        <button onclick="executeTrade('${slug}', 0, 'BUY')"
+                                class="flex-1 px-3 py-2 bg-green-600 hover:bg-green-700 rounded text-sm font-medium transition-colors">
+                            Buy ${leftLabel}
+                        </button>
+                        <button onclick="executeTrade('${slug}', 1, 'BUY')"
+                                class="flex-1 px-3 py-2 bg-green-600 hover:bg-green-700 rounded text-sm font-medium transition-colors">
+                            Buy ${rightLabel}
+                        </button>
+                    </div>
                 </div>
 
                 <!-- Stats Row -->
@@ -1138,6 +1171,106 @@
         const AUTH_STORAGE_KEY = 'polymarket_live_auth';
         let loginPollingTimer = null;
         let currentLoginToken = null;
+
+        // Get current session from localStorage
+        function getSession() {
+            try {
+                const saved = localStorage.getItem(AUTH_STORAGE_KEY);
+                if (saved) {
+                    return JSON.parse(saved);
+                }
+            } catch (e) {
+                console.error('Failed to parse session:', e);
+            }
+            return null;
+        }
+
+        // Execute a trade
+        async function executeTrade(eventSlug, outcomeIndex, side) {
+            const session = getSession();
+            if (!session?.telegramId) {
+                alert('Please login first');
+                return;
+            }
+
+            const amountInput = document.getElementById(`amount-${eventSlug}`);
+            const amount = parseFloat(amountInput?.value || 10);
+
+            if (isNaN(amount) || amount <= 0) {
+                alert('Please enter a valid amount');
+                return;
+            }
+
+            // Get outcome name for confirmation
+            const eventData = subscriptions.get(eventSlug);
+            let outcomeName;
+            if (eventData?.outcomes && eventData.outcomes.length > outcomeIndex) {
+                // Use outcome name from market data (preferred)
+                outcomeName = eventData.outcomes[outcomeIndex];
+            } else {
+                // Fall back to team names from slug
+                const teams = eventGameData.get(eventSlug) || getTeamsFromSlug(eventSlug);
+                const parts = eventSlug.toLowerCase().split('-');
+                const league = parts[0] || '';
+                const isUSLeague = US_LEAGUES.includes(league);
+                const leftTeam = isUSLeague ? teams.away || teams.awayTeam : teams.home || teams.homeTeam;
+                const rightTeam = isUSLeague ? teams.home || teams.homeTeam : teams.away || teams.awayTeam;
+                outcomeName = outcomeIndex === 0 ? leftTeam : rightTeam;
+            }
+
+            // Show loading state
+            const tradeSection = document.getElementById(`trade-${eventSlug}`);
+            const buttons = tradeSection?.querySelectorAll('button');
+            buttons?.forEach(btn => {
+                btn.disabled = true;
+                btn.classList.add('opacity-50');
+            });
+
+            try {
+                const response = await fetch('/api/trade', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        session: {
+                            telegramId: session.telegramId,
+                            walletAddress: session.walletAddress,
+                            proxyAddress: session.proxyAddress
+                        },
+                        trade: {
+                            eventSlug: eventSlug,
+                            outcomeIndex: outcomeIndex,
+                            side: side,
+                            amount: amount
+                        }
+                    })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    alert(`Order placed successfully!\nOrder ID: ${result.orderId}`);
+                } else {
+                    alert(`Trade failed: ${result.error}`);
+                }
+            } catch (e) {
+                console.error('Trade error:', e);
+                alert(`Trade failed: ${e.message}`);
+            } finally {
+                // Restore buttons
+                buttons?.forEach(btn => {
+                    btn.disabled = false;
+                    btn.classList.remove('opacity-50');
+                });
+            }
+        }
+
+        // Update trade sections visibility based on login state
+        function updateTradeSections() {
+            const isLoggedIn = !!getSession()?.telegramId;
+            document.querySelectorAll('.trade-section').forEach(el => {
+                el.classList.toggle('hidden', !isLoggedIn);
+            });
+        }
 
         // Check for existing session on page load
         function checkExistingSession() {
@@ -1312,6 +1445,9 @@
                 walletDisplay.textContent = addr.slice(0, 6) + '...' + addr.slice(-4);
                 walletDisplay.title = addr;
             }
+
+            // Show trade sections
+            updateTradeSections();
         }
 
         // Logout and clear session
@@ -1322,6 +1458,9 @@
             document.getElementById('loggedOutUI').classList.remove('hidden');
             document.getElementById('loggedInUI').classList.add('hidden');
             document.getElementById('walletDisplay').textContent = '';
+
+            // Hide trade sections
+            updateTradeSections();
         }
 
         // Check session on page load

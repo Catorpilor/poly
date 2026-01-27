@@ -62,6 +62,7 @@ type TradeRequest struct {
 	OrderType    OrderType
 	Expiration   int64 // Unix timestamp for GTD orders
 	NegativeRisk bool  // Whether this is a negative risk market
+	TakerFeeBps  int   // Taker fee in basis points (e.g., 100 = 1%, 1000 = 10%), fetched from CLOB API
 }
 
 // TradeResult represents the result of a trade
@@ -322,6 +323,86 @@ func (tc *TradingClient) GetOrderBook(ctx context.Context, tokenID string) (*Ord
 	return &orderBook, nil
 }
 
+// CLOBMarketInfo contains market information from the CLOB API
+type CLOBMarketInfo struct {
+	ConditionID      string `json:"condition_id"`
+	Question         string `json:"question"`
+	Active           bool   `json:"active"`
+	Closed           bool   `json:"closed"`
+	NegRisk          bool   `json:"neg_risk"`
+	MakerBaseFee     int    `json:"maker_base_fee"`     // Fee in basis points (1000 = 10%)
+	TakerBaseFee     int    `json:"taker_base_fee"`     // Fee in basis points (1000 = 10%)
+	MinimumOrderSize int    `json:"minimum_order_size"`
+	MinimumTickSize  float64 `json:"minimum_tick_size"`
+	Tokens           []struct {
+		TokenID string  `json:"token_id"`
+		Outcome string  `json:"outcome"`
+		Price   float64 `json:"price"`
+	} `json:"tokens"`
+}
+
+// orderBookMarket is used to extract condition ID from order book response
+type orderBookMarket struct {
+	Market string `json:"market"` // This is the condition ID
+}
+
+// GetMarketInfo fetches market information from the CLOB API by token ID
+// It first fetches the order book to get the condition ID, then fetches market details
+func (tc *TradingClient) GetMarketInfo(ctx context.Context, tokenID string) (*CLOBMarketInfo, error) {
+	// Step 1: Get condition ID from order book
+	bookURL := fmt.Sprintf("%s/book?token_id=%s", tc.clobURL, tokenID)
+	bookReq, err := http.NewRequestWithContext(ctx, "GET", bookURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create order book request: %w", err)
+	}
+
+	bookResp, err := tc.httpClient.Do(bookReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch order book: %w", err)
+	}
+	defer bookResp.Body.Close()
+
+	if bookResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("order book request failed: %s", bookResp.Status)
+	}
+
+	var bookData orderBookMarket
+	if err := json.NewDecoder(bookResp.Body).Decode(&bookData); err != nil {
+		return nil, fmt.Errorf("failed to decode order book: %w", err)
+	}
+
+	if bookData.Market == "" {
+		return nil, fmt.Errorf("no market/condition ID in order book response")
+	}
+
+	// Step 2: Fetch market info using condition ID
+	marketURL := fmt.Sprintf("%s/markets/%s", tc.clobURL, bookData.Market)
+	marketReq, err := http.NewRequestWithContext(ctx, "GET", marketURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create market request: %w", err)
+	}
+
+	marketResp, err := tc.httpClient.Do(marketReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch market info: %w", err)
+	}
+	defer marketResp.Body.Close()
+
+	if marketResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("market info request failed: %s", marketResp.Status)
+	}
+
+	var market CLOBMarketInfo
+	if err := json.NewDecoder(marketResp.Body).Decode(&market); err != nil {
+		return nil, fmt.Errorf("failed to decode market info: %w", err)
+	}
+
+	log.Printf("GetMarketInfo: tokenID=%s, conditionID=%s, takerFeeBps=%d, makerFeeBps=%d, negRisk=%v",
+		tokenID, bookData.Market, market.TakerBaseFee, market.MakerBaseFee, market.NegRisk)
+
+	return &market, nil
+}
+
 // GetBestPrice gets the best available price for a trade
 // For BUY: amount = USDC to spend, returns the VWAP price per share
 // For SELL: amount = shares to sell, returns the VWAP price per share
@@ -514,20 +595,26 @@ func (tc *TradingClient) ExecuteTrade(
 	if strings.ToUpper(trade.Side) == "BUY" {
 		side = model.BUY
 		// BUY: spending USDC to get shares
-		// Step 1: Calculate shares from USDC amount
+		// Step 1: Calculate shares from USDC amount, accounting for taker fee
+		// Total cost = shares * price * (1 + takerFee)
+		// So: shares = amount / (price * (1 + takerFee))
+		// TakerFeeBps is in basis points (1000 = 10%), convert to decimal
 		// takerAmount (shares): max 2 decimals -> round down to nearest 10000
-		shares := int64((trade.Amount / price) * 1e6)
+		takerFeeDecimal := float64(trade.TakerFeeBps) / 10000.0
+		effectivePrice := price * (1 + takerFeeDecimal)
+		shares := int64((trade.Amount / effectivePrice) * 1e6)
 		sharesRounded := (shares / 10000) * 10000
 		takerAmount = strconv.FormatInt(sharesRounded, 10)
 		// Step 2: Calculate makerAmount FROM shares * price to ensure consistency
 		// This is critical: Polymarket validates makerAmount == takerAmount * price
 		// makerAmount (USDC): max 4 decimals -> round to nearest 100
+		// Note: makerAmount is the base cost, fee is added separately by exchange
 		// Use math.Round to avoid floating-point truncation errors (e.g., 75*0.69 = 51.7499...)
 		makerAmountRaw := int64(math.Round(float64(sharesRounded) * price))
 		makerAmountRaw = ((makerAmountRaw + 50) / 100) * 100
 		makerAmount = strconv.FormatInt(makerAmountRaw, 10)
-		log.Printf("ExecuteTrade BUY: makerAmount=%s USDC (calculated from shares*price), takerAmount=%s shares (raw=%d), price=%.6f, originalUSDC=%.2f",
-			makerAmount, takerAmount, shares, price, trade.Amount)
+		log.Printf("ExecuteTrade BUY: makerAmount=%s USDC, takerAmount=%s shares (raw=%d), price=%.6f, effectivePrice=%.6f (feeBps=%d), originalUSDC=%.2f",
+			makerAmount, takerAmount, shares, price, effectivePrice, trade.TakerFeeBps, trade.Amount)
 	} else {
 		side = model.SELL
 		// SELL: selling shares to get USDC
@@ -568,6 +655,9 @@ func (tc *TradingClient) ExecuteTrade(
 		log.Printf("ExecuteTrade: Using proxy wallet, sigType=POLY_GNOSIS_SAFE(2)")
 	}
 
+	// Use taker fee (already in basis points from CLOB API)
+	log.Printf("ExecuteTrade: TakerFeeBps=%d", trade.TakerFeeBps)
+
 	// Build order data
 	orderData := &model.OrderData{
 		Maker:         maker,
@@ -576,7 +666,7 @@ func (tc *TradingClient) ExecuteTrade(
 		MakerAmount:   makerAmount,
 		TakerAmount:   takerAmount,
 		Side:          side,
-		FeeRateBps:    "0", // Default fee
+		FeeRateBps:    strconv.Itoa(trade.TakerFeeBps),
 		Nonce:         "0",
 		Signer:        eoaAddress.Hex(),
 		SignatureType: sigType,
