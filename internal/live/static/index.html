@@ -73,6 +73,25 @@
                 <p class="text-gray-400 text-sm">Pro Trader View - Multi-Event Monitoring</p>
             </div>
             <div class="flex items-center gap-4">
+                <!-- Auth Section -->
+                <div id="authSection" class="flex items-center gap-2">
+                    <div id="loggedOutUI" class="flex items-center gap-2">
+                        <button onclick="initiateLogin()" id="loginBtn"
+                                class="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 rounded text-sm font-medium transition-colors flex items-center gap-1">
+                            <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z"/>
+                            </svg>
+                            Login
+                        </button>
+                    </div>
+                    <div id="loggedInUI" class="hidden flex items-center gap-2">
+                        <span id="walletDisplay" class="text-gray-400 text-xs font-mono"></span>
+                        <button onclick="logout()"
+                                class="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs font-medium transition-colors">
+                            Logout
+                        </button>
+                    </div>
+                </div>
                 <div class="flex items-center gap-2">
                     <div id="statusDot" class="w-2.5 h-2.5 rounded-full bg-gray-500"></div>
                     <span id="status" class="text-gray-400 text-sm">Not connected</span>
@@ -1084,15 +1103,6 @@
             if (e.key === 'Enter') subscribeEvent();
         });
 
-        // Auto-connect on page load if there are saved subscriptions
-        window.addEventListener('load', function() {
-            const saved = loadSavedSubscriptions();
-            if (saved.length > 0) {
-                console.log('Found saved subscriptions, auto-connecting...');
-                connect();
-            }
-        });
-
         // Reconnect when tab becomes visible
         document.addEventListener('visibilitychange', () => {
             if (!document.hidden) {
@@ -1120,6 +1130,208 @@
             if (sportsWs) {
                 sportsWs.close();
                 sportsWs = null;
+            }
+        });
+
+        // ==================== Authentication ====================
+
+        const AUTH_STORAGE_KEY = 'polymarket_live_auth';
+        let loginPollingTimer = null;
+        let currentLoginToken = null;
+
+        // Check for existing session on page load
+        function checkExistingSession() {
+            // Check URL for token parameter (callback from Telegram)
+            const urlParams = new URLSearchParams(window.location.search);
+            const urlToken = urlParams.get('token');
+
+            if (urlToken) {
+                // Clear the URL parameter
+                window.history.replaceState({}, document.title, window.location.pathname);
+                // Complete the login
+                completeLogin(urlToken);
+                return;
+            }
+
+            // Check localStorage for existing session
+            const saved = localStorage.getItem(AUTH_STORAGE_KEY);
+            if (saved) {
+                try {
+                    const session = JSON.parse(saved);
+                    if (session.walletAddress) {
+                        showLoggedInState(session);
+                    }
+                } catch (e) {
+                    console.error('Failed to parse saved session:', e);
+                    localStorage.removeItem(AUTH_STORAGE_KEY);
+                }
+            }
+        }
+
+        // Initiate login by creating token and opening Telegram
+        async function initiateLogin() {
+            const loginBtn = document.getElementById('loginBtn');
+            loginBtn.disabled = true;
+            loginBtn.textContent = 'Opening...';
+
+            try {
+                const response = await fetch('/api/auth/init', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.error || 'Failed to initialize login');
+                }
+
+                const data = await response.json();
+                currentLoginToken = data.token;
+
+                // Open Telegram in new tab
+                window.open(data.telegramUrl, '_blank');
+
+                // Start polling for authentication
+                loginBtn.textContent = 'Waiting...';
+                startLoginPolling(data.token, data.expiresAt);
+
+            } catch (e) {
+                console.error('Login initialization failed:', e);
+                alert('Failed to start login: ' + e.message);
+                loginBtn.disabled = false;
+                loginBtn.textContent = 'Login';
+            }
+        }
+
+        // Poll for authentication status
+        function startLoginPolling(token, expiresAt) {
+            const pollInterval = 3000; // 3 seconds
+            const maxPolls = Math.ceil((expiresAt * 1000 - Date.now()) / pollInterval);
+            let pollCount = 0;
+
+            loginPollingTimer = setInterval(async () => {
+                pollCount++;
+
+                // Stop if expired
+                if (Date.now() > expiresAt * 1000 || pollCount > maxPolls) {
+                    stopLoginPolling();
+                    const loginBtn = document.getElementById('loginBtn');
+                    loginBtn.disabled = false;
+                    loginBtn.textContent = 'Login';
+                    alert('Login session expired. Please try again.');
+                    return;
+                }
+
+                try {
+                    const response = await fetch(`/api/auth/status?token=${token}`);
+                    if (!response.ok) {
+                        console.error('Status check failed');
+                        return;
+                    }
+
+                    const data = await response.json();
+
+                    if (data.status === 'authenticated') {
+                        stopLoginPolling();
+                        completeLogin(token);
+                    } else if (data.status === 'expired' || data.status === 'used') {
+                        stopLoginPolling();
+                        const loginBtn = document.getElementById('loginBtn');
+                        loginBtn.disabled = false;
+                        loginBtn.textContent = 'Login';
+                    }
+                } catch (e) {
+                    console.error('Status polling error:', e);
+                }
+            }, pollInterval);
+        }
+
+        function stopLoginPolling() {
+            if (loginPollingTimer) {
+                clearInterval(loginPollingTimer);
+                loginPollingTimer = null;
+            }
+            currentLoginToken = null;
+        }
+
+        // Complete login and save session
+        async function completeLogin(token) {
+            try {
+                const response = await fetch('/api/auth/complete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token })
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.error || 'Failed to complete login');
+                }
+
+                const data = await response.json();
+
+                if (data.success) {
+                    const session = {
+                        telegramId: data.telegramId,
+                        walletAddress: data.walletAddress,
+                        proxyAddress: data.proxyAddress,
+                        authenticatedAt: Date.now()
+                    };
+
+                    localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(session));
+                    showLoggedInState(session);
+                } else {
+                    throw new Error(data.error || 'Login failed');
+                }
+
+            } catch (e) {
+                console.error('Login completion failed:', e);
+                alert('Failed to complete login: ' + e.message);
+            }
+
+            // Reset login button
+            const loginBtn = document.getElementById('loginBtn');
+            loginBtn.disabled = false;
+            loginBtn.innerHTML = `
+                <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z"/>
+                </svg>
+                Login
+            `;
+        }
+
+        // Show logged-in UI state
+        function showLoggedInState(session) {
+            document.getElementById('loggedOutUI').classList.add('hidden');
+            document.getElementById('loggedInUI').classList.remove('hidden');
+
+            // Display truncated wallet address
+            const walletDisplay = document.getElementById('walletDisplay');
+            if (session.walletAddress) {
+                const addr = session.walletAddress;
+                walletDisplay.textContent = addr.slice(0, 6) + '...' + addr.slice(-4);
+                walletDisplay.title = addr;
+            }
+        }
+
+        // Logout and clear session
+        function logout() {
+            localStorage.removeItem(AUTH_STORAGE_KEY);
+            stopLoginPolling();
+
+            document.getElementById('loggedOutUI').classList.remove('hidden');
+            document.getElementById('loggedInUI').classList.add('hidden');
+            document.getElementById('walletDisplay').textContent = '';
+        }
+
+        // Check session on page load
+        window.addEventListener('load', function() {
+            checkExistingSession();
+
+            const saved = loadSavedSubscriptions();
+            if (saved.length > 0) {
+                console.log('Found saved subscriptions, auto-connecting...');
+                connect();
             }
         });
     </script>

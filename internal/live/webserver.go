@@ -8,8 +8,12 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/Catorpilor/poly/internal/config"
+	"github.com/Catorpilor/poly/internal/database"
+	"github.com/Catorpilor/poly/internal/database/repositories"
 )
 
 // WebSocket message types
@@ -32,22 +36,32 @@ var staticFiles embed.FS
 
 // WebServer serves the live monitoring web interface
 type WebServer struct {
-	liveManager *LiveTradeManager
-	upgrader    websocket.Upgrader
-	httpServer  *http.Server
-	port        int
+	liveManager    *LiveTradeManager
+	upgrader       websocket.Upgrader
+	httpServer     *http.Server
+	port           int
+	db             *database.DB
+	config         *config.Config
+	loginTokenRepo repositories.LoginTokenRepository
 }
 
 // NewWebServer creates a new web server for live monitoring
-func NewWebServer(liveManager *LiveTradeManager, port int) *WebServer {
+func NewWebServer(liveManager *LiveTradeManager, port int, db *database.DB, cfg *config.Config) *WebServer {
 	ws := &WebServer{
 		liveManager: liveManager,
 		port:        port,
+		db:          db,
+		config:      cfg,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Allow all origins for development
 			},
 		},
+	}
+
+	// Initialize login token repository if db is available
+	if db != nil {
+		ws.loginTokenRepo = repositories.NewLoginTokenRepository(db)
 	}
 
 	mux := http.NewServeMux()
@@ -65,6 +79,11 @@ func NewWebServer(liveManager *LiveTradeManager, port int) *WebServer {
 
 	// Health check
 	mux.HandleFunc("/health", ws.handleHealth)
+
+	// Auth endpoints for Telegram login
+	mux.HandleFunc("/api/auth/init", ws.handleAuthInit)
+	mux.HandleFunc("/api/auth/status", ws.handleAuthStatus)
+	mux.HandleFunc("/api/auth/complete", ws.handleAuthComplete)
 
 	ws.httpServer = &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
@@ -252,6 +271,180 @@ func (ws *WebServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"rtds_subscribed":   ws.liveManager.IsSubscribed(),
 		"subscribed_events": subscribedEvents,
 		"tracked_assets":    trackedAssets,
+	}
+
+	json.NewEncoder(w).Encode(resp)
+}
+
+// Auth response types
+type authInitResponse struct {
+	Token       string `json:"token"`
+	TelegramURL string `json:"telegramUrl"`
+	ExpiresAt   int64  `json:"expiresAt"`
+}
+
+type authStatusResponse struct {
+	Status        string  `json:"status"`
+	WalletAddress *string `json:"walletAddress,omitempty"`
+	ProxyAddress  *string `json:"proxyAddress,omitempty"`
+}
+
+type authCompleteResponse struct {
+	Success       bool    `json:"success"`
+	TelegramID    *int64  `json:"telegramId,omitempty"`
+	WalletAddress *string `json:"walletAddress,omitempty"`
+	ProxyAddress  *string `json:"proxyAddress,omitempty"`
+	Error         string  `json:"error,omitempty"`
+}
+
+// handleAuthInit creates a new login token and returns the Telegram deep link
+func (ws *WebServer) handleAuthInit(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Only allow POST
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+		return
+	}
+
+	// Check if login token repo is available
+	if ws.loginTokenRepo == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Authentication not configured"})
+		return
+	}
+
+	// Create a new login token with 5 minute expiry
+	token, err := ws.loginTokenRepo.Create(r.Context(), 5*time.Minute)
+	if err != nil {
+		log.Printf("WebServer: Failed to create login token: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to create login token"})
+		return
+	}
+
+	// Build Telegram deep link URL
+	tokenStr := repositories.TokenToString(token.Token)
+	botUsername := "poly_trade_test_bot"
+	if ws.config != nil && ws.config.Telegram.BotUsername != "" {
+		botUsername = ws.config.Telegram.BotUsername
+	}
+	telegramURL := fmt.Sprintf("https://t.me/%s?start=login_%s", botUsername, tokenStr)
+
+	resp := authInitResponse{
+		Token:       tokenStr,
+		TelegramURL: telegramURL,
+		ExpiresAt:   token.ExpiresAt.Unix(),
+	}
+
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleAuthStatus checks the status of a login token
+func (ws *WebServer) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Only allow GET
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+		return
+	}
+
+	// Get token from query parameter
+	tokenStr := r.URL.Query().Get("token")
+	if tokenStr == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Missing token parameter"})
+		return
+	}
+
+	// Check if login token repo is available
+	if ws.loginTokenRepo == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Authentication not configured"})
+		return
+	}
+
+	// Get token status
+	token, err := ws.loginTokenRepo.GetByToken(r.Context(), tokenStr)
+	if err != nil {
+		log.Printf("WebServer: Failed to get login token: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to check token status"})
+		return
+	}
+
+	if token == nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Token not found"})
+		return
+	}
+
+	// Check if expired
+	status := token.Status
+	if time.Now().After(token.ExpiresAt) && status == database.LoginTokenStatusPending {
+		status = database.LoginTokenStatusExpired
+	}
+
+	resp := authStatusResponse{
+		Status:        status,
+		WalletAddress: token.WalletAddress,
+		ProxyAddress:  token.ProxyAddress,
+	}
+
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleAuthComplete completes the login and returns user data
+func (ws *WebServer) handleAuthComplete(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Only allow POST
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+		return
+	}
+
+	// Parse request body
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+		return
+	}
+
+	if req.Token == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Missing token"})
+		return
+	}
+
+	// Check if login token repo is available
+	if ws.loginTokenRepo == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(authCompleteResponse{Success: false, Error: "Authentication not configured"})
+		return
+	}
+
+	// Mark token as used and get user data
+	token, err := ws.loginTokenRepo.MarkUsed(r.Context(), req.Token)
+	if err != nil {
+		log.Printf("WebServer: Failed to complete login: %v", err)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(authCompleteResponse{Success: false, Error: "Token not authenticated or expired"})
+		return
+	}
+
+	resp := authCompleteResponse{
+		Success:       true,
+		TelegramID:    token.TelegramID,
+		WalletAddress: token.WalletAddress,
+		ProxyAddress:  token.ProxyAddress,
 	}
 
 	json.NewEncoder(w).Encode(resp)

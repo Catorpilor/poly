@@ -130,6 +130,27 @@ type PriceAlert struct {
 	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
 }
 
+// LoginToken represents a web authentication token
+type LoginToken struct {
+	Token           pgtype.UUID `json:"token" db:"token"`
+	Status          string      `json:"status" db:"status"` // pending, authenticated, used, expired
+	TelegramID      *int64      `json:"telegram_id" db:"telegram_id"`
+	WalletAddress   *string     `json:"wallet_address" db:"wallet_address"`
+	ProxyAddress    *string     `json:"proxy_address" db:"proxy_address"`
+	CreatedAt       time.Time   `json:"created_at" db:"created_at"`
+	AuthenticatedAt *time.Time  `json:"authenticated_at" db:"authenticated_at"`
+	ExpiresAt       time.Time   `json:"expires_at" db:"expires_at"`
+	UsedAt          *time.Time  `json:"used_at" db:"used_at"`
+}
+
+// LoginToken status constants
+const (
+	LoginTokenStatusPending       = "pending"
+	LoginTokenStatusAuthenticated = "authenticated"
+	LoginTokenStatusUsed          = "used"
+	LoginTokenStatusExpired       = "expired"
+)
+
 // OrderSide represents the side of an order (BUY or SELL)
 type OrderSide string
 

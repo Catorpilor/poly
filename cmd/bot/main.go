@@ -53,7 +53,7 @@ func main() {
 	if cfg.App.Port > 0 {
 		liveWebPort = cfg.App.Port + 1 // Use next port after app port
 	}
-	webServer := live.NewWebServer(bot.GetLiveManager(), liveWebPort)
+	webServer := live.NewWebServer(bot.GetLiveManager(), liveWebPort, db, cfg)
 	if err := webServer.Start(); err != nil {
 		log.Printf("Warning: Failed to start live monitoring web server: %v", err)
 	} else {

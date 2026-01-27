@@ -21,18 +21,19 @@ import (
 
 // Bot represents the Telegram bot
 type Bot struct {
-	api           *tgbotapi.BotAPI
-	config        *config.Config
-	db            *database.DB
-	userRepo      repositories.UserRepository
-	handlers      map[string]CommandHandler
-	rateLimiter   *RateLimiter
-	stateManager  *StateManager
-	walletManager *wallet.Manager
-	blockchain    *blockchain.Client
-	proxyResolver *polymarket.ProxyResolver
-	tradingClient *polymarket.TradingClient
-	liveManager   *live.LiveTradeManager
+	api            *tgbotapi.BotAPI
+	config         *config.Config
+	db             *database.DB
+	userRepo       repositories.UserRepository
+	loginTokenRepo repositories.LoginTokenRepository
+	handlers       map[string]CommandHandler
+	rateLimiter    *RateLimiter
+	stateManager   *StateManager
+	walletManager  *wallet.Manager
+	blockchain     *blockchain.Client
+	proxyResolver  *polymarket.ProxyResolver
+	tradingClient  *polymarket.TradingClient
+	liveManager    *live.LiveTradeManager
 }
 
 // CommandHandler is a function that handles a command
@@ -72,18 +73,19 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 	liveManager := live.NewLiveTradeManager()
 
 	bot := &Bot{
-		api:           api,
-		config:        cfg,
-		db:            db,
-		userRepo:      repositories.NewUserRepository(db),
-		handlers:      make(map[string]CommandHandler),
-		rateLimiter:   NewRateLimiter(cfg.Security.RateLimitPerUser, time.Duration(cfg.Security.RateLimitWindowMins)*time.Minute),
-		stateManager:  NewStateManager(),
-		walletManager: walletManager,
-		blockchain:    blockchainClient,
-		proxyResolver: proxyResolver,
-		tradingClient: tradingClient,
-		liveManager:   liveManager,
+		api:            api,
+		config:         cfg,
+		db:             db,
+		userRepo:       repositories.NewUserRepository(db),
+		loginTokenRepo: repositories.NewLoginTokenRepository(db),
+		handlers:       make(map[string]CommandHandler),
+		rateLimiter:    NewRateLimiter(cfg.Security.RateLimitPerUser, time.Duration(cfg.Security.RateLimitWindowMins)*time.Minute),
+		stateManager:   NewStateManager(),
+		walletManager:  walletManager,
+		blockchain:     blockchainClient,
+		proxyResolver:  proxyResolver,
+		tradingClient:  tradingClient,
+		liveManager:    liveManager,
 	}
 
 	// Set bot as telegram sender for live manager
@@ -270,6 +272,14 @@ func (b *Bot) handleDeepLink(ctx context.Context, update *tgbotapi.Update) {
 		return
 	}
 
+	// Handle login deep links: login_<token>
+	// Used for web authentication via Telegram
+	if strings.HasPrefix(parameter, "login_") {
+		token := strings.TrimPrefix(parameter, "login_")
+		b.handleLoginToken(ctx, update, token)
+		return
+	}
+
 	// Unknown parameter, just start normally
 	b.handleStart(ctx, b, update)
 }
@@ -288,6 +298,145 @@ func (b *Bot) handleMarketBySlug(ctx context.Context, update *tgbotapi.Update, s
 
 	// Reuse the same display logic
 	b.displayMarketForTrading(ctx, chatID, market)
+}
+
+// handleLoginToken handles web authentication via Telegram
+// When user clicks "Login with Telegram" on web, they're redirected here
+func (b *Bot) handleLoginToken(ctx context.Context, update *tgbotapi.Update, token string) {
+	chatID := update.Message.Chat.ID
+	userID := update.Message.From.ID
+	username := update.Message.From.UserName
+
+	log.Printf("Login token received from user %d: %s", userID, token)
+
+	// Validate token format (should be UUID, 36 chars)
+	if len(token) != 36 {
+		b.sendMessage(chatID, "❌ Invalid login token format.")
+		return
+	}
+
+	// Check if token exists and is valid
+	loginToken, err := b.loginTokenRepo.GetByToken(ctx, token)
+	if err != nil {
+		log.Printf("Error getting login token: %v", err)
+		b.sendMessage(chatID, "❌ Invalid login token.")
+		return
+	}
+
+	if loginToken == nil {
+		b.sendMessage(chatID, "❌ Login token not found or expired.")
+		return
+	}
+
+	// Check if token is still pending
+	if loginToken.Status != database.LoginTokenStatusPending {
+		b.sendMessage(chatID, "❌ This login token has already been used.")
+		return
+	}
+
+	// Check if token has expired
+	if time.Now().After(loginToken.ExpiresAt) {
+		b.sendMessage(chatID, "❌ This login token has expired. Please try again.")
+		return
+	}
+
+	// Get or create user
+	user, err := b.userRepo.GetByTelegramID(ctx, userID)
+	if err != nil {
+		log.Printf("Error getting user: %v", err)
+		b.sendMessage(chatID, "❌ Failed to process login. Please try again.")
+		return
+	}
+
+	// If user doesn't exist, create wallet
+	if user == nil {
+		log.Printf("Creating new wallet for login user %d", userID)
+
+		// Generate new wallet
+		newWallet, err := b.walletManager.GenerateNewWallet()
+		if err != nil {
+			log.Printf("Error generating wallet: %v", err)
+			b.sendMessage(chatID, "❌ Failed to create wallet. Please try again.")
+			return
+		}
+
+		// Encrypt the private key
+		encryptedKey, err := b.walletManager.EncryptPrivateKey(newWallet)
+		if err != nil {
+			log.Printf("Error encrypting private key: %v", err)
+			b.sendMessage(chatID, "❌ Failed to secure wallet. Please try again.")
+			return
+		}
+
+		// Resolve proxy address
+		proxyAddress := ""
+		if b.proxyResolver != nil {
+			eoaAddress := newWallet.EOAAddress
+			if proxy, err := b.proxyResolver.GetProxyWallet(ctx, eoaAddress); err == nil && proxy.Hex() != "0x0000000000000000000000000000000000000000" {
+				proxyAddress = proxy.Hex()
+				log.Printf("Found proxy wallet for new user: %s", proxyAddress)
+			}
+		}
+
+		// Create user in database
+		user = &database.User{
+			TelegramID:   userID,
+			Username:     username,
+			EOAAddress:   newWallet.EOAAddress.Hex(),
+			ProxyAddress: proxyAddress,
+			EncryptedKey: encryptedKey,
+			Settings:     make(database.JSONB),
+			IsActive:     true,
+		}
+
+		if err := b.userRepo.Create(ctx, user); err != nil {
+			log.Printf("Error creating user: %v", err)
+			b.sendMessage(chatID, "❌ Failed to create account. Please try again.")
+			return
+		}
+
+		log.Printf("Created new user %d with wallet %s", userID, newWallet.EOAAddress.Hex())
+	}
+
+	// Authenticate the token
+	walletAddr := user.EOAAddress
+	proxyAddr := user.ProxyAddress
+	if err := b.loginTokenRepo.Authenticate(ctx, token, userID, walletAddr, proxyAddr); err != nil {
+		log.Printf("Error authenticating token: %v", err)
+		b.sendMessage(chatID, "❌ Failed to authenticate. Please try again.")
+		return
+	}
+
+	// Build callback URL
+	callbackURL := fmt.Sprintf("%s?token=%s", b.config.App.LiveWebURL, token)
+
+	// Send success message
+	// Note: Telegram doesn't allow localhost URLs in inline buttons, so we only show
+	// the button for https URLs. For localhost, the web page will auto-detect the login.
+	message := fmt.Sprintf(`✅ *Login Successful!*
+
+You are now authenticated as *%s*.
+
+Your wallet:
+%s
+
+`, username, walletAddr)
+
+	// Only show URL button for https URLs (Telegram rejects http/localhost)
+	if strings.HasPrefix(b.config.App.LiveWebURL, "https://") {
+		message += "Click the button below to return to the web interface."
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonURL("🌐 Open Live Web", callbackURL),
+			),
+		)
+		b.sendMessageWithKeyboard(chatID, message, keyboard)
+	} else {
+		message += "Return to your browser - the page will automatically log you in."
+		b.sendMessage(chatID, message)
+	}
+
+	log.Printf("User %d authenticated successfully for web login", userID)
 }
 
 // displayMarketForTrading shows market details with trading buttons
@@ -594,6 +743,11 @@ func (b *Bot) SendMessage(chatID int64, text string) {
 // GetLiveManager returns the live trade manager
 func (b *Bot) GetLiveManager() *live.LiveTradeManager {
 	return b.liveManager
+}
+
+// GetLoginTokenRepo returns the login token repository
+func (b *Bot) GetLoginTokenRepo() repositories.LoginTokenRepository {
+	return b.loginTokenRepo
 }
 
 // sendMessageAndReturn sends a message and returns the sent message

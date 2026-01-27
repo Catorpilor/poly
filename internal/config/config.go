@@ -42,7 +42,8 @@ type Config struct {
 
 // TelegramConfig holds Telegram bot configuration
 type TelegramConfig struct {
-	BotToken string
+	BotToken    string
+	BotUsername string // Bot username for deep links (without @)
 }
 
 // DatabaseConfig holds database configuration
@@ -100,6 +101,7 @@ type AppConfig struct {
 	Environment string
 	LogLevel    string
 	Port        int
+	LiveWebURL  string // URL for live web interface callback
 }
 
 // GnosisSafeConfig holds Gnosis Safe configuration
@@ -123,6 +125,7 @@ func Load() (*Config, error) {
 	if cfg.Telegram.BotToken == "" {
 		return nil, fmt.Errorf("TELEGRAM_BOT_TOKEN is required")
 	}
+	cfg.Telegram.BotUsername = getEnv("TELEGRAM_BOT_USERNAME", "poly_trade_test_bot")
 
 	// Load Database configuration
 	cfg.Database.URL = getEnv("DATABASE_URL", "")
@@ -179,6 +182,7 @@ func Load() (*Config, error) {
 	cfg.App.Environment = getEnv("ENVIRONMENT", "development")
 	cfg.App.LogLevel = getEnv("LOG_LEVEL", "debug")
 	cfg.App.Port = getEnvInt("PORT", 8080)
+	cfg.App.LiveWebURL = getEnv("LIVE_WEB_URL", "http://localhost:8081")
 
 	// Load Gnosis Safe configuration
 	cfg.GnosisSafe.FactoryAddress = getEnv("GNOSIS_SAFE_FACTORY_ADDRESS", "0xa6B71E26C5e0845f74c812102Ca7114b6a896AB2")
