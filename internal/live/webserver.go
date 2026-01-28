@@ -226,12 +226,43 @@ func (ws *WebServer) handleSubscribe(conn *websocket.Conn, eventSlug string, all
 		return
 	}
 
-	// Extract outcomes from the first active market
+	// Extract outcomes from the Moneyline market (not spreads/totals/props)
 	var outcomes []string
 	for _, market := range eventInfo.Markets {
 		if market.Active && !market.Closed {
-			outcomes = market.GetOutcomes()
+			q := market.Question
+			// Skip non-moneyline markets based on question
+			if strings.Contains(q, "Spread") ||
+				strings.Contains(q, "O/U") ||
+				strings.Contains(q, "Over") ||
+				strings.Contains(q, "Under") ||
+				strings.Contains(q, "Points") ||
+				strings.Contains(q, "Rebounds") ||
+				strings.Contains(q, "Assists") ||
+				strings.Contains(q, "1H ") ||
+				strings.Contains(q, "1Q ") ||
+				strings.Contains(q, "(-") ||
+				strings.Contains(q, "(+") {
+				continue
+			}
+			marketOutcomes := market.GetOutcomes()
+			// Also skip if outcomes contain Over/Under/Yes/No
+			if len(marketOutcomes) >= 2 &&
+				(marketOutcomes[0] == "Over" || marketOutcomes[0] == "Under" ||
+					marketOutcomes[0] == "Yes" || marketOutcomes[0] == "No") {
+				continue
+			}
+			outcomes = marketOutcomes
 			break
+		}
+	}
+	// Fallback to first active market if no moneyline found
+	if len(outcomes) == 0 {
+		for _, market := range eventInfo.Markets {
+			if market.Active && !market.Closed {
+				outcomes = market.GetOutcomes()
+				break
+			}
 		}
 	}
 
