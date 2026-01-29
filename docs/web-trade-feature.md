@@ -96,17 +96,42 @@ type WebServer struct {
 
 ### Moneyline Market Selection
 
-For sports events with multiple markets (spreads, totals, props), the system automatically selects the Moneyline market by skipping markets with these patterns in the question:
+For sports/esports events with multiple markets (spreads, totals, props), the system automatically selects the Moneyline market using `GetPrimaryMarket()` from the resolver. Markets are filtered by checking (case-insensitive) for these sub-market keywords:
 
-- `Spread`, `O/U`, `Over`, `Under` (spreads/totals)
-- `(-` and `(+` (spread numbers like -10.5)
-- `Points`, `Rebounds`, `Assists` (player props)
-- `1H `, `1Q ` (half/quarter markets)
-- Outcomes containing `Over`, `Under`, `Yes`, `No`
+**General:**
+- `spread` - spread betting
+- `total` - totals markets
+- `over`, `under`, `o/u` - over/under markets
+- `score` - correct score markets
+- `handicap` - handicap betting
 
-Example:
-- Skipped: "Spread: Clippers (-10.5)"
-- Selected: "Clippers vs. Jazz"
+**Sports (NBA, NFL, etc.):**
+- `points`, `rebounds`, `assists` - player props
+- `1h `, `1q ` - half/quarter markets
+- `(-`, `(+` - spread notation like "(-10.5)"
+- `goals` - soccer totals
+
+**Esports (LoL, etc.):**
+- `first` - first blood, first tower, etc.
+- `blood` - first blood
+- `tower` - first tower
+- `dragon` - first dragon
+- `baron` - first baron
+- `inhibitor` - first inhibitor
+- `kills` - total kills
+- `map `, `maps` - map-specific markets
+- `series:` - series markets
+
+**Examples:**
+| Market Question | Filtered? | Reason |
+|-----------------|-----------|--------|
+| "Pistons vs. Nuggets" | No | ML market |
+| "Spread: Pistons (-7.5)" | Yes | contains "spread", "(-" |
+| "Pistons vs. Nuggets: O/U 219.5" | Yes | contains "o/u" |
+| "LeBron James: Points O/U 27.5" | Yes | contains "points", "o/u" |
+| "First Blood in Game 1?" | Yes | contains "first", "blood" |
+| "T1 vs. Gen.G" | No | ML market |
+| "1H Moneyline: Heat vs. Bulls" | Yes | contains "1h " |
 
 ### Frontend Integration
 
