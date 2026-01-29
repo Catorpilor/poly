@@ -226,44 +226,10 @@ func (ws *WebServer) handleSubscribe(conn *websocket.Conn, eventSlug string, all
 		return
 	}
 
-	// Extract outcomes from the Moneyline market (not spreads/totals/props)
+	// Extract outcomes from the Moneyline market using resolver's logic
 	var outcomes []string
-	for _, market := range eventInfo.Markets {
-		if market.Active && !market.Closed {
-			q := market.Question
-			// Skip non-moneyline markets based on question
-			if strings.Contains(q, "Spread") ||
-				strings.Contains(q, "O/U") ||
-				strings.Contains(q, "Over") ||
-				strings.Contains(q, "Under") ||
-				strings.Contains(q, "Points") ||
-				strings.Contains(q, "Rebounds") ||
-				strings.Contains(q, "Assists") ||
-				strings.Contains(q, "1H ") ||
-				strings.Contains(q, "1Q ") ||
-				strings.Contains(q, "(-") ||
-				strings.Contains(q, "(+") {
-				continue
-			}
-			marketOutcomes := market.GetOutcomes()
-			// Also skip if outcomes contain Over/Under/Yes/No
-			if len(marketOutcomes) >= 2 &&
-				(marketOutcomes[0] == "Over" || marketOutcomes[0] == "Under" ||
-					marketOutcomes[0] == "Yes" || marketOutcomes[0] == "No") {
-				continue
-			}
-			outcomes = marketOutcomes
-			break
-		}
-	}
-	// Fallback to first active market if no moneyline found
-	if len(outcomes) == 0 {
-		for _, market := range eventInfo.Markets {
-			if market.Active && !market.Closed {
-				outcomes = market.GetOutcomes()
-				break
-			}
-		}
+	if primaryMarket := ws.liveManager.resolver.GetPrimaryMarket(eventInfo); primaryMarket != nil {
+		outcomes = primaryMarket.GetOutcomes()
 	}
 
 	ws.sendResponse(conn, wsResponse{
@@ -675,7 +641,7 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		// Resolve from event slug - use first active ML market
+		// Resolve from event slug - use primary (ML) market from resolver
 		eventInfo, err := ws.liveManager.resolver.GetEventInfo(r.Context(), req.Trade.EventSlug)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -683,69 +649,19 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Find the Moneyline market (not spreads/totals/props)
-		// Moneyline markets have simple questions like "Team A vs. Team B" without:
-		// - "Spread" or spread numbers like "(-10.5)"
-		// - "O/U" or "Over" or "Under" (totals)
-		// - "Points", "Rebounds", "Assists" (player props)
-		// - "1H" or "1Q" (half/quarter markets)
-		for _, market := range eventInfo.Markets {
-			if market.Active && !market.Closed {
-				tokenIDs := market.GetClobTokenIds()
-				outcomes := market.GetOutcomes()
-				if len(tokenIDs) >= 2 && len(outcomes) >= 2 {
-					q := market.Question
-					// Skip non-moneyline markets based on question
-					if strings.Contains(q, "Spread") ||
-						strings.Contains(q, "O/U") ||
-						strings.Contains(q, "Over") ||
-						strings.Contains(q, "Under") ||
-						strings.Contains(q, "Points") ||
-						strings.Contains(q, "Rebounds") ||
-						strings.Contains(q, "Assists") ||
-						strings.Contains(q, "1H ") ||
-						strings.Contains(q, "1Q ") ||
-						strings.Contains(q, "(-") ||
-						strings.Contains(q, "(+") {
-						continue
-					}
-					// Also skip if outcomes contain Over/Under
-					if outcomes[0] == "Over" || outcomes[0] == "Under" ||
-						outcomes[0] == "Yes" || outcomes[0] == "No" {
-						continue
-					}
-					// This looks like a moneyline market
-					marketID = market.ID
-					if req.Trade.OutcomeIndex < len(tokenIDs) {
-						tokenID = tokenIDs[req.Trade.OutcomeIndex]
-					}
-					if req.Trade.OutcomeIndex < len(outcomes) {
-						outcome = outcomes[req.Trade.OutcomeIndex]
-					}
-					log.Printf("WebServer: Selected moneyline market: %s, question: %s, outcomes: %v", marketID, q, outcomes)
-					break
-				}
+		// Use resolver's GetPrimaryMarket which has comprehensive sub-market filtering
+		primaryMarket := ws.liveManager.resolver.GetPrimaryMarket(eventInfo)
+		if primaryMarket != nil {
+			marketID = primaryMarket.ID
+			tokenIDs := primaryMarket.GetClobTokenIds()
+			outcomes := primaryMarket.GetOutcomes()
+			if req.Trade.OutcomeIndex < len(tokenIDs) {
+				tokenID = tokenIDs[req.Trade.OutcomeIndex]
 			}
-		}
-		// Fallback: if no moneyline found, use first active market with 2 team-like outcomes
-		if tokenID == "" {
-			for _, market := range eventInfo.Markets {
-				if market.Active && !market.Closed {
-					tokenIDs := market.GetClobTokenIds()
-					outcomes := market.GetOutcomes()
-					if len(tokenIDs) >= 2 && len(outcomes) >= 2 {
-						marketID = market.ID
-						if req.Trade.OutcomeIndex < len(tokenIDs) {
-							tokenID = tokenIDs[req.Trade.OutcomeIndex]
-						}
-						if req.Trade.OutcomeIndex < len(outcomes) {
-							outcome = outcomes[req.Trade.OutcomeIndex]
-						}
-						log.Printf("WebServer: Fallback to first market: %s, question: %s, outcomes: %v", marketID, market.Question, outcomes)
-						break
-					}
-				}
+			if req.Trade.OutcomeIndex < len(outcomes) {
+				outcome = outcomes[req.Trade.OutcomeIndex]
 			}
+			log.Printf("WebServer: Selected primary market: %s, question: %s, outcomes: %v", marketID, primaryMarket.Question, outcomes)
 		}
 	}
 
