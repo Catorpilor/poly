@@ -794,8 +794,17 @@ func (m *LiveTradeManager) SubscribeWeb(conn *websocket.Conn, eventSlug string, 
 // isSubMarketSlug checks if a slug indicates a sub-market (over/under, btts, handicap, etc.)
 func isSubMarketSlug(slug string) bool {
 	subMarketIndicators := []string{
+		// General
 		"-over-", "-under-", "-btts", "-handicap", "-spread",
-		"-total-", "-first-", "-score-", "-goals-", "-points-",
+		"-total-", "-first-", "-score-", "-goals-",
+		// Sports player props
+		"-points-", "-rebounds-", "-assists-",
+		// Half/quarter markets
+		"-1h-", "-1q-", "-2h-", "-2q-", "-3q-", "-4q-",
+		"-moneyline", // catches "1h-moneyline"
+		// Esports
+		"-kills-", "-map-", "-maps-", "-dragon-", "-baron-",
+		"-blood-", "-tower-", "-inhibitor-", "-series-",
 	}
 	slugLower := strings.ToLower(slug)
 	for _, indicator := range subMarketIndicators {
