@@ -15,6 +15,27 @@ func TestGetPrimaryMarket(t *testing.T) {
 		wantNil        bool
 	}{
 		{
+			name: "Real data: Hawks vs Pacers - ML market deep in list",
+			event: &EventInfo{
+				ID:    "nba-atl-ind-2026-01-31",
+				Title: "Hawks vs. Pacers",
+				Markets: []MarketInfo{
+					{ID: "1303349", Question: "Andrew Nembhard: Assists O/U 8.5", OutcomesRaw: `["Yes", "No"]`, Active: true, Closed: false},
+					{ID: "1309386", Question: "Hawks vs. Pacers: 1H O/U 119.5", OutcomesRaw: `["Over", "Under"]`, Active: true, Closed: false},
+					{ID: "1303749", Question: "1H Spread: Hawks (-0.5)", OutcomesRaw: `["Hawks", "Pacers"]`, Active: true, Closed: false},
+					{ID: "1303750", Question: "Hawks vs. Pacers: 1H O/U 120.5", OutcomesRaw: `["Over", "Under"]`, Active: true, Closed: false},
+					{ID: "1303751", Question: "Hawks vs. Pacers: 1H Moneyline", OutcomesRaw: `["Hawks", "Pacers"]`, Active: true, Closed: false},
+					{ID: "1303970", Question: "Hawks vs. Pacers: O/U 232.5", OutcomesRaw: `["Over", "Under"]`, Active: true, Closed: false},
+					{ID: "1301270", Question: "Spread: Hawks (-1.5)", OutcomesRaw: `["Hawks", "Pacers"]`, Active: true, Closed: false},
+					{ID: "1305405", Question: "Jalen Johnson: Assists O/U 6.5", OutcomesRaw: `["Yes", "No"]`, Active: true, Closed: false},
+					{ID: "1265645", Question: "Hawks vs. Pacers", OutcomesRaw: `["Hawks", "Pacers"]`, Active: true, Closed: false},
+					{ID: "1302815", Question: "Pascal Siakam: Points O/U 24.5", OutcomesRaw: `["Yes", "No"]`, Active: true, Closed: false},
+				},
+			},
+			wantQuestion: "Hawks vs. Pacers",
+			wantOutcomes: []string{"Hawks", "Pacers"},
+		},
+		{
 			name: "NBA game - should select ML not spreads/totals",
 			event: &EventInfo{
 				ID:    "nba-det-den-2026-01-27",
