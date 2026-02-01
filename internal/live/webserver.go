@@ -499,6 +499,7 @@ type webTradeData struct {
 	EventSlug    string  `json:"eventSlug"`
 	MarketID     string  `json:"marketId"`
 	OutcomeIndex int     `json:"outcomeIndex"`
+	YesNoIndex   *int    `json:"yesNoIndex"` // For 3-way markets: 0=Yes, 1=No (nil for 2-way)
 	Side         string  `json:"side"`
 	Amount       float64 `json:"amount"`
 }
@@ -662,17 +663,27 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 		// Get all ML markets to detect 2-way vs 3-way
 		mlMarkets := ws.liveManager.resolver.GetAllMLMarkets(eventInfo)
 		if len(mlMarkets) >= 3 {
-			// 3-way market (soccer): outcomeIndex selects which market, always bet Yes (index 0)
+			// 3-way market (soccer): outcomeIndex selects which market, yesNoIndex selects Yes/No
 			if req.Trade.OutcomeIndex < len(mlMarkets) {
 				selectedMarket := mlMarkets[req.Trade.OutcomeIndex]
 				marketID = selectedMarket.ID
 				tokenIDs := selectedMarket.GetClobTokenIds()
-				if len(tokenIDs) > 0 {
-					tokenID = tokenIDs[0] // Always Yes for 3-way
+				outcomes := selectedMarket.GetOutcomes()
+
+				// Use yesNoIndex if provided, default to 0 (Yes)
+				yesNoIdx := 0
+				if req.Trade.YesNoIndex != nil {
+					yesNoIdx = *req.Trade.YesNoIndex
 				}
-				outcome = "Yes"
+
+				if yesNoIdx < len(tokenIDs) {
+					tokenID = tokenIDs[yesNoIdx]
+				}
+				if yesNoIdx < len(outcomes) {
+					outcome = outcomes[yesNoIdx]
+				}
 				shortName := ExtractMarketShortName(selectedMarket.Question)
-				log.Printf("WebServer: 3-way market selected: %s (%s), question: %s", marketID, shortName, selectedMarket.Question)
+				log.Printf("WebServer: 3-way market selected: %s (%s), yesNo=%d, question: %s", marketID, shortName, yesNoIdx, selectedMarket.Question)
 			}
 		} else if len(mlMarkets) > 0 {
 			// 2-way market (NBA, esports): outcomeIndex selects outcome within the market

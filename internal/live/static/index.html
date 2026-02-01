@@ -955,12 +955,25 @@
             const rightTeam = isUSLeague ? teams.home : teams.away;
 
             // Generate trade buttons dynamically
-            const tradeButtons = outcomeLabels.map((label, idx) => `
-                <button onclick="executeTrade('${slug}', ${idx}, 'BUY')"
-                        class="flex-1 px-3 py-2 bg-green-600 hover:bg-green-700 rounded text-sm font-medium transition-colors">
-                    Buy ${label}
-                </button>
-            `).join('');
+            const is3Way = outcomeLabels.length >= 3;
+            let tradeButtons;
+            if (is3Way) {
+                // 3-way market: show selector buttons that reveal YES/NO options
+                tradeButtons = outcomeLabels.map((label, idx) => `
+                    <button onclick="select3WayMarket('${slug}', ${idx}, '${label}')"
+                            class="flex-1 px-2 py-2 bg-blue-600 hover:bg-blue-700 rounded text-xs font-medium transition-colors">
+                        ${label}
+                    </button>
+                `).join('');
+            } else {
+                // 2-way market: direct trade buttons
+                tradeButtons = outcomeLabels.map((label, idx) => `
+                    <button onclick="executeTrade('${slug}', ${idx}, 'BUY')"
+                            class="flex-1 px-3 py-2 bg-green-600 hover:bg-green-700 rounded text-sm font-medium transition-colors">
+                        Buy ${label}
+                    </button>
+                `).join('');
+            }
 
             panel.innerHTML = `
                 <div class="px-4 py-3 border-b border-gray-700 flex items-center justify-between">
@@ -1015,6 +1028,24 @@
                     <div class="flex gap-2">
                         ${tradeButtons}
                     </div>
+                    ${is3Way ? `
+                    <!-- YES/NO row for 3-way markets (hidden until market selected) -->
+                    <div id="yesno-${slug}" class="hidden mt-2">
+                        <div class="flex items-center gap-2 mb-1">
+                            <span id="selected-market-${slug}" class="text-gray-300 text-xs font-medium"></span>
+                        </div>
+                        <div class="flex gap-2">
+                            <button onclick="execute3WayTrade('${slug}', 0)"
+                                    class="flex-1 px-3 py-2 bg-green-600 hover:bg-green-700 rounded text-sm font-medium transition-colors">
+                                BUY YES
+                            </button>
+                            <button onclick="execute3WayTrade('${slug}', 1)"
+                                    class="flex-1 px-3 py-2 bg-red-600 hover:bg-red-700 rounded text-sm font-medium transition-colors">
+                                BUY NO
+                            </button>
+                        </div>
+                    </div>
+                    ` : ''}
                 </div>
 
                 <!-- Stats Row -->
@@ -1186,8 +1217,59 @@
             return null;
         }
 
+        // Track selected 3-way market
+        let selected3WayMarket = { slug: null, marketIndex: null, marketLabel: null };
+
+        // Hide all YES/NO rows
+        function hideAll3WayRows() {
+            document.querySelectorAll('[id^="yesno-"]').forEach(el => el.classList.add('hidden'));
+            selected3WayMarket = { slug: null, marketIndex: null, marketLabel: null };
+        }
+
+        // Select a market in 3-way mode (shows YES/NO buttons)
+        function select3WayMarket(eventSlug, marketIndex, marketLabel) {
+            // Hide any previously shown YES/NO row
+            hideAll3WayRows();
+
+            // Store selection
+            selected3WayMarket = { slug: eventSlug, marketIndex, marketLabel };
+
+            // Show the YES/NO row for this event
+            const yesnoRow = document.getElementById(`yesno-${eventSlug}`);
+            const selectedLabel = document.getElementById(`selected-market-${eventSlug}`);
+            if (yesnoRow && selectedLabel) {
+                selectedLabel.textContent = `${marketLabel}:`;
+                yesnoRow.classList.remove('hidden');
+            }
+        }
+
+        // Execute trade for 3-way market (yesNoIndex: 0=Yes, 1=No)
+        async function execute3WayTrade(eventSlug, yesNoIndex) {
+            if (selected3WayMarket.slug !== eventSlug || selected3WayMarket.marketIndex === null) {
+                alert('Please select a market first');
+                return;
+            }
+
+            // For 3-way, we send: marketIndex (which market) and yesNoIndex (Yes=0 or No=1)
+            // The backend handles this by selecting the right market and outcome
+            await executeTrade(eventSlug, selected3WayMarket.marketIndex, 'BUY', yesNoIndex);
+            hideAll3WayRows();
+        }
+
+        // Click outside handler to hide YES/NO row
+        document.addEventListener('click', function(event) {
+            // Check if click is outside any yesno row and not on a 3-way selector button
+            const clickedYesNo = event.target.closest('[id^="yesno-"]');
+            const clicked3WayBtn = event.target.closest('[onclick^="select3WayMarket"]');
+            const clickedExecuteBtn = event.target.closest('[onclick^="execute3WayTrade"]');
+
+            if (!clickedYesNo && !clicked3WayBtn && !clickedExecuteBtn && selected3WayMarket.slug) {
+                hideAll3WayRows();
+            }
+        });
+
         // Execute a trade
-        async function executeTrade(eventSlug, outcomeIndex, side) {
+        async function executeTrade(eventSlug, outcomeIndex, side, yesNoIndex = null) {
             const session = getSession();
             if (!session?.telegramId) {
                 alert('Please login first');
@@ -1240,6 +1322,7 @@
                         trade: {
                             eventSlug: eventSlug,
                             outcomeIndex: outcomeIndex,
+                            yesNoIndex: yesNoIndex,
                             side: side,
                             amount: amount
                         }
