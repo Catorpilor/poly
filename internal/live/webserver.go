@@ -228,8 +228,18 @@ func (ws *WebServer) handleSubscribe(conn *websocket.Conn, eventSlug string, all
 
 	// Extract outcomes from the Moneyline market using resolver's logic
 	var outcomes []string
-	if primaryMarket := ws.liveManager.resolver.GetPrimaryMarket(eventInfo); primaryMarket != nil {
-		outcomes = primaryMarket.GetOutcomes()
+	mlMarkets := ws.liveManager.resolver.GetAllMLMarkets(eventInfo)
+	if len(mlMarkets) >= 3 {
+		// 3-way market (soccer): use market short names as outcomes
+		for _, m := range mlMarkets {
+			shortName := ExtractMarketShortName(m.Question)
+			if shortName != "" {
+				outcomes = append(outcomes, shortName)
+			}
+		}
+	} else if len(mlMarkets) > 0 {
+		// 2-way market (NBA, esports): use outcomes from primary market
+		outcomes = mlMarkets[0].GetOutcomes()
 	}
 
 	ws.sendResponse(conn, wsResponse{
@@ -641,7 +651,7 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		// Resolve from event slug - use primary (ML) market from resolver
+		// Resolve from event slug - use ML market(s) from resolver
 		eventInfo, err := ws.liveManager.resolver.GetEventInfo(r.Context(), req.Trade.EventSlug)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -649,9 +659,24 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Use resolver's GetPrimaryMarket which has comprehensive sub-market filtering
-		primaryMarket := ws.liveManager.resolver.GetPrimaryMarket(eventInfo)
-		if primaryMarket != nil {
+		// Get all ML markets to detect 2-way vs 3-way
+		mlMarkets := ws.liveManager.resolver.GetAllMLMarkets(eventInfo)
+		if len(mlMarkets) >= 3 {
+			// 3-way market (soccer): outcomeIndex selects which market, always bet Yes (index 0)
+			if req.Trade.OutcomeIndex < len(mlMarkets) {
+				selectedMarket := mlMarkets[req.Trade.OutcomeIndex]
+				marketID = selectedMarket.ID
+				tokenIDs := selectedMarket.GetClobTokenIds()
+				if len(tokenIDs) > 0 {
+					tokenID = tokenIDs[0] // Always Yes for 3-way
+				}
+				outcome = "Yes"
+				shortName := ExtractMarketShortName(selectedMarket.Question)
+				log.Printf("WebServer: 3-way market selected: %s (%s), question: %s", marketID, shortName, selectedMarket.Question)
+			}
+		} else if len(mlMarkets) > 0 {
+			// 2-way market (NBA, esports): outcomeIndex selects outcome within the market
+			primaryMarket := mlMarkets[0]
 			marketID = primaryMarket.ID
 			tokenIDs := primaryMarket.GetClobTokenIds()
 			outcomes := primaryMarket.GetOutcomes()
@@ -661,7 +686,7 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 			if req.Trade.OutcomeIndex < len(outcomes) {
 				outcome = outcomes[req.Trade.OutcomeIndex]
 			}
-			log.Printf("WebServer: Selected primary market: %s, question: %s, outcomes: %v", marketID, primaryMarket.Question, outcomes)
+			log.Printf("WebServer: 2-way market selected: %s, question: %s, outcomes: %v", marketID, primaryMarket.Question, outcomes)
 		}
 	}
 

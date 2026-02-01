@@ -942,17 +942,25 @@
 
             // Use outcomes from market data if available, otherwise use team names
             // Outcomes are preferred for non-sports markets (e.g., "Up"/"Down" for crypto)
-            let leftLabel, rightLabel;
+            // For 3-way markets (soccer), outcomes will be market short names (e.g., "REAL", "DRAW", "RAYO")
+            let outcomeLabels = [];
             if (eventData.outcomes && eventData.outcomes.length >= 2) {
-                leftLabel = eventData.outcomes[0];
-                rightLabel = eventData.outcomes[1];
+                outcomeLabels = eventData.outcomes;
             } else {
-                leftLabel = isUSLeague ? teams.away : teams.home;
-                rightLabel = isUSLeague ? teams.home : teams.away;
+                // Fallback to team names for 2-way
+                outcomeLabels = isUSLeague ? [teams.away, teams.home] : [teams.home, teams.away];
             }
-            // Keep team variables for game state display
+            // Keep team variables for game state display (always 2 teams)
             const leftTeam = isUSLeague ? teams.away : teams.home;
             const rightTeam = isUSLeague ? teams.home : teams.away;
+
+            // Generate trade buttons dynamically
+            const tradeButtons = outcomeLabels.map((label, idx) => `
+                <button onclick="executeTrade('${slug}', ${idx}, 'BUY')"
+                        class="flex-1 px-3 py-2 bg-green-600 hover:bg-green-700 rounded text-sm font-medium transition-colors">
+                    Buy ${label}
+                </button>
+            `).join('');
 
             panel.innerHTML = `
                 <div class="px-4 py-3 border-b border-gray-700 flex items-center justify-between">
@@ -1005,14 +1013,7 @@
                         <span class="text-gray-500 text-xs">USDC</span>
                     </div>
                     <div class="flex gap-2">
-                        <button onclick="executeTrade('${slug}', 0, 'BUY')"
-                                class="flex-1 px-3 py-2 bg-green-600 hover:bg-green-700 rounded text-sm font-medium transition-colors">
-                            Buy ${leftLabel}
-                        </button>
-                        <button onclick="executeTrade('${slug}', 1, 'BUY')"
-                                class="flex-1 px-3 py-2 bg-green-600 hover:bg-green-700 rounded text-sm font-medium transition-colors">
-                            Buy ${rightLabel}
-                        </button>
+                        ${tradeButtons}
                     </div>
                 </div>
 
