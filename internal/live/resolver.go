@@ -10,6 +10,27 @@ import (
 	"time"
 )
 
+// subMarketKeywords is the single source of truth for keywords that indicate a sub-market
+// (not a moneyline market). Used by GetPrimaryMarket and GetAllMLMarkets.
+var subMarketKeywords = []string{
+	"handicap", "kills", "first", "total", "over", "under",
+	"map ", "maps", "series:", "inhibitor", "dragon", "baron",
+	"tower", "blood", "score", "spread", "points", "goals",
+	"o/u", "rebounds", "assists", "1h ", "1q ", "(-", "(+",
+	"1st ", "2nd ", "3rd ", "set ",
+}
+
+// isSubMarketQuestion checks if a market question contains sub-market keywords
+func isSubMarketQuestion(question string) bool {
+	questionLower := strings.ToLower(question)
+	for _, keyword := range subMarketKeywords {
+		if strings.Contains(questionLower, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
 // EventInfo contains information about a Polymarket event
 type EventInfo struct {
 	ID      string       `json:"id"`
@@ -163,14 +184,6 @@ func (r *EventSlugResolver) GetPrimaryMarketAssetIDs(event *EventInfo) []string 
 // GetAllMLMarkets returns all moneyline markets for an event
 // This handles both 2-way (e.g., NBA: Team A vs Team B) and 3-way (e.g., Football: Team A/Draw/Team B)
 func (r *EventSlugResolver) GetAllMLMarkets(event *EventInfo) []*MarketInfo {
-	subMarketKeywords := []string{
-		"handicap", "kills", "first", "total", "over", "under",
-		"map ", "maps", "series:", "inhibitor", "dragon", "baron",
-		"tower", "blood", "score", "spread", "points", "goals",
-		"o/u", "rebounds", "assists", "1h ", "1q ", "(-", "(+",
-		"1st ", "2nd ", "3rd ", "set ",
-	}
-
 	var mlMarkets []*MarketInfo
 
 	// Find all markets without sub-market keywords (these are ML markets)
@@ -180,16 +193,7 @@ func (r *EventSlugResolver) GetAllMLMarkets(event *EventInfo) []*MarketInfo {
 			continue
 		}
 
-		questionLower := strings.ToLower(m.Question)
-		isSubMarket := false
-		for _, keyword := range subMarketKeywords {
-			if strings.Contains(questionLower, keyword) {
-				isSubMarket = true
-				break
-			}
-		}
-
-		if !isSubMarket {
+		if !isSubMarketQuestion(m.Question) {
 			mlMarkets = append(mlMarkets, m)
 		}
 	}
@@ -199,13 +203,15 @@ func (r *EventSlugResolver) GetAllMLMarkets(event *EventInfo) []*MarketInfo {
 		return mlMarkets
 	}
 
-	// Fallback: look for markets with "win" in question
+	// Fallback: look for markets with "win" in question but still skip sub-markets
+	// (e.g., "Who will win?" is OK, but "Set 1 Winner" is not)
 	for i := range event.Markets {
 		m := &event.Markets[i]
 		if !m.Active || m.Closed {
 			continue
 		}
-		if strings.Contains(strings.ToLower(m.Question), "win") {
+		questionLower := strings.ToLower(m.Question)
+		if strings.Contains(questionLower, "win") && !isSubMarketQuestion(m.Question) {
 			mlMarkets = append(mlMarkets, m)
 		}
 	}
@@ -245,14 +251,6 @@ func (r *EventSlugResolver) GetAllMLMarketsAssetIDs(event *EventInfo) []string {
 // ML markets typically ask "Who will win?" or just have team names as the question
 // Sub-markets have keywords like: handicap, kills, first, total, over, under, map, series
 func (r *EventSlugResolver) GetPrimaryMarket(event *EventInfo) *MarketInfo {
-	subMarketKeywords := []string{
-		"handicap", "kills", "first", "total", "over", "under",
-		"map ", "maps", "series:", "inhibitor", "dragon", "baron",
-		"tower", "blood", "score", "spread", "points", "goals",
-		"o/u", "rebounds", "assists", "1h ", "1q ", "(-", "(+",
-		"1st ", "2nd ", "3rd ", "set ",
-	}
-
 	// First pass: find ML market (no sub-market keywords, active, not closed)
 	for i := range event.Markets {
 		m := &event.Markets[i]
@@ -260,27 +258,20 @@ func (r *EventSlugResolver) GetPrimaryMarket(event *EventInfo) *MarketInfo {
 			continue
 		}
 
-		questionLower := strings.ToLower(m.Question)
-		isSubMarket := false
-		for _, keyword := range subMarketKeywords {
-			if strings.Contains(questionLower, keyword) {
-				isSubMarket = true
-				break
-			}
-		}
-
-		if !isSubMarket {
+		if !isSubMarketQuestion(m.Question) {
 			return m
 		}
 	}
 
-	// Second pass: look for "win" in question
+	// Second pass: look for "win" in question but still skip sub-markets
+	// (e.g., "Who will win?" is OK, but "Set 1 Winner" is not)
 	for i := range event.Markets {
 		m := &event.Markets[i]
 		if !m.Active || m.Closed {
 			continue
 		}
-		if strings.Contains(strings.ToLower(m.Question), "win") {
+		questionLower := strings.ToLower(m.Question)
+		if strings.Contains(questionLower, "win") && !isSubMarketQuestion(m.Question) {
 			return m
 		}
 	}

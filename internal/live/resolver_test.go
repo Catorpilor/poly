@@ -302,6 +302,33 @@ func TestGetPrimaryMarket(t *testing.T) {
 			wantQuestion: "Djokovic vs. Sinner",
 			wantOutcomes: []string{"Djokovic", "Sinner"},
 		},
+		{
+			name: "Tennis - Set Winner fallback should NOT match 'win' in 'Winner'",
+			event: &EventInfo{
+				ID:    "tennis-parks-zheng",
+				Title: "Parks vs. Zheng",
+				Markets: []MarketInfo{
+					{ID: "1360622", Question: "Set 1 Winner: Parks vs Zheng", OutcomesRaw: `["Parks", "Zheng"]`, Active: true, Closed: false},
+					{ID: "1360623", Question: "Set 2 Winner: Parks vs Zheng", OutcomesRaw: `["Parks", "Zheng"]`, Active: true, Closed: false},
+					{ID: "1360624", Question: "Parks vs. Zheng", OutcomesRaw: `["Parks", "Zheng"]`, Active: true, Closed: false},
+				},
+			},
+			wantQuestion: "Parks vs. Zheng",
+			wantOutcomes: []string{"Parks", "Zheng"},
+		},
+		{
+			name: "Tennis - Only Set Winners available, fallback to last resort",
+			event: &EventInfo{
+				ID:    "tennis-only-sets",
+				Title: "Player A vs. Player B",
+				Markets: []MarketInfo{
+					{ID: "1", Question: "Set 1 Winner: Player A vs Player B", OutcomesRaw: `["Player A", "Player B"]`, Active: true, Closed: false},
+					{ID: "2", Question: "Set 2 Winner: Player A vs Player B", OutcomesRaw: `["Player A", "Player B"]`, Active: true, Closed: false},
+				},
+			},
+			wantQuestion: "Set 1 Winner: Player A vs Player B",
+			wantOutcomes: []string{"Player A", "Player B"},
+		},
 	}
 
 	for _, tt := range tests {
