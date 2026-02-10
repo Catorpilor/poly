@@ -100,10 +100,11 @@ For sports/esports events with multiple markets (spreads, totals, props), the sy
 
 **General:**
 - `spread` - spread betting
-- `total` - totals markets
 - `over`, `under`, `o/u` - over/under markets
 - `score` - correct score markets
 - `handicap` - handicap betting
+- `total games`, `total goals`, `total kills`, `total sets`, `total points`, `total maps`, `total rounds` - totals markets (specific patterns to avoid matching tournament names like "Qatar Total Open")
+- `: total`, `: o/u` - colon-prefixed totals patterns
 
 **Sports (NBA, NFL, etc.):**
 - `points`, `rebounds`, `assists` - player props
@@ -126,6 +127,11 @@ For sports/esports events with multiple markets (spreads, totals, props), the sy
 - `map `, `maps` - map-specific markets
 - `series:` - series markets
 
+**Fallback logic:**
+1. First pass: select markets with NO sub-market keywords (these are ML markets)
+2. Second pass: look for markets with "win" in question, but still skip sub-markets (prevents "Set 1 Winner" from being selected via "win" → "Winner" substring match)
+3. Last resort: return first active market
+
 **Examples:**
 | Market Question | Filtered? | Reason |
 |-----------------|-----------|--------|
@@ -136,8 +142,10 @@ For sports/esports events with multiple markets (spreads, totals, props), the sy
 | "First Blood in Game 1?" | Yes | contains "first", "blood" |
 | "T1 vs. Gen.G" | No | ML market |
 | "1H Moneyline: Heat vs. Bulls" | Yes | contains "1h " |
-| "1st Set Winner" | Yes | contains "1st " |
+| "1st Set Winner" | Yes | contains "1st ", "set " |
 | "Set Handicap: Djokovic (-1.5)" | Yes | contains "set ", "handicap" |
+| "Set 1 Winner: Parks vs Zheng" | Yes | contains "set ", "1st " |
+| "Qatar Total Open: Parks vs Zheng" | No | ML market ("Total" is in tournament name, not a totals pattern) |
 | "Zheng vs. Sabalenka" | No | ML market |
 
 ### Frontend Integration
