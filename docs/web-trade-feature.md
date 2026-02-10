@@ -111,6 +111,10 @@ For sports/esports events with multiple markets (spreads, totals, props), the sy
 - `(-`, `(+` - spread notation like "(-10.5)"
 - `goals` - soccer totals
 
+**Tennis:**
+- `1st `, `2nd `, `3rd ` - set winner markets (e.g., "1st Set Winner")
+- `set ` - set-related markets (e.g., "Set Handicap")
+
 **Esports (LoL, etc.):**
 - `first` - first blood, first tower, etc.
 - `blood` - first blood
@@ -132,6 +136,9 @@ For sports/esports events with multiple markets (spreads, totals, props), the sy
 | "First Blood in Game 1?" | Yes | contains "first", "blood" |
 | "T1 vs. Gen.G" | No | ML market |
 | "1H Moneyline: Heat vs. Bulls" | Yes | contains "1h " |
+| "1st Set Winner" | Yes | contains "1st " |
+| "Set Handicap: Djokovic (-1.5)" | Yes | contains "set ", "handicap" |
+| "Zheng vs. Sabalenka" | No | ML market |
 
 ### Frontend Integration
 

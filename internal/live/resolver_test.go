@@ -273,6 +273,35 @@ func TestGetPrimaryMarket(t *testing.T) {
 			wantQuestion: "Lakers vs. Warriors",
 			wantOutcomes: []string{"Lakers", "Warriors"},
 		},
+		{
+			name: "Tennis - 1st/2nd/3rd Set Winner should be skipped",
+			event: &EventInfo{
+				ID:    "tennis-aus-open",
+				Title: "Zheng vs. Sabalenka",
+				Markets: []MarketInfo{
+					{ID: "1", Question: "1st Set Winner", OutcomesRaw: `["Zheng", "Sabalenka"]`, Active: true, Closed: false},
+					{ID: "2", Question: "2nd Set Winner", OutcomesRaw: `["Zheng", "Sabalenka"]`, Active: true, Closed: false},
+					{ID: "3", Question: "3rd Set Winner", OutcomesRaw: `["Zheng", "Sabalenka"]`, Active: true, Closed: false},
+					{ID: "4", Question: "Zheng vs. Sabalenka", OutcomesRaw: `["Zheng", "Sabalenka"]`, Active: true, Closed: false},
+				},
+			},
+			wantQuestion: "Zheng vs. Sabalenka",
+			wantOutcomes: []string{"Zheng", "Sabalenka"},
+		},
+		{
+			name: "Tennis - Set spread should be skipped",
+			event: &EventInfo{
+				ID:    "tennis-match-2",
+				Title: "Djokovic vs. Sinner",
+				Markets: []MarketInfo{
+					{ID: "1", Question: "Set Handicap: Djokovic (-1.5)", OutcomesRaw: `["Djokovic", "Sinner"]`, Active: true, Closed: false},
+					{ID: "2", Question: "Total Sets O/U 3.5", OutcomesRaw: `["Over", "Under"]`, Active: true, Closed: false},
+					{ID: "3", Question: "Djokovic vs. Sinner", OutcomesRaw: `["Djokovic", "Sinner"]`, Active: true, Closed: false},
+				},
+			},
+			wantQuestion: "Djokovic vs. Sinner",
+			wantOutcomes: []string{"Djokovic", "Sinner"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -361,6 +390,21 @@ func TestGetAllMLMarkets(t *testing.T) {
 			},
 			wantCount: 1,
 			wantFirst: "DRX vs. HLE",
+		},
+		{
+			name: "Tennis - should filter out set winner markets",
+			event: &EventInfo{
+				ID:    "tennis-match",
+				Title: "Zheng vs. Sabalenka",
+				Markets: []MarketInfo{
+					{ID: "1", Question: "1st Set Winner", OutcomesRaw: `["Zheng", "Sabalenka"]`, Active: true, Closed: false},
+					{ID: "2", Question: "2nd Set Winner", OutcomesRaw: `["Zheng", "Sabalenka"]`, Active: true, Closed: false},
+					{ID: "3", Question: "3rd Set Winner", OutcomesRaw: `["Zheng", "Sabalenka"]`, Active: true, Closed: false},
+					{ID: "4", Question: "Zheng vs. Sabalenka", OutcomesRaw: `["Zheng", "Sabalenka"]`, Active: true, Closed: false},
+				},
+			},
+			wantCount: 1,
+			wantFirst: "Zheng vs. Sabalenka",
 		},
 	}
 

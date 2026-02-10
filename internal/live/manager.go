@@ -805,6 +805,8 @@ func isSubMarketSlug(slug string) bool {
 		// Esports
 		"-kills-", "-map-", "-maps-", "-dragon-", "-baron-",
 		"-blood-", "-tower-", "-inhibitor-", "-series-",
+		// Tennis
+		"-1st-", "-2nd-", "-3rd-", "-set-",
 	}
 	slugLower := strings.ToLower(slug)
 	for _, indicator := range subMarketIndicators {

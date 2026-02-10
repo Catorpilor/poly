@@ -168,6 +168,7 @@ func (r *EventSlugResolver) GetAllMLMarkets(event *EventInfo) []*MarketInfo {
 		"map ", "maps", "series:", "inhibitor", "dragon", "baron",
 		"tower", "blood", "score", "spread", "points", "goals",
 		"o/u", "rebounds", "assists", "1h ", "1q ", "(-", "(+",
+		"1st ", "2nd ", "3rd ", "set ",
 	}
 
 	var mlMarkets []*MarketInfo
@@ -249,6 +250,7 @@ func (r *EventSlugResolver) GetPrimaryMarket(event *EventInfo) *MarketInfo {
 		"map ", "maps", "series:", "inhibitor", "dragon", "baron",
 		"tower", "blood", "score", "spread", "points", "goals",
 		"o/u", "rebounds", "assists", "1h ", "1q ", "(-", "(+",
+		"1st ", "2nd ", "3rd ", "set ",
 	}
 
 	// First pass: find ML market (no sub-market keywords, active, not closed)
