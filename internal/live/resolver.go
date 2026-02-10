@@ -13,11 +13,14 @@ import (
 // subMarketKeywords is the single source of truth for keywords that indicate a sub-market
 // (not a moneyline market). Used by GetPrimaryMarket and GetAllMLMarkets.
 var subMarketKeywords = []string{
-	"handicap", "kills", "first", "total", "over", "under",
+	"handicap", "kills", "first", "over", "under",
 	"map ", "maps", "series:", "inhibitor", "dragon", "baron",
 	"tower", "blood", "score", "spread", "points", "goals",
 	"o/u", "rebounds", "assists", "1h ", "1q ", "(-", "(+",
 	"1st ", "2nd ", "3rd ", "set ",
+	"total games", "total goals", "total kills", "total sets",
+	"total points", "total maps", "total rounds",
+	": total", ": o/u",
 }
 
 // isSubMarketQuestion checks if a market question contains sub-market keywords

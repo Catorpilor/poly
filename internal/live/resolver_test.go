@@ -317,6 +317,27 @@ func TestGetPrimaryMarket(t *testing.T) {
 			wantOutcomes: []string{"Parks", "Zheng"},
 		},
 		{
+			name: "Real data: Tennis Parks vs Zheng - ML has 'Total' in tournament name",
+			event: &EventInfo{
+				ID:    "wta-parks-zhen-2026-02-10",
+				Title: "Qatar Total Open: Alycia Parks vs Qinwen Zheng",
+				Markets: []MarketInfo{
+					{ID: "1360779", Question: "Set Handicap: Zheng (-1.5) vs Parks (+1.5)", OutcomesRaw: `["Zheng", "Parks"]`, Active: true, Closed: false},
+					{ID: "1360289", Question: "Qatar Total Open: Alycia Parks vs Qinwen Zheng", OutcomesRaw: `["Parks", "Zheng"]`, Active: true, Closed: false},
+					{ID: "1360622", Question: "Set 1 Winner: Parks vs Zheng", OutcomesRaw: `["Parks", "Zheng"]`, Active: true, Closed: false},
+					{ID: "1360627", Question: "Parks vs. Zheng: Match O/U 22.5", OutcomesRaw: `["Over", "Under"]`, Active: true, Closed: false},
+					{ID: "1360620", Question: "Parks vs. Zheng: Total Sets O/U 2.5", OutcomesRaw: `["Over", "Under"]`, Active: true, Closed: false},
+					{ID: "1360623", Question: "Parks vs. Zheng: Match O/U 21.5", OutcomesRaw: `["Over", "Under"]`, Active: true, Closed: false},
+					{ID: "1360628", Question: "Parks vs. Zheng: Set 1 Games O/U 10.5", OutcomesRaw: `["Over", "Under"]`, Active: true, Closed: false},
+					{ID: "1360621", Question: "Parks vs. Zheng: Set 1 Games O/U 8.5", OutcomesRaw: `["Over", "Under"]`, Active: true, Closed: false},
+					{ID: "1360630", Question: "Parks vs. Zheng: Match O/U 23.5", OutcomesRaw: `["Over", "Under"]`, Active: true, Closed: false},
+					{ID: "1360625", Question: "Parks vs. Zheng: Set 1 Games O/U 9.5", OutcomesRaw: `["Over", "Under"]`, Active: true, Closed: false},
+				},
+			},
+			wantQuestion: "Qatar Total Open: Alycia Parks vs Qinwen Zheng",
+			wantOutcomes: []string{"Parks", "Zheng"},
+		},
+		{
 			name: "Tennis - Only Set Winners available, fallback to last resort",
 			event: &EventInfo{
 				ID:    "tennis-only-sets",
