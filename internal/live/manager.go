@@ -652,49 +652,62 @@ func (m *LiveTradeManager) subscribeToAllTrades() error {
 }
 
 func (m *LiveTradeManager) handleTrade(payload *rtdsTradePayload) bool {
-	// Match by event slug from payload (primary method)
-	// RTDS sends slugs like "epl-ast-eve-2026-01-18-eve" but we subscribe to "epl-ast-eve-2026-01-18"
-	// So we use prefix matching
 	subscribedEvents := m.subscriptions.GetAllSubscribedEvents()
 
 	var matchedSlug string
-	eventSlug := payload.EventSlug
-	if eventSlug == "" {
-		eventSlug = payload.Slug
-	}
-	for _, slug := range subscribedEvents {
-		if strings.HasPrefix(eventSlug, slug) {
-			matchedSlug = slug
-			break
-		}
-	}
+	var matchedByAsset bool
 
-	// Fallback: match by asset ID
-	if matchedSlug == "" && payload.Asset != "" {
+	// Primary: match by asset ID (most accurate — we only track ML market assets)
+	if payload.Asset != "" {
 		m.assetMu.RLock()
 		if slug, found := m.assetToEvent[payload.Asset]; found {
 			matchedSlug = slug
+			matchedByAsset = true
 		}
 		m.assetMu.RUnlock()
+	}
+
+	// Fallback: match by event slug prefix
+	// RTDS sends slugs like "epl-ast-eve-2026-01-18-eve" but we subscribe to "epl-ast-eve-2026-01-18"
+	if matchedSlug == "" {
+		eventSlug := payload.EventSlug
+		if eventSlug == "" {
+			eventSlug = payload.Slug
+		}
+		for _, slug := range subscribedEvents {
+			if strings.HasPrefix(eventSlug, slug) {
+				matchedSlug = slug
+				break
+			}
+		}
 	}
 
 	if matchedSlug == "" {
 		return false
 	}
 
-	// Look up market name for 3-way markets (e.g., "WOL", "DRAW", "NEW")
-	// Or extract sub-market name from slug (e.g., "Over 2.5", "BTTS")
+	// Use payload.Slug (market-specific slug) for sub-market detection
+	// payload.EventSlug is the event-level slug (same for all markets in an event)
+	// payload.Slug contains market indicators like "-first-set-winner-", "-over-2-5-", etc.
+	marketSlug := payload.Slug
+	if marketSlug == "" {
+		marketSlug = payload.EventSlug
+	}
+
+	// Determine if this is a sub-market trade
+	// If matched by asset ID, it's an ML trade (we only track ML assets)
+	// If matched by prefix, check the market slug for sub-market indicators
 	var marketName string
 	var isSubMarket bool
-	if isSubMarketSlug(eventSlug) {
-		// For sub-markets, extract name from slug (e.g., "over-2-5" → "Over 2.5")
-		marketName = extractSubMarketName(eventSlug, matchedSlug)
-		isSubMarket = true
-	} else if payload.Asset != "" {
-		// For ML markets, look up from asset mapping
+	if matchedByAsset {
+		// Matched by ML asset — look up market name for 3-way markets
 		m.assetMu.RLock()
 		marketName = m.assetToMarketName[payload.Asset]
 		m.assetMu.RUnlock()
+	} else if isSubMarketSlug(marketSlug) {
+		// Prefix-matched and slug has sub-market indicators
+		marketName = extractSubMarketName(marketSlug, matchedSlug)
+		isSubMarket = true
 	}
 
 	tradeInfo := &TradeInfo{
@@ -711,7 +724,7 @@ func (m *LiveTradeManager) handleTrade(payload *rtdsTradePayload) bool {
 	}
 
 	m.broadcastToTelegram(matchedSlug, tradeInfo)
-	m.broadcastToWeb(matchedSlug, tradeInfo, eventSlug) // Pass original RTDS slug for filtering
+	m.broadcastToWeb(matchedSlug, tradeInfo, marketSlug) // Pass market slug for sub-market filtering
 	return true
 }
 
@@ -932,8 +945,8 @@ func (m *LiveTradeManager) broadcastToWeb(eventSlug string, trade *TradeInfo, rt
 		return
 	}
 
-	// Check if this is a sub-market trade
-	isSubMarket := isSubMarketSlug(rtdsSlug)
+	// Check if this is a sub-market trade using both slug check and trade flag
+	isSubMarket := trade.IsSubMarket || isSubMarketSlug(rtdsSlug)
 
 	webFormat := m.formatter.FormatForWeb(trade)
 	data, err := json.Marshal(webFormat)

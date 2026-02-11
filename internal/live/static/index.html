@@ -1097,46 +1097,35 @@
             });
         }
 
-        // Extract short event label combining outcome with game context from slug
+        // Build event label from slug: outcome + game tag for esports, outcome only otherwise
         // e.g., outcome="WBG", slug="lol-lpl-wbg-ig-g1-2026-02-10" → "WBG-G1"
-        // e.g., outcome="Hawks", slug="nba-atl-ind-2026-01-31" → "ATL-IND"
+        // e.g., outcome="IG", slug="lol-lpl-wbg-ig-g2-2026-02-10" → "IG-G2"
+        // e.g., outcome="Hawks", slug="nba-atl-ind-2026-01-31" → "Hawks"
+        // e.g., outcome="Zheng", slug="wta-parks-zhen-2026-02-10" → "Zheng"
         function getEventLabel(eventSlug, outcome) {
-            if (!eventSlug) return '';
-            const parts = eventSlug.split('-');
-            if (parts.length < 3) return eventSlug.toUpperCase();
+            if (!outcome) return '';
 
-            // Find where the date starts (4-digit year)
-            const dateIdx = parts.findIndex(p => /^\d{4}$/.test(p));
-            const end = dateIdx > 0 ? dateIdx : parts.length;
-
-            // Extract game identifiers (g1, g2, g3, etc.)
-            const gameParts = parts.slice(1, end)
-                .filter(p => /^g\d+$/i.test(p))
-                .map(p => p.toUpperCase());
-
-            // If there's a game identifier, combine with outcome (e.g., "WBG-G1")
-            if (gameParts.length > 0 && outcome) {
-                return `${outcome}-${gameParts.join('-')}`;
+            // Extract game identifiers (g1, g2, etc.) from slug
+            if (eventSlug) {
+                const parts = eventSlug.split('-');
+                const dateIdx = parts.findIndex(p => /^\d{4}$/.test(p));
+                const end = dateIdx > 0 ? dateIdx : parts.length;
+                const gameParts = parts.slice(1, end)
+                    .filter(p => /^g\d+$/i.test(p))
+                    .map(p => p.toUpperCase());
+                if (gameParts.length > 0) {
+                    return outcome + '-' + gameParts.join('-');
+                }
             }
 
-            // No game identifier: use slug-based abbreviation (e.g., "ATL-IND")
-            let start = 1;
-            const subLeagues = ['lpl', 'lck', 'lec', 'lcs', 'vct', 'cblol', 'pcs'];
-            if (end > 3 && subLeagues.includes(parts[1].toLowerCase())) {
-                start = 2;
-            }
-            const meaningful = parts.slice(start, end)
-                .filter(p => p.toLowerCase() !== 'vs')
-                .map(p => p.toUpperCase().substring(0, 4));
-
-            return meaningful.join('-') || eventSlug.toUpperCase();
+            return outcome;
         }
 
         function createTradeHTML(trade) {
             const isBuy = trade.side === 'BUY';
             const sideColor = isBuy ? 'text-green-400' : 'text-red-400';
             const time = formatTimeUTC8(trade.timestamp);
-            const eventLabel = getEventLabel(trade.eventSlug, trade.outcome);
+            const outcomeDisplay = getEventLabel(trade.eventSlug, trade.outcome);
 
             const traderName = trade.trader || 'Anonymous';
             const traderLink = trade.proxyWallet ?
@@ -1146,14 +1135,13 @@
                 <div class="trade-enter flex items-center justify-between px-3 py-2 border-b border-gray-700/50 hover:bg-gray-700/30 text-sm">
                     <div class="flex items-center gap-2 min-w-0 flex-1">
                         <span class="text-gray-500 text-xs w-16 flex-shrink-0">${time}</span>
-                        <span class="text-cyan-400 text-xs font-mono flex-shrink-0">${eventLabel}</span>
                         <a href="${traderLink}" target="_blank" rel="noopener"
                            class="text-yellow-400 hover:text-yellow-300 hover:underline font-medium truncate max-w-[100px]"
                            title="${traderName}">
                             ${traderName}
                         </a>
                         <span class="${sideColor} font-bold w-10 flex-shrink-0">${trade.side}</span>
-                        <span class="text-gray-300 truncate">${trade.outcome}</span>
+                        <span class="text-gray-300 truncate">${outcomeDisplay}</span>
                     </div>
                     <div class="flex items-center gap-1 flex-shrink-0 ml-2">
                         <span class="text-blue-400 font-medium">$${parseFloat(trade.size).toFixed(2)}</span>
