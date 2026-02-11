@@ -1097,10 +1097,21 @@
             });
         }
 
+        // Extract short event label from slug, e.g., "nba-atl-ind-2026-01-31" → "ATL-IND"
+        function getEventLabel(eventSlug) {
+            if (!eventSlug) return '';
+            const parts = eventSlug.split('-');
+            if (parts.length < 3) return eventSlug.toUpperCase();
+            const t1 = parts[1].toUpperCase().substring(0, 3);
+            const t2 = parts[2].toUpperCase().substring(0, 3);
+            return `${t1}-${t2}`;
+        }
+
         function createTradeHTML(trade) {
             const isBuy = trade.side === 'BUY';
             const sideColor = isBuy ? 'text-green-400' : 'text-red-400';
             const time = formatTimeUTC8(trade.timestamp);
+            const eventLabel = getEventLabel(trade.eventSlug);
 
             const traderName = trade.trader || 'Anonymous';
             const traderLink = trade.proxyWallet ?
@@ -1110,6 +1121,7 @@
                 <div class="trade-enter flex items-center justify-between px-3 py-2 border-b border-gray-700/50 hover:bg-gray-700/30 text-sm">
                     <div class="flex items-center gap-2 min-w-0 flex-1">
                         <span class="text-gray-500 text-xs w-16 flex-shrink-0">${time}</span>
+                        <span class="text-cyan-400 text-xs font-mono flex-shrink-0">${eventLabel}</span>
                         <a href="${traderLink}" target="_blank" rel="noopener"
                            class="text-yellow-400 hover:text-yellow-300 hover:underline font-medium truncate max-w-[100px]"
                            title="${traderName}">
