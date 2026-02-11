@@ -338,6 +338,26 @@ func TestGetPrimaryMarket(t *testing.T) {
 			wantOutcomes: []string{"Parks", "Zheng"},
 		},
 		{
+			name: "Real data: Esports BO5 - should select series ML, not individual game winners",
+			event: &EventInfo{
+				ID:    "lol-we-lng-2026-02-11",
+				Title: "LoL: Team WE vs LNG Esports (BO5) - LPL Knights Rivals",
+				Markets: []MarketInfo{
+					{ID: "1365699", Question: "LoL: Team WE vs LNG Esports - Game 4 Winner", OutcomesRaw: `["Team WE", "LNG Esports"]`, Active: true, Closed: false},
+					{ID: "1365439", Question: "Game Handicap: WE (-1.5) vs LNG Esports (+1.5)", OutcomesRaw: `["Team WE", "LNG Esports"]`, Active: true, Closed: false},
+					{ID: "1362864", Question: "LoL: Team WE vs LNG Esports - Game 1 Winner", OutcomesRaw: `["Team WE", "LNG Esports"]`, Active: true, Closed: false},
+					{ID: "1362865", Question: "LoL: Team WE vs LNG Esports - Game 2 Winner", OutcomesRaw: `["Team WE", "LNG Esports"]`, Active: true, Closed: false},
+					{ID: "1362866", Question: "LoL: Team WE vs LNG Esports - Game 3 Winner", OutcomesRaw: `["Team WE", "LNG Esports"]`, Active: true, Closed: false},
+					{ID: "1362867", Question: "Games Total: O/U 3.5", OutcomesRaw: `["Over", "Under"]`, Active: true, Closed: false},
+					{ID: "1362863", Question: "LoL: Team WE vs LNG Esports (BO5) - LPL Knights Rivals", OutcomesRaw: `["Team WE", "LNG Esports"]`, Active: true, Closed: false},
+					{ID: "1363017", Question: "First Blood in Game 3?", OutcomesRaw: `["Team WE", "LNG Esports"]`, Active: true, Closed: false},
+					{ID: "1365673", Question: "Total Kills Over/Under 34.5 in Game 3?", OutcomesRaw: `["Over", "Under"]`, Active: true, Closed: false},
+				},
+			},
+			wantQuestion: "LoL: Team WE vs LNG Esports (BO5) - LPL Knights Rivals",
+			wantOutcomes: []string{"Team WE", "LNG Esports"},
+		},
+		{
 			name: "Tennis - Only Set Winners available, fallback to last resort",
 			event: &EventInfo{
 				ID:    "tennis-only-sets",

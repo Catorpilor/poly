@@ -21,6 +21,7 @@ var subMarketKeywords = []string{
 	"total games", "total goals", "total kills", "total sets",
 	"total points", "total maps", "total rounds",
 	": total", ": o/u",
+	"- game ", "game handicap", "games total",
 }
 
 // isSubMarketQuestion checks if a market question contains sub-market keywords
