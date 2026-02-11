@@ -1097,11 +1097,10 @@
             });
         }
 
-        // Extract short event label from slug
-        // e.g., "nba-atl-ind-2026-01-31" → "ATL-IND"
-        // e.g., "lol-lpl-wbg-ig-g1-2026-02-10" → "WBG-IG-G1"
-        // e.g., "wta-parks-zhen-2026-02-10" → "PAR-ZHE"
-        function getEventLabel(eventSlug) {
+        // Extract short event label combining outcome with game context from slug
+        // e.g., outcome="WBG", slug="lol-lpl-wbg-ig-g1-2026-02-10" → "WBG-G1"
+        // e.g., outcome="Hawks", slug="nba-atl-ind-2026-01-31" → "ATL-IND"
+        function getEventLabel(eventSlug, outcome) {
             if (!eventSlug) return '';
             const parts = eventSlug.split('-');
             if (parts.length < 3) return eventSlug.toUpperCase();
@@ -1110,14 +1109,22 @@
             const dateIdx = parts.findIndex(p => /^\d{4}$/.test(p));
             const end = dateIdx > 0 ? dateIdx : parts.length;
 
-            // Skip league prefix (nba, epl, lol, wta, etc.)
+            // Extract game identifiers (g1, g2, g3, etc.)
+            const gameParts = parts.slice(1, end)
+                .filter(p => /^g\d+$/i.test(p))
+                .map(p => p.toUpperCase());
+
+            // If there's a game identifier, combine with outcome (e.g., "WBG-G1")
+            if (gameParts.length > 0 && outcome) {
+                return `${outcome}-${gameParts.join('-')}`;
+            }
+
+            // No game identifier: use slug-based abbreviation (e.g., "ATL-IND")
             let start = 1;
-            // Skip esports sub-leagues (lpl, lck, lec, lcs, vct, etc.)
             const subLeagues = ['lpl', 'lck', 'lec', 'lcs', 'vct', 'cblol', 'pcs'];
             if (end > 3 && subLeagues.includes(parts[1].toLowerCase())) {
                 start = 2;
             }
-
             const meaningful = parts.slice(start, end)
                 .filter(p => p.toLowerCase() !== 'vs')
                 .map(p => p.toUpperCase().substring(0, 4));
@@ -1129,7 +1136,7 @@
             const isBuy = trade.side === 'BUY';
             const sideColor = isBuy ? 'text-green-400' : 'text-red-400';
             const time = formatTimeUTC8(trade.timestamp);
-            const eventLabel = getEventLabel(trade.eventSlug);
+            const eventLabel = getEventLabel(trade.eventSlug, trade.outcome);
 
             const traderName = trade.trader || 'Anonymous';
             const traderLink = trade.proxyWallet ?
