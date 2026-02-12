@@ -477,6 +477,7 @@ func (m *LiveTradeManager) pingLoop() {
 func (m *LiveTradeManager) readLoop() {
 	messageCount := 0
 	tradeCount := 0
+	staleCount := 0
 	matchedCount := 0
 	lastLogTime := time.Now()
 	sampleSlugs := make(map[string]int)          // Sample of incoming event slugs
@@ -520,9 +521,18 @@ func (m *LiveTradeManager) readLoop() {
 		// Handle activity trades
 		if event.Topic == "activity" && event.Type == "trades" {
 			tradeCount++
-			// Log first raw payload to see actual field names
+			// Log first trade to see timestamp age
 			if tradeCount == 1 {
-				log.Printf("LiveTradeManager: First trade payload (raw): %s", string(message))
+				ts := event.Payload.Timestamp
+				if ts > 0 {
+					if ts < 10000000000 {
+						ts *= 1000
+					}
+					ageMs := time.Now().UnixMilli() - ts
+					log.Printf("LiveTradeManager: First trade age=%dms, payload: %s", ageMs, string(message))
+				} else {
+					log.Printf("LiveTradeManager: First trade payload (raw): %s", string(message))
+				}
 			}
 			// Track sample of incoming event slugs (keep up to 10 unique)
 			slug := event.Payload.EventSlug
@@ -534,17 +544,29 @@ func (m *LiveTradeManager) readLoop() {
 			}
 			if m.handleTrade(&event.Payload) {
 				matchedCount++
-			} else if slug != "" && len(unmatchedSamples) < 20 {
-				// Track unmatched trades to help debug
-				unmatchedSamples[slug] = fmt.Sprintf("event_slug=%s, slug=%s, asset=%s",
-					event.Payload.EventSlug, event.Payload.Slug, event.Payload.Asset)
+			} else {
+				// Check if it was filtered due to staleness
+				if event.Payload.Timestamp > 0 {
+					ts := event.Payload.Timestamp
+					if ts < 10000000000 {
+						ts *= 1000
+					}
+					if time.Now().UnixMilli()-ts > 120_000 {
+						staleCount++
+					}
+				}
+				if slug != "" && len(unmatchedSamples) < 20 {
+					// Track unmatched trades to help debug
+					unmatchedSamples[slug] = fmt.Sprintf("event_slug=%s, slug=%s, asset=%s",
+						event.Payload.EventSlug, event.Payload.Slug, event.Payload.Asset)
+				}
 			}
 		}
 
 		// Log stats every 60 seconds
 		if time.Since(lastLogTime) > 60*time.Second {
 			subscribedEvents := m.subscriptions.GetAllSubscribedEvents()
-			log.Printf("LiveTradeManager: Stats - messages=%d, trades=%d, matched=%d", messageCount, tradeCount, matchedCount)
+			log.Printf("LiveTradeManager: Stats - messages=%d, trades=%d, matched=%d, stale_skipped=%d", messageCount, tradeCount, matchedCount, staleCount)
 			log.Printf("LiveTradeManager: Subscribed events: %v", subscribedEvents)
 			log.Printf("LiveTradeManager: Sample incoming slugs: %v", sampleSlugs)
 			if len(unmatchedSamples) > 0 {
@@ -556,6 +578,7 @@ func (m *LiveTradeManager) readLoop() {
 			sampleSlugs = make(map[string]int)          // Reset
 			unmatchedSamples = make(map[string]string)  // Reset
 			matchedCount = 0
+			staleCount = 0
 			lastLogTime = time.Now()
 		}
 	}
@@ -652,6 +675,18 @@ func (m *LiveTradeManager) subscribeToAllTrades() error {
 }
 
 func (m *LiveTradeManager) handleTrade(payload *rtdsTradePayload) bool {
+	// Skip stale trades (RTDS replays backlog on subscription)
+	if payload.Timestamp > 0 {
+		tradeTime := payload.Timestamp
+		if tradeTime < 10000000000 { // seconds → milliseconds
+			tradeTime *= 1000
+		}
+		ageMs := time.Now().UnixMilli() - tradeTime
+		if ageMs > 120_000 { // older than 2 minutes
+			return false
+		}
+	}
+
 	subscribedEvents := m.subscriptions.GetAllSubscribedEvents()
 
 	var matchedSlug string
