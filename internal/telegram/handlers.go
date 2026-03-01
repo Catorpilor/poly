@@ -687,41 +687,34 @@ func (b *Bot) handlePositions(ctx context.Context, bot *Bot, update *tgbotapi.Up
 		}
 	}
 
-	// Fetch positions using unified scanner
-	if b.blockchain != nil {
-		proxyAddr := common.HexToAddress(user.ProxyAddress)
+	// Fetch positions using Polymarket Data API (no blockchain required)
+	proxyAddr := common.HexToAddress(user.ProxyAddress)
+	unifiedScanner := polymarket.NewUnifiedPositionScanner(nil)
+	summary, err := unifiedScanner.ScanAllStrategies(ctx, proxyAddr)
+	if err != nil {
+		log.Printf("Unified position scan error: %v", err)
+	}
 
-		// Use unified scanner that combines all strategies
-		unifiedScanner := polymarket.NewUnifiedPositionScanner(b.blockchain.GetClient())
-		summary, err := unifiedScanner.ScanAllStrategies(ctx, proxyAddr)
-
-		if err != nil {
-			log.Printf("Unified position scan error: %v", err)
-		}
-
-		// Build full message with footer
-		fullMessage := summary
-		if err == nil {
-			fullMessage += `
+	// Build full message with footer
+	fullMessage := summary
+	if err == nil {
+		fullMessage += `
 
 💡 *Tips:*
 • Positions shown are from recent activity
 • For complete history, visit Polymarket.com
 • Use /wallet to check your USDC balance`
-		}
-
-		// Add refresh and sell buttons
-		keyboard := tgbotapi.NewInlineKeyboardMarkup(
-			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "refresh_positions"),
-				tgbotapi.NewInlineKeyboardButtonData("💰 Sell", "sell_positions"),
-			),
-		)
-
-		b.sendMessageWithKeyboard(update.Message.Chat.ID, fullMessage, keyboard)
-	} else {
-		b.sendMessage(update.Message.Chat.ID, "❌ Blockchain connection unavailable.")
 	}
+
+	// Add refresh and sell buttons
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "refresh_positions"),
+			tgbotapi.NewInlineKeyboardButtonData("💰 Sell", "sell_positions"),
+		),
+	)
+
+	b.sendMessageWithKeyboard(update.Message.Chat.ID, fullMessage, keyboard)
 	return nil
 }
 

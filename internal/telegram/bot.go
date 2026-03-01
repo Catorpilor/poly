@@ -1387,40 +1387,34 @@ func (b *Bot) handleRefreshPositions(ctx context.Context, update *tgbotapi.Updat
 	// Show loading state
 	b.editMessage(chatID, messageID, "🔄 *Refreshing positions...*\n\n_Scanning blockchain activity..._")
 
-	// Fetch positions
-	if b.blockchain != nil {
-		proxyAddr := common.HexToAddress(user.ProxyAddress)
+	// Fetch positions using Polymarket Data API (no blockchain required)
+	proxyAddr := common.HexToAddress(user.ProxyAddress)
+	unifiedScanner := polymarket.NewUnifiedPositionScanner(nil)
+	summary, err := unifiedScanner.ScanAllStrategies(ctx, proxyAddr)
+	if err != nil {
+		log.Printf("Unified position scan error: %v", err)
+	}
 
-		unifiedScanner := polymarket.NewUnifiedPositionScanner(b.blockchain.GetClient())
-		summary, err := unifiedScanner.ScanAllStrategies(ctx, proxyAddr)
-
-		if err != nil {
-			log.Printf("Unified position scan error: %v", err)
-		}
-
-		// Build full message with footer
-		fullMessage := summary
-		if err == nil {
-			fullMessage += `
+	// Build full message with footer
+	fullMessage := summary
+	if err == nil {
+		fullMessage += `
 
 💡 *Tips:*
 • Positions shown are from recent activity
 • For complete history, visit Polymarket.com
 • Use /wallet to check your USDC balance`
-		}
-
-		// Add refresh and sell buttons
-		keyboard := tgbotapi.NewInlineKeyboardMarkup(
-			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "refresh_positions"),
-				tgbotapi.NewInlineKeyboardButtonData("💰 Sell", "sell_positions"),
-			),
-		)
-
-		b.editMessageWithKeyboard(chatID, messageID, fullMessage, keyboard)
-	} else {
-		b.editMessage(chatID, messageID, "❌ Blockchain connection unavailable.")
 	}
+
+	// Add refresh and sell buttons
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "refresh_positions"),
+			tgbotapi.NewInlineKeyboardButtonData("💰 Sell", "sell_positions"),
+		),
+	)
+
+	b.editMessageWithKeyboard(chatID, messageID, fullMessage, keyboard)
 }
 
 // handleSellPositions shows the list of positions available for selling
@@ -1444,14 +1438,9 @@ func (b *Bot) handleSellPositions(ctx context.Context, update *tgbotapi.Update) 
 	// Show loading
 	b.editMessage(chatID, messageID, "💰 *Loading positions for sale...*")
 
-	// Fetch positions
-	if b.blockchain == nil {
-		b.editMessage(chatID, messageID, "❌ Blockchain connection unavailable.")
-		return
-	}
-
+	// Fetch positions using Polymarket Data API (no blockchain required)
 	proxyAddr := common.HexToAddress(user.ProxyAddress)
-	unifiedScanner := polymarket.NewUnifiedPositionScanner(b.blockchain.GetClient())
+	unifiedScanner := polymarket.NewUnifiedPositionScanner(nil)
 	positions, err := unifiedScanner.GetPositions(ctx, proxyAddr)
 
 	if err != nil {
