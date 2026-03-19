@@ -21,6 +21,12 @@ All new features and bug fixes MUST follow the TDD cycle:
 - Mock external dependencies (Telegram API, Polymarket API, Polygon RPC) — never call real services in tests
 - Aim for meaningful coverage, not 100% — focus on business logic and edge cases
 
+### Watching Changes
+```bash
+watch -n1 -c 'git diff --stat'          # live summary in a split pane
+watch -n1 -c 'git diff --color=always'  # live full diff in a split pane
+```
+
 ### Running Tests
 ```bash
 go test ./...                          # all tests
@@ -50,6 +56,26 @@ docs/           - Architecture spec, deployment, feature docs
 - **UTF-8 safety**: Use `truncateUTF8()` for display string truncation — never byte-slice strings that may contain non-ASCII (market titles, etc.)
 - **Market data**: Fetched from Polymarket CLOB API, cached with short TTLs
 - **Encrypted keys**: AES-256-GCM, decrypted only for signing
+
+## Deploy
+
+### Release flow
+1. Tag a new version: `git tag v0.0.XX && git push origin v0.0.XX`
+2. CI (Docker Release workflow) builds multi-arch image and pushes to `cheshire42/poly`
+3. Deploy on the Raspberry Pi:
+
+```bash
+cd ~/workspace/poly_deploy
+# Update image tag in docker-compose.yml
+docker compose down && docker compose up -d
+docker compose logs --tail 30    # verify startup
+```
+
+### Production environment
+- **Deploy dir**: `~/workspace/poly_deploy/` (separate from source repo)
+- **Image**: `cheshire42/poly:<tag>` on Docker Hub
+- **Infra**: Raspberry Pi, PostgreSQL and Redis on host, bot in Docker
+- **Config**: `.env` file in deploy dir, DB/Redis connect via `host.docker.internal`
 
 ## Architecture
 
