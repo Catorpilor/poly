@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ethereum/go-ethereum/common"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -641,9 +642,7 @@ func (b *Bot) handleCustomAmountInput(ctx context.Context, update *tgbotapi.Upda
 	}
 
 	marketName := market.Question
-	if len(marketName) > 40 {
-		marketName = marketName[:37] + "..."
-	}
+	marketName = truncateUTF8(marketName, 40)
 	// Get actual outcome name
 	outcomes := market.GetOutcomes()
 	outcomeName := "Unknown"
@@ -930,9 +929,7 @@ func (b *Bot) handleBuyCallback(ctx context.Context, update *tgbotapi.Update) {
 
 	// Truncate question if too long
 	question := market.Question
-	if len(question) > 50 {
-		question = question[:47] + "..."
-	}
+	question = truncateUTF8(question, 50)
 
 	message := fmt.Sprintf(`🎯 *Buy Order*
 
@@ -1010,9 +1007,7 @@ func (b *Bot) handleAmountCallback(ctx context.Context, update *tgbotapi.Update)
 	}
 
 	marketName := market.Question
-	if len(marketName) > 40 {
-		marketName = marketName[:37] + "..."
-	}
+	marketName = truncateUTF8(marketName, 40)
 
 	// Get the REAL orderbook price (not the stale outcomePrices)
 	var realPrice float64
@@ -1131,9 +1126,7 @@ func (b *Bot) handleBuyExecuteCallback(ctx context.Context, update *tgbotapi.Upd
 	}
 
 	marketName := market.Question
-	if len(marketName) > 40 {
-		marketName = marketName[:37] + "..."
-	}
+	marketName = truncateUTF8(marketName, 40)
 
 	// Show processing message
 	b.editMessage(chatID, messageID, fmt.Sprintf(`⏳ *Processing Market Order...*
@@ -1209,9 +1202,7 @@ func (b *Bot) handleBuyLimitCallback(ctx context.Context, update *tgbotapi.Updat
 	}
 
 	marketName := market.Question
-	if len(marketName) > 40 {
-		marketName = marketName[:37] + "..."
-	}
+	marketName = truncateUTF8(marketName, 40)
 
 	// Store context for the limit price input
 	b.stateManager.SetState(userID, StateWaitingForBuyLimitPrice, map[string]interface{}{
@@ -1481,19 +1472,14 @@ func (b *Bot) handleSellPositions(ctx context.Context, update *tgbotapi.Update) 
 		}
 
 		// Truncate title
-		title := pos.MarketTitle
-		if len(title) > 25 {
-			title = title[:22] + "..."
-		}
+		title := truncateUTF8(pos.MarketTitle, 25)
 
 		// Format shares
 		sharesStr := polymarket.FormatShares(pos.Shares)
 
 		// Button text: "Title - 10.5 YES"
 		btnText := fmt.Sprintf("%s - %s %s", title, sharesStr, pos.Outcome)
-		if len(btnText) > 40 {
-			btnText = btnText[:37] + "..."
-		}
+		btnText = truncateUTF8(btnText, 40)
 
 		// Callback data: sellpos:<index>
 		// We use index because callback data is limited to 64 bytes
@@ -1784,9 +1770,7 @@ func (b *Bot) executeSellWithPrice(ctx context.Context, update *tgbotapi.Update,
 
 	// Show processing message
 	marketName := pos.MarketTitle
-	if len(marketName) > 40 {
-		marketName = marketName[:37] + "..."
-	}
+	marketName = truncateUTF8(marketName, 40)
 
 	orderTypeStr := "Market"
 	priceStr := "best available"
@@ -1894,9 +1878,7 @@ func (b *Bot) handleLimitPriceInput(ctx context.Context, update *tgbotapi.Update
 
 	// Show processing message
 	marketName := pos.MarketTitle
-	if len(marketName) > 40 {
-		marketName = marketName[:37] + "..."
-	}
+	marketName = truncateUTF8(marketName, 40)
 
 	b.sendMessage(chatID, fmt.Sprintf(`⏳ *Processing Limit Sell Order...*
 
@@ -2078,6 +2060,16 @@ Successfully cancelled %d order(s).
 
 Use /markets to find markets and place new orders.`, cancelled)
 	b.editMessage(chatID, messageID, msg)
+}
+
+// truncateUTF8 truncates a string to maxRunes runes and appends "..." if truncated.
+// Unlike byte slicing (s[:n]), this never cuts in the middle of a multi-byte character.
+func truncateUTF8(s string, maxRunes int) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:maxRunes-3]) + "..."
 }
 
 // editMessage edits an existing message

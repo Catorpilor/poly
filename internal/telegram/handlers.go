@@ -270,10 +270,7 @@ func (b *Bot) handleMarkets(ctx context.Context, bot *Bot, update *tgbotapi.Upda
 
 	for i, m := range markets {
 		// Truncate long questions
-		question := m.Question
-		if len(question) > 40 {
-			question = question[:37] + "..."
-		}
+		question := truncateUTF8(m.Question, 40)
 
 		// Get Yes price from OutcomePrices
 		yesPrice := 0.0
