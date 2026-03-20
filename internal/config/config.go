@@ -38,6 +38,9 @@ type Config struct {
 
 	// Gnosis Safe configuration
 	GnosisSafe GnosisSafeConfig
+
+	// Builder Relayer configuration (for on-chain Safe transactions)
+	Builder BuilderConfig
 }
 
 // TelegramConfig holds Telegram bot configuration
@@ -102,6 +105,14 @@ type AppConfig struct {
 	LogLevel    string
 	Port        int
 	LiveWebURL  string // URL for live web interface callback
+}
+
+// BuilderConfig holds Polymarket Builder Relayer configuration
+type BuilderConfig struct {
+	RelayerURL string
+	APIKey     string
+	Secret     string
+	Passphrase string
 }
 
 // GnosisSafeConfig holds Gnosis Safe configuration
@@ -183,6 +194,12 @@ func Load() (*Config, error) {
 	cfg.App.LogLevel = getEnv("LOG_LEVEL", "debug")
 	cfg.App.Port = getEnvInt("PORT", 8080)
 	cfg.App.LiveWebURL = getEnv("LIVE_WEB_URL", "http://localhost:8081")
+
+	// Load Builder Relayer configuration (optional - redeem won't work without it)
+	cfg.Builder.RelayerURL = getEnv("POLYMARKET_BUILDER_RELAYER_URL", "https://relayer-v2.polymarket.com")
+	cfg.Builder.APIKey = getEnv("POLYMARKET_BUILDER_API_KEY", "")
+	cfg.Builder.Secret = getEnv("POLYMARKET_BUILDER_SECRET", "")
+	cfg.Builder.Passphrase = getEnv("POLYMARKET_BUILDER_PASSPHRASE", "")
 
 	// Load Gnosis Safe configuration
 	cfg.GnosisSafe.FactoryAddress = getEnv("GNOSIS_SAFE_FACTORY_ADDRESS", "0xa6B71E26C5e0845f74c812102Ca7114b6a896AB2")

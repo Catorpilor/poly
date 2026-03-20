@@ -101,7 +101,7 @@ func (b *Bot) handleRedeemPositions(ctx context.Context, update *tgbotapi.Update
 	}, 10*time.Minute)
 }
 
-// handleRedeemAll handles the "redeem_all" callback — executes redemption for all positions
+// handleRedeemAll handles the "redeem_all" callback — executes redemption via Polymarket's Builder Relayer.
 func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 	userID := update.CallbackQuery.From.ID
 	chatID := update.CallbackQuery.Message.Chat.ID
@@ -127,13 +127,13 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 		return
 	}
 
-	// Require blockchain client for on-chain redemption
-	if b.blockchain == nil {
-		b.editMessage(chatID, messageID, "❌ Blockchain connection unavailable. Cannot execute on-chain redemptions.")
+	// Require relayer client
+	if b.relayerClient == nil {
+		b.editMessage(chatID, messageID, "❌ Builder Relayer not configured. Cannot execute redemptions.")
 		return
 	}
 
-	// Use a timeout context for all blockchain operations (3 min per position + buffer)
+	// Timeout context for all relayer operations (3 min per position + buffer)
 	redeemCtx, cancel := context.WithTimeout(ctx, time.Duration(len(positions)+1)*3*time.Minute)
 	defer cancel()
 
@@ -146,24 +146,6 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 
 	proxyAddress := common.HexToAddress(user.ProxyAddress)
 	eoaAddress := common.HexToAddress(user.EOAAddress)
-
-	// Check EOA has enough MATIC for gas
-	log.Printf("Redeem: checking EOA %s MATIC balance...", eoaAddress.Hex())
-	eoaBalance, err := b.blockchain.GetBalance(redeemCtx, eoaAddress)
-	if err != nil {
-		log.Printf("Redeem: failed to check EOA balance: %v", err)
-		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Failed to check gas balance: %v", err))
-		return
-	}
-
-	log.Printf("Redeem: EOA balance = %s MATIC", blockchain.FormatMATIC(eoaBalance))
-	minGas := new(big.Int).Mul(big.NewInt(1e16), big.NewInt(1)) // 0.01 MATIC
-	if eoaBalance.Cmp(minGas) < 0 {
-		b.editMessage(chatID, messageID, fmt.Sprintf(
-			"❌ *Insufficient gas*\n\nYour EOA wallet needs MATIC for gas fees.\nCurrent balance: %s MATIC\nMinimum needed: ~0.01 MATIC\n\nSend MATIC to: `%s`",
-			blockchain.FormatMATIC(eoaBalance), eoaAddress.Hex()))
-		return
-	}
 
 	// Group positions by conditionID to avoid duplicate redemptions
 	type redeemGroup struct {
@@ -188,19 +170,15 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 		g.positions = append(g.positions, pos)
 	}
 
-	// Build ordered list of groups
 	groupList := make([]*redeemGroup, 0, len(groups))
 	for _, g := range groups {
 		groupList = append(groupList, g)
 	}
 
 	total := len(groupList)
-	log.Printf("Redeem: %d unique conditions to redeem for proxy %s", total, proxyAddress.Hex())
+	log.Printf("Redeem: %d unique conditions to redeem for proxy %s (via relayer)", total, proxyAddress.Hex())
 
-	safeExecutor := blockchain.NewSafeTransactionExecutor(b.blockchain.GetClient(), b.blockchain.GetChainID())
-	balanceChecker := blockchain.NewBalanceChecker(b.blockchain.GetClient())
-
-	// Check and set NegRisk approval once if needed
+	// For neg-risk approval check, we still need the blockchain client (read-only)
 	hasNegRisk := false
 	for _, g := range groupList {
 		if g.negativeRisk {
@@ -209,14 +187,15 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 		}
 	}
 
-	if hasNegRisk {
+	if hasNegRisk && b.blockchain != nil {
 		log.Printf("Redeem: checking NegRisk adapter approval...")
+		balanceChecker := blockchain.NewBalanceChecker(b.blockchain.GetClient())
 		approved, err := balanceChecker.IsApprovedForAll(redeemCtx, proxyAddress, blockchain.NegRiskAdapterAddress)
 		if err != nil {
 			log.Printf("Redeem: failed to check NegRisk approval: %v", err)
 		} else if !approved {
 			b.editMessage(chatID, messageID, "⏳ *Approving NegRisk adapter...*")
-			log.Printf("Redeem: NegRisk adapter not approved, sending approval tx...")
+			log.Printf("Redeem: NegRisk adapter not approved, submitting approval via relayer...")
 
 			approvalData, err := blockchain.EncodeSetApprovalForAll(blockchain.NegRiskAdapterAddress, true)
 			if err != nil {
@@ -224,9 +203,9 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 				return
 			}
 
-			_, err = safeExecutor.ExecTransaction(redeemCtx, proxyAddress, blockchain.ConditionalTokensAddress, big.NewInt(0), approvalData, userWallet.PrivateKey)
+			_, err = b.relayerClient.ExecSafeTransaction(redeemCtx, eoaAddress, proxyAddress, blockchain.ConditionalTokensAddress, approvalData, userWallet.PrivateKey)
 			if err != nil {
-				log.Printf("Redeem: NegRisk approval tx failed: %v", err)
+				log.Printf("Redeem: NegRisk approval via relayer failed: %v", err)
 				b.editMessage(chatID, messageID, fmt.Sprintf("❌ Failed to approve NegRisk adapter: %v", err))
 				return
 			}
@@ -236,7 +215,7 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 		}
 	}
 
-	// Execute redemptions
+	// Execute redemptions via relayer
 	var (
 		succeeded   int
 		totalPayout float64
@@ -257,19 +236,27 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 		conditionID := common.HexToHash(g.conditionID)
 
 		if g.negativeRisk {
-			log.Printf("Redeem [%d/%d]: fetching on-chain token balances...", i+1, total)
-			amounts, err := b.getNegRiskAmounts(redeemCtx, balanceChecker, proxyAddress, g.positions)
-			if err != nil {
-				errMsg := fmt.Sprintf("%s: failed to get token balances: %v", title, err)
-				errors = append(errors, errMsg)
-				log.Printf("Redeem error: %s", errMsg)
-				continue
-			}
-			log.Printf("Redeem [%d/%d]: token amounts = %v", i+1, total, amounts)
+			if b.blockchain != nil {
+				log.Printf("Redeem [%d/%d]: fetching on-chain token balances...", i+1, total)
+				balanceChecker := blockchain.NewBalanceChecker(b.blockchain.GetClient())
+				amounts, err := b.getNegRiskAmounts(redeemCtx, balanceChecker, proxyAddress, g.positions)
+				if err != nil {
+					errMsg := fmt.Sprintf("%s: failed to get token balances: %v", title, err)
+					errors = append(errors, errMsg)
+					log.Printf("Redeem error: %s", errMsg)
+					continue
+				}
+				log.Printf("Redeem [%d/%d]: token amounts = %v", i+1, total, amounts)
 
-			target, calldata, err = blockchain.EncodeNegRiskRedemption(conditionID, amounts)
-			if err != nil {
-				errMsg := fmt.Sprintf("%s: encoding error: %v", title, err)
+				target, calldata, err = blockchain.EncodeNegRiskRedemption(conditionID, amounts)
+				if err != nil {
+					errMsg := fmt.Sprintf("%s: encoding error: %v", title, err)
+					errors = append(errors, errMsg)
+					log.Printf("Redeem error: %s", errMsg)
+					continue
+				}
+			} else {
+				errMsg := fmt.Sprintf("%s: blockchain client needed for neg-risk balance query", title)
 				errors = append(errors, errMsg)
 				log.Printf("Redeem error: %s", errMsg)
 				continue
@@ -285,10 +272,10 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 			}
 		}
 
-		log.Printf("Redeem [%d/%d]: executing Safe tx → target=%s, calldataLen=%d", i+1, total, target.Hex(), len(calldata))
-		txHash, err := safeExecutor.ExecTransaction(redeemCtx, proxyAddress, target, big.NewInt(0), calldata, userWallet.PrivateKey)
+		log.Printf("Redeem [%d/%d]: submitting via relayer → target=%s, calldataLen=%d", i+1, total, target.Hex(), len(calldata))
+		txHash, err := b.relayerClient.ExecSafeTransaction(redeemCtx, eoaAddress, proxyAddress, target, calldata, userWallet.PrivateKey)
 		if err != nil {
-			errMsg := fmt.Sprintf("%s: tx failed: %v", title, err)
+			errMsg := fmt.Sprintf("%s: relayer failed: %v", title, err)
 			errors = append(errors, errMsg)
 			log.Printf("Redeem error: %s", errMsg)
 			continue
@@ -296,8 +283,8 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 
 		succeeded++
 		totalPayout += g.totalPayout
-		txHashes = append(txHashes, txHash.Hex())
-		log.Printf("Redeem [%d/%d]: SUCCESS tx=%s", i+1, total, txHash.Hex())
+		txHashes = append(txHashes, txHash)
+		log.Printf("Redeem [%d/%d]: SUCCESS tx=%s", i+1, total, txHash)
 	}
 
 	// Build final summary
@@ -309,14 +296,11 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 
 // getNegRiskAmounts fetches on-chain ERC1155 balances for neg-risk redemption.
 func (b *Bot) getNegRiskAmounts(ctx context.Context, bc *blockchain.BalanceChecker, proxyAddress common.Address, positions []*polymarket.RedeemablePositionInfo) ([]*big.Int, error) {
-	// For neg-risk binary, we need YES and NO token balances
-	// The positions list for this conditionID may have 1 or 2 entries
 	var yesTokenID, noTokenID *big.Int
 
 	for _, pos := range positions {
 		tokenID, ok := new(big.Int).SetString(pos.Asset, 0)
 		if !ok {
-			// Try as decimal
 			tokenID, ok = new(big.Int).SetString(pos.Asset, 10)
 			if !ok {
 				return nil, fmt.Errorf("invalid token ID: %s", pos.Asset)
@@ -341,7 +325,6 @@ func (b *Bot) getNegRiskAmounts(ctx context.Context, bc *blockchain.BalanceCheck
 		}
 	}
 
-	// Fetch on-chain balances
 	yesBalance := big.NewInt(0)
 	noBalance := big.NewInt(0)
 
@@ -384,7 +367,7 @@ func (b *Bot) buildRedeemSummary(positions []*polymarket.RedeemablePositionInfo)
 	}
 
 	message += fmt.Sprintf("\n*Total est. payout: ~$%.2f USDC*\n", totalPayout)
-	message += "\n⚠️ Requires on-chain transactions.\nGas fees paid from EOA wallet."
+	message += "\n⚠️ This will submit transactions via Polymarket's relayer.\nNo gas fees required from your wallet."
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
@@ -414,8 +397,12 @@ func (b *Bot) buildRedeemResult(succeeded, total int, totalPayout float64, txHas
 
 		message += "*Transactions:*\n"
 		for _, hash := range txHashes {
-			shortHash := hash[:10] + "..." + hash[len(hash)-6:]
-			message += fmt.Sprintf("• [%s](https://polygonscan.com/tx/%s)\n", shortHash, hash)
+			if len(hash) > 16 {
+				shortHash := hash[:10] + "..." + hash[len(hash)-6:]
+				message += fmt.Sprintf("• [%s](https://polygonscan.com/tx/%s)\n", shortHash, hash)
+			} else {
+				message += fmt.Sprintf("• %s\n", hash)
+			}
 		}
 	}
 

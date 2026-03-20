@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +35,7 @@ type Bot struct {
 	blockchain     *blockchain.Client
 	proxyResolver  *polymarket.ProxyResolver
 	tradingClient  *polymarket.TradingClient
+	relayerClient  *polymarket.RelayerClient
 	liveManager    *live.LiveTradeManager
 }
 
@@ -70,6 +72,15 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 	// Create trading client
 	tradingClient := polymarket.NewTradingClient(cfg.Polymarket.CLOBAPIUrl, cfg.Blockchain.ChainID)
 
+	// Create relayer client (optional — redeem won't work without Builder credentials)
+	var relayerClient *polymarket.RelayerClient
+	if cfg.Builder.APIKey != "" && cfg.Builder.Secret != "" {
+		relayerClient = polymarket.NewRelayerClient(&cfg.Builder, big.NewInt(cfg.Blockchain.ChainID))
+		log.Printf("Builder Relayer client initialized (url: %s)", cfg.Builder.RelayerURL)
+	} else {
+		log.Printf("Warning: Builder credentials not configured — /redeem will be unavailable")
+	}
+
 	// Create live trade manager
 	liveManager := live.NewLiveTradeManager()
 
@@ -86,6 +97,7 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 		blockchain:     blockchainClient,
 		proxyResolver:  proxyResolver,
 		tradingClient:  tradingClient,
+		relayerClient:  relayerClient,
 		liveManager:    liveManager,
 	}
 
