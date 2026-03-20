@@ -123,13 +123,29 @@ func (s *SafeTransactionExecutor) ExecTransaction(
 		return common.Hash{}, fmt.Errorf("pack execTransaction: %w", err)
 	}
 
-	// 5. Estimate gas
-	log.Printf("SafeTx: suggesting gas price...")
-	gasPrice, err := s.client.SuggestGasPrice(ctx)
+	// 5. Get gas parameters (EIP-1559)
+	log.Printf("SafeTx: fetching gas parameters...")
+	head, err := s.client.HeaderByNumber(ctx, nil)
 	if err != nil {
-		return common.Hash{}, fmt.Errorf("suggest gas price: %w", err)
+		return common.Hash{}, fmt.Errorf("get latest header: %w", err)
 	}
-	log.Printf("SafeTx: gas price = %s", gasPrice.String())
+	baseFee := head.BaseFee
+	log.Printf("SafeTx: base fee = %s", baseFee.String())
+
+	// Max priority fee (tip) — use suggested or fallback to 30 Gwei
+	gasTipCap, err := s.client.SuggestGasTipCap(ctx)
+	if err != nil {
+		gasTipCap = new(big.Int).Mul(big.NewInt(30), big.NewInt(1e9)) // 30 Gwei
+		log.Printf("SafeTx: tip cap suggestion failed, using 30 Gwei")
+	}
+	log.Printf("SafeTx: tip cap = %s", gasTipCap.String())
+
+	// Max fee = 2 * baseFee + tip (ensures inclusion even if base fee rises)
+	gasFeeCap := new(big.Int).Add(
+		new(big.Int).Mul(baseFee, big.NewInt(2)),
+		gasTipCap,
+	)
+	log.Printf("SafeTx: fee cap = %s", gasFeeCap.String())
 
 	msg := ethereum.CallMsg{
 		From:  eoaAddress,
@@ -148,7 +164,7 @@ func (s *SafeTransactionExecutor) ExecTransaction(
 	gasLimit = gasLimit * 120 / 100
 	log.Printf("SafeTx: gas limit = %d", gasLimit)
 
-	// 6. Get EOA nonce and build transaction
+	// 6. Get EOA nonce and build EIP-1559 transaction
 	log.Printf("SafeTx: getting EOA nonce for %s...", eoaAddress.Hex())
 	nonce, err := s.client.PendingNonceAt(ctx, eoaAddress)
 	if err != nil {
@@ -156,8 +172,17 @@ func (s *SafeTransactionExecutor) ExecTransaction(
 	}
 	log.Printf("SafeTx: EOA nonce = %d", nonce)
 
-	tx := types.NewTransaction(nonce, safeAddress, big.NewInt(0), gasLimit, gasPrice, execData)
-	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(s.chainID), privateKey)
+	tx := types.NewTx(&types.DynamicFeeTx{
+		ChainID:   s.chainID,
+		Nonce:     nonce,
+		GasTipCap: gasTipCap,
+		GasFeeCap: gasFeeCap,
+		Gas:       gasLimit,
+		To:        &safeAddress,
+		Value:     big.NewInt(0),
+		Data:      execData,
+	})
+	signedTx, err := types.SignTx(tx, types.LatestSignerForChainID(s.chainID), privateKey)
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("sign transaction: %w", err)
 	}
