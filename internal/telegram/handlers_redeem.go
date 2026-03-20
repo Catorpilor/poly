@@ -178,7 +178,14 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 	total := len(groupList)
 	log.Printf("Redeem: %d unique conditions to redeem for proxy %s (via relayer)", total, proxyAddress.Hex())
 
-	// For neg-risk approval check, we still need the blockchain client (read-only)
+	// Build all sub-transactions upfront
+	b.editMessage(chatID, messageID, "⏳ *Preparing redemption transactions...*")
+
+	var multiSendTxs []blockchain.MultiSendTx
+	var totalPayout float64
+	var encodeErrors []string
+
+	// Check NegRisk approval and include in batch if needed
 	hasNegRisk := false
 	for _, g := range groupList {
 		if g.negativeRisk {
@@ -194,104 +201,94 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 		if err != nil {
 			log.Printf("Redeem: failed to check NegRisk approval: %v", err)
 		} else if !approved {
-			b.editMessage(chatID, messageID, "⏳ *Approving NegRisk adapter...*")
-			log.Printf("Redeem: NegRisk adapter not approved, submitting approval via relayer...")
-
+			log.Printf("Redeem: including NegRisk approval in batch")
 			approvalData, err := blockchain.EncodeSetApprovalForAll(blockchain.NegRiskAdapterAddress, true)
 			if err != nil {
 				b.editMessage(chatID, messageID, fmt.Sprintf("❌ Failed to encode approval: %v", err))
 				return
 			}
-
-			_, err = b.relayerClient.ExecSafeTransaction(redeemCtx, eoaAddress, proxyAddress, blockchain.ConditionalTokensAddress, approvalData, userWallet.PrivateKey)
-			if err != nil {
-				log.Printf("Redeem: NegRisk approval via relayer failed: %v", err)
-				b.editMessage(chatID, messageID, fmt.Sprintf("❌ Failed to approve NegRisk adapter: %v", err))
-				return
-			}
-			log.Printf("Redeem: NegRisk adapter approved for proxy %s", proxyAddress.Hex())
+			multiSendTxs = append(multiSendTxs, blockchain.MultiSendTx{
+				To:   blockchain.ConditionalTokensAddress,
+				Data: approvalData,
+			})
 		} else {
 			log.Printf("Redeem: NegRisk adapter already approved")
 		}
 	}
 
-	// Execute redemptions via relayer
-	var (
-		succeeded   int
-		totalPayout float64
-		txHashes    []string
-		errors      []string
-	)
-
 	for i, g := range groupList {
 		title := truncateUTF8(g.title, 40)
-		b.editMessage(chatID, messageID, fmt.Sprintf("⏳ *Claiming %d/%d:* %s...", i+1, total, title))
-		log.Printf("Redeem [%d/%d]: %s (conditionID=%s, negRisk=%v)", i+1, total, title, g.conditionID, g.negativeRisk)
+		conditionID := common.HexToHash(g.conditionID)
+		log.Printf("Redeem [%d/%d]: encoding %s (conditionID=%s, negRisk=%v)", i+1, total, title, g.conditionID, g.negativeRisk)
 
 		var (
 			target   common.Address
 			calldata []byte
 		)
 
-		conditionID := common.HexToHash(g.conditionID)
-
 		if g.negativeRisk {
 			if b.blockchain != nil {
-				log.Printf("Redeem [%d/%d]: fetching on-chain token balances...", i+1, total)
 				balanceChecker := blockchain.NewBalanceChecker(b.blockchain.GetClient())
 				amounts, err := b.getNegRiskAmounts(redeemCtx, balanceChecker, proxyAddress, g.positions)
 				if err != nil {
-					errMsg := fmt.Sprintf("%s: failed to get token balances: %v", title, err)
-					errors = append(errors, errMsg)
-					log.Printf("Redeem error: %s", errMsg)
+					encodeErrors = append(encodeErrors, fmt.Sprintf("%s: %v", title, err))
 					continue
 				}
-				log.Printf("Redeem [%d/%d]: token amounts = %v", i+1, total, amounts)
-
 				target, calldata, err = blockchain.EncodeNegRiskRedemption(conditionID, amounts)
 				if err != nil {
-					errMsg := fmt.Sprintf("%s: encoding error: %v", title, err)
-					errors = append(errors, errMsg)
-					log.Printf("Redeem error: %s", errMsg)
+					encodeErrors = append(encodeErrors, fmt.Sprintf("%s: %v", title, err))
 					continue
 				}
 			} else {
-				errMsg := fmt.Sprintf("%s: blockchain client needed for neg-risk balance query", title)
-				errors = append(errors, errMsg)
-				log.Printf("Redeem error: %s", errMsg)
+				encodeErrors = append(encodeErrors, fmt.Sprintf("%s: blockchain client needed for neg-risk", title))
 				continue
 			}
 		} else {
 			var err error
 			target, calldata, err = blockchain.EncodeStandardRedemption(conditionID)
 			if err != nil {
-				errMsg := fmt.Sprintf("%s: encoding error: %v", title, err)
-				errors = append(errors, errMsg)
-				log.Printf("Redeem error: %s", errMsg)
+				encodeErrors = append(encodeErrors, fmt.Sprintf("%s: %v", title, err))
 				continue
 			}
 		}
 
-		log.Printf("Redeem [%d/%d]: submitting via relayer → target=%s, calldataLen=%d", i+1, total, target.Hex(), len(calldata))
-		txHash, err := b.relayerClient.ExecSafeTransaction(redeemCtx, eoaAddress, proxyAddress, target, calldata, userWallet.PrivateKey)
-		if err != nil {
-			errMsg := fmt.Sprintf("%s: relayer failed: %v", title, err)
-			errors = append(errors, errMsg)
-			log.Printf("Redeem error: %s", errMsg)
-			continue
-		}
-
-		succeeded++
+		multiSendTxs = append(multiSendTxs, blockchain.MultiSendTx{To: target, Data: calldata})
 		totalPayout += g.totalPayout
-		txHashes = append(txHashes, txHash)
-		log.Printf("Redeem [%d/%d]: SUCCESS tx=%s", i+1, total, txHash)
 	}
 
-	// Build final summary
+	if len(multiSendTxs) == 0 {
+		b.stateManager.ClearState(userID)
+		b.editMessage(chatID, messageID, b.buildRedeemResult(0, total, 0, nil, encodeErrors))
+		return
+	}
+
+	// Execute: single tx for one call, MultiSend for multiple
+	b.editMessage(chatID, messageID, fmt.Sprintf("⏳ *Claiming %d positions...*", total))
+	log.Printf("Redeem: submitting %d sub-transactions via relayer", len(multiSendTxs))
+
+	var txHash string
+	var execErr error
+
+	if len(multiSendTxs) == 1 {
+		// Single call — no need for MultiSend overhead
+		tx := multiSendTxs[0]
+		txHash, execErr = b.relayerClient.ExecSafeTransaction(redeemCtx, eoaAddress, proxyAddress, tx.To, tx.Data, userWallet.PrivateKey)
+	} else {
+		// Batch via MultiSend
+		txHash, execErr = b.relayerClient.ExecMultiSendTransaction(redeemCtx, eoaAddress, proxyAddress, multiSendTxs, userWallet.PrivateKey)
+	}
+
 	b.stateManager.ClearState(userID)
-	message := b.buildRedeemResult(succeeded, total, totalPayout, txHashes, errors)
-	b.editMessage(chatID, messageID, message)
-	log.Printf("Redeem complete: %d/%d succeeded, totalPayout=%.2f", succeeded, total, totalPayout)
+
+	if execErr != nil {
+		log.Printf("Redeem error: %v", execErr)
+		allErrors := append(encodeErrors, fmt.Sprintf("relayer: %v", execErr))
+		b.editMessage(chatID, messageID, b.buildRedeemResult(0, total, 0, nil, allErrors))
+		return
+	}
+
+	log.Printf("Redeem: SUCCESS tx=%s, positions=%d, payout=%.2f", txHash, total, totalPayout)
+	b.editMessage(chatID, messageID, b.buildRedeemResult(total-len(encodeErrors), total, totalPayout, []string{txHash}, encodeErrors))
 }
 
 // getNegRiskAmounts fetches on-chain ERC1155 balances for neg-risk redemption.

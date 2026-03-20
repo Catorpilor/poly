@@ -20,6 +20,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/Catorpilor/poly/internal/blockchain"
 	"github.com/Catorpilor/poly/internal/config"
 )
 
@@ -103,8 +104,8 @@ func (rc *RelayerClient) ExecSafeTransaction(
 	}
 	log.Printf("Relayer: safe nonce = %d", nonce)
 
-	// 2. Compute EIP-712 SafeTx hash
-	safeTxHash := computeSafeTxHash(rc.chainID, safeAddress, to, data, nonce)
+	// 2. Compute EIP-712 SafeTx hash (operation=0 for direct Call)
+	safeTxHash := computeSafeTxHash(rc.chainID, safeAddress, to, data, 0, nonce)
 	log.Printf("Relayer: safeTx hash = %s", safeTxHash.Hex())
 
 	// 3. Sign with personal_sign + adjust v for Gnosis Safe
@@ -142,6 +143,79 @@ func (rc *RelayerClient) ExecSafeTransaction(
 	log.Printf("Relayer: submitted, transactionID=%s, state=%s", resp.TransactionID, resp.State)
 
 	// 5. Wait for confirmation
+	log.Printf("Relayer: waiting for confirmation...")
+	status, err := rc.WaitForConfirmation(ctx, resp.TransactionID, 3*time.Minute)
+	if err != nil {
+		return "", fmt.Errorf("wait for confirmation: %w", err)
+	}
+
+	log.Printf("Relayer: confirmed! state=%s, txHash=%s", status.State, status.TransactionHash)
+	return status.TransactionHash, nil
+}
+
+// ExecMultiSendTransaction batches multiple calls into a single Safe transaction
+// via the MultiSend contract (DelegateCall). All sub-transactions execute atomically.
+func (rc *RelayerClient) ExecMultiSendTransaction(
+	ctx context.Context,
+	eoaAddress, safeAddress common.Address,
+	txs []blockchain.MultiSendTx,
+	privateKey *ecdsa.PrivateKey,
+) (string, error) {
+	// 1. Encode all sub-txs into multiSend calldata
+	log.Printf("Relayer: encoding MultiSend with %d sub-transactions...", len(txs))
+	multiSendData, err := blockchain.EncodeMultiSend(txs)
+	if err != nil {
+		return "", fmt.Errorf("encode multisend: %w", err)
+	}
+	log.Printf("Relayer: multiSend calldata length = %d", len(multiSendData))
+
+	// 2. Get Safe nonce
+	log.Printf("Relayer: getting safe nonce for %s...", eoaAddress.Hex())
+	nonce, err := rc.GetSafeNonce(ctx, eoaAddress)
+	if err != nil {
+		return "", fmt.Errorf("get safe nonce: %w", err)
+	}
+	log.Printf("Relayer: safe nonce = %d", nonce)
+
+	// 3. Compute EIP-712 SafeTx hash with operation=1 (DelegateCall) and to=MultiSend
+	safeTxHash := computeSafeTxHash(rc.chainID, safeAddress, blockchain.MultiSendAddress, multiSendData, 1, nonce)
+	log.Printf("Relayer: safeTx hash = %s (MultiSend, DelegateCall)", safeTxHash.Hex())
+
+	// 4. Sign
+	signature, err := signSafeTransaction(safeTxHash, privateKey)
+	if err != nil {
+		return "", fmt.Errorf("sign safe tx: %w", err)
+	}
+	log.Printf("Relayer: signature ready (v=%d)", signature[64])
+
+	// 5. Submit to relayer with operation=1
+	req := &SafeTransactionRequest{
+		Type:        "SAFE",
+		From:        eoaAddress.Hex(),
+		To:          blockchain.MultiSendAddress.Hex(),
+		ProxyWallet: safeAddress.Hex(),
+		Data:        "0x" + hex.EncodeToString(multiSendData),
+		Nonce:       strconv.FormatInt(nonce, 10),
+		Signature:   "0x" + hex.EncodeToString(signature),
+		SignParams: SafeTransactionParams{
+			GasPrice:       "0",
+			Operation:      "1", // DelegateCall for MultiSend
+			SafeTxnGas:     "0",
+			BaseGas:        "0",
+			GasToken:       zeroAddress,
+			RefundReceiver: zeroAddress,
+		},
+		Metadata: "redeem positions (multisend)",
+	}
+
+	log.Printf("Relayer: submitting MultiSend transaction...")
+	resp, err := rc.SubmitSafeTransaction(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("submit to relayer: %w", err)
+	}
+	log.Printf("Relayer: submitted, transactionID=%s, state=%s", resp.TransactionID, resp.State)
+
+	// 6. Wait for confirmation
 	log.Printf("Relayer: waiting for confirmation...")
 	status, err := rc.WaitForConfirmation(ctx, resp.TransactionID, 3*time.Minute)
 	if err != nil {
@@ -344,7 +418,7 @@ func (rc *RelayerClient) signBuilderRequest(timestamp, method, path, body string
 // computeSafeTxHash computes the EIP-712 typed data hash for a Gnosis Safe transaction.
 // Domain: {chainId, verifyingContract: safeAddress}
 // All gas fields are zero — the relayer handles gas.
-func computeSafeTxHash(chainID *big.Int, safeAddress, to common.Address, data []byte, nonce int64) common.Hash {
+func computeSafeTxHash(chainID *big.Int, safeAddress, to common.Address, data []byte, operation uint8, nonce int64) common.Hash {
 	// EIP-712 domain separator
 	// keccak256("EIP712Domain(uint256 chainId,address verifyingContract)")
 	domainTypeHash := crypto.Keccak256Hash([]byte("EIP712Domain(uint256 chainId,address verifyingContract)"))
@@ -365,10 +439,10 @@ func computeSafeTxHash(chainID *big.Int, safeAddress, to common.Address, data []
 	zero32 := make([]byte, 32)
 	structHash := crypto.Keccak256Hash(
 		safeTxTypeHash.Bytes(),
-		common.LeftPadBytes(to.Bytes(), 32),       // to
-		zero32,                                     // value = 0
-		dataHash.Bytes(),                           // keccak256(data)
-		zero32,                                     // operation = 0 (CALL)
+		common.LeftPadBytes(to.Bytes(), 32),                         // to
+		zero32,                                                      // value = 0
+		dataHash.Bytes(),                                            // keccak256(data)
+		common.LeftPadBytes([]byte{operation}, 32),                  // operation (0=Call, 1=DelegateCall)
 		zero32,                                     // safeTxGas = 0
 		zero32,                                     // baseGas = 0
 		zero32,                                     // gasPrice = 0

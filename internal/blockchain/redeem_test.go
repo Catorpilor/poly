@@ -150,3 +150,52 @@ func TestEncodeSetApprovalForAll(t *testing.T) {
 		t.Error("method selectors should match")
 	}
 }
+
+func TestEncodeMultiSend(t *testing.T) {
+	t.Parallel()
+
+	txs := []MultiSendTx{
+		{
+			To:   common.HexToAddress("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
+			Data: []byte{0x01, 0x02, 0x03, 0x04},
+		},
+		{
+			To:   common.HexToAddress("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"),
+			Data: []byte{0xAA, 0xBB},
+		},
+	}
+
+	calldata, err := EncodeMultiSend(txs)
+	if err != nil {
+		t.Fatalf("EncodeMultiSend() error = %v", err)
+	}
+
+	if len(calldata) < 4 {
+		t.Fatal("calldata too short")
+	}
+
+	// Should be longer than a single tx encoding
+	singleTx := []MultiSendTx{txs[0]}
+	singleCalldata, err := EncodeMultiSend(singleTx)
+	if err != nil {
+		t.Fatalf("EncodeMultiSend(single) error = %v", err)
+	}
+
+	if len(calldata) <= len(singleCalldata) {
+		t.Error("two-tx encoding should be longer than single-tx")
+	}
+
+	// Same method selector for both
+	if string(calldata[:4]) != string(singleCalldata[:4]) {
+		t.Error("method selectors should match")
+	}
+}
+
+func TestEncodeMultiSend_Empty(t *testing.T) {
+	t.Parallel()
+
+	_, err := EncodeMultiSend(nil)
+	if err == nil {
+		t.Error("expected error for empty tx list")
+	}
+}

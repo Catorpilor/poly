@@ -22,7 +22,7 @@ func TestComputeSafeTxHash(t *testing.T) {
 	nonce := int64(42)
 	chainID := big.NewInt(137)
 
-	hash := computeSafeTxHash(chainID, safeAddress, to, data, nonce)
+	hash := computeSafeTxHash(chainID, safeAddress, to, data, 0, nonce)
 
 	// Should produce a non-zero 32-byte hash
 	if hash == (common.Hash{}) {
@@ -30,15 +30,21 @@ func TestComputeSafeTxHash(t *testing.T) {
 	}
 
 	// Same inputs should produce same hash
-	hash2 := computeSafeTxHash(chainID, safeAddress, to, data, nonce)
+	hash2 := computeSafeTxHash(chainID, safeAddress, to, data, 0, nonce)
 	if hash != hash2 {
 		t.Error("deterministic: same inputs should produce same hash")
 	}
 
 	// Different nonce should produce different hash
-	hash3 := computeSafeTxHash(chainID, safeAddress, to, data, 43)
+	hash3 := computeSafeTxHash(chainID, safeAddress, to, data, 0, 43)
 	if hash == hash3 {
 		t.Error("different nonce should produce different hash")
+	}
+
+	// Different operation should produce different hash
+	hashDelegateCall := computeSafeTxHash(chainID, safeAddress, to, data, 1, nonce)
+	if hash == hashDelegateCall {
+		t.Error("different operation (Call vs DelegateCall) should produce different hash")
 	}
 }
 
