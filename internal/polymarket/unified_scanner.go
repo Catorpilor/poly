@@ -85,6 +85,11 @@ func (ups *UnifiedPositionScanner) formatPositionsFromAPI(positions []*Position)
 	return result
 }
 
+// GetRedeemablePositions fetches redeemable positions for the Claim All flow.
+func (ups *UnifiedPositionScanner) GetRedeemablePositions(ctx context.Context, proxyAddress common.Address) ([]*RedeemablePositionInfo, error) {
+	return ups.positionManager.GetRedeemablePositions(ctx, proxyAddress)
+}
+
 // GetPositionValue attempts to calculate the value of positions
 func (ups *UnifiedPositionScanner) GetPositionValue(ctx context.Context, proxyAddress common.Address) (*big.Int, error) {
 	// This would require:

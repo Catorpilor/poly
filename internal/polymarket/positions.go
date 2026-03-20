@@ -59,6 +59,19 @@ type DataAPIPosition struct {
 	NegativeRisk       bool    `json:"negativeRisk"`
 }
 
+// RedeemablePositionInfo contains all data needed to display and execute a redemption.
+type RedeemablePositionInfo struct {
+	Title         string  `json:"title"`
+	Outcome       string  `json:"outcome"`
+	ConditionID   string  `json:"condition_id"`
+	Asset         string  `json:"asset"`          // token ID (YES or NO)
+	OppositeAsset string  `json:"opposite_asset"` // complementary token ID
+	Size          float64 `json:"size"`           // shares (human-readable)
+	NegativeRisk  bool    `json:"negative_risk"`
+	CurPrice      float64 `json:"cur_price"`  // 1.0 for winners, 0.0 for losers
+	EstPayout     float64 `json:"est_payout"` // estimated USDC payout
+}
+
 // Market represents a Polymarket market
 type Market struct {
 	ID          string  `json:"id"`
@@ -154,6 +167,56 @@ func (pm *PositionManager) GetUserPositionsFromAPI(ctx context.Context, proxyAdd
 			PnL:          ap.CashPnl,
 			PnLPercent:   ap.PercentPnl,
 			NegativeRisk: ap.NegativeRisk,
+		})
+	}
+
+	return positions, nil
+}
+
+// GetRedeemablePositions fetches positions with redeemable=true from the Data API.
+// Unlike GetUserPositionsFromAPI, this does NOT filter out positions with CurPrice=0
+// because losing positions are still part of the redemption process.
+func (pm *PositionManager) GetRedeemablePositions(ctx context.Context, proxyAddress common.Address) ([]*RedeemablePositionInfo, error) {
+	url := fmt.Sprintf("%s/positions?user=%s&redeemable=true",
+		pm.dataAPIURL, strings.ToLower(proxyAddress.Hex()))
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := pm.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch redeemable positions: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Data API returned status %d", resp.StatusCode)
+	}
+
+	var apiPositions []DataAPIPosition
+	if err := json.NewDecoder(resp.Body).Decode(&apiPositions); err != nil {
+		return nil, fmt.Errorf("failed to decode positions: %w", err)
+	}
+
+	positions := make([]*RedeemablePositionInfo, 0, len(apiPositions))
+	for _, ap := range apiPositions {
+		if ap.Size <= 0 {
+			continue
+		}
+
+		positions = append(positions, &RedeemablePositionInfo{
+			Title:         ap.Title,
+			Outcome:       ap.Outcome,
+			ConditionID:   ap.ConditionID,
+			Asset:         ap.Asset,
+			OppositeAsset: ap.OppositeAsset,
+			Size:          ap.Size,
+			NegativeRisk:  ap.NegativeRisk,
+			CurPrice:      ap.CurPrice,
+			EstPayout:     ap.Size * ap.CurPrice,
 		})
 	}
 

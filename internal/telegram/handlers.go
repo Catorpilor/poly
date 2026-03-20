@@ -703,11 +703,14 @@ func (b *Bot) handlePositions(ctx context.Context, bot *Bot, update *tgbotapi.Up
 • Use /wallet to check your USDC balance`
 	}
 
-	// Add refresh and sell buttons
+	// Add refresh, sell, and redeem buttons
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "refresh_positions"),
 			tgbotapi.NewInlineKeyboardButtonData("💰 Sell", "sell_positions"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🎁 Redeem", "redeem_positions"),
 		),
 	)
 
