@@ -174,8 +174,9 @@ func (pm *PositionManager) GetUserPositionsFromAPI(ctx context.Context, proxyAdd
 }
 
 // GetRedeemablePositions fetches positions with redeemable=true from the Data API.
-// Unlike GetUserPositionsFromAPI, this does NOT filter out positions with CurPrice=0
-// because losing positions are still part of the redemption process.
+// Only returns positions with a positive payout (winning side). Losing positions are
+// excluded from display but still get burned automatically by the CTF contract when
+// the winning side is redeemed.
 func (pm *PositionManager) GetRedeemablePositions(ctx context.Context, proxyAddress common.Address) ([]*RedeemablePositionInfo, error) {
 	url := fmt.Sprintf("%s/positions?user=%s&redeemable=true",
 		pm.dataAPIURL, strings.ToLower(proxyAddress.Hex()))
@@ -203,7 +204,7 @@ func (pm *PositionManager) GetRedeemablePositions(ctx context.Context, proxyAddr
 
 	positions := make([]*RedeemablePositionInfo, 0, len(apiPositions))
 	for _, ap := range apiPositions {
-		if ap.Size <= 0 {
+		if ap.Size <= 0 || ap.CurPrice <= 0 {
 			continue
 		}
 

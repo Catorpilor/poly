@@ -159,10 +159,11 @@ func TestGetRedeemablePositions_FiltersZeroSize(t *testing.T) {
 	}
 }
 
-func TestGetRedeemablePositions_IncludesLosingPositions(t *testing.T) {
+func TestGetRedeemablePositions_FiltersLosingPositions(t *testing.T) {
 	t.Parallel()
 
-	// Losing positions (CurPrice=0) should NOT be filtered out for redeemable positions
+	// Losing positions (CurPrice=0) should be filtered out — they have zero payout.
+	// The CTF contract burns them automatically when the winning side is redeemed.
 	apiPositions := []DataAPIPosition{
 		{
 			Title:       "Winning position",
@@ -192,9 +193,12 @@ func TestGetRedeemablePositions_IncludesLosingPositions(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Both should be included — losing positions still part of redemption
-	if len(positions) != 2 {
-		t.Errorf("expected 2 positions (including losing), got %d", len(positions))
+	// Only winning position should remain
+	if len(positions) != 1 {
+		t.Errorf("expected 1 position (losing filtered out), got %d", len(positions))
+	}
+	if len(positions) > 0 && positions[0].Title != "Winning position" {
+		t.Errorf("expected winning position, got %q", positions[0].Title)
 	}
 }
 
