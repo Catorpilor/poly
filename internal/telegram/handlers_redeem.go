@@ -133,6 +133,10 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 		return
 	}
 
+	// Use a timeout context for all blockchain operations (3 min per position + buffer)
+	redeemCtx, cancel := context.WithTimeout(ctx, time.Duration(len(positions)+1)*3*time.Minute)
+	defer cancel()
+
 	// Decrypt private key
 	userWallet, err := b.walletManager.DecryptPrivateKey(user.EncryptedKey)
 	if err != nil {
@@ -144,17 +148,21 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 	eoaAddress := common.HexToAddress(user.EOAAddress)
 
 	// Check EOA has enough MATIC for gas
-	eoaBalance, err := b.blockchain.GetBalance(ctx, eoaAddress)
+	log.Printf("Redeem: checking EOA %s MATIC balance...", eoaAddress.Hex())
+	eoaBalance, err := b.blockchain.GetBalance(redeemCtx, eoaAddress)
 	if err != nil {
-		log.Printf("Warning: failed to check EOA balance: %v", err)
-	} else {
-		minGas := new(big.Int).Mul(big.NewInt(1e16), big.NewInt(1)) // 0.01 MATIC
-		if eoaBalance.Cmp(minGas) < 0 {
-			b.editMessage(chatID, messageID, fmt.Sprintf(
-				"❌ *Insufficient gas*\n\nYour EOA wallet needs MATIC for gas fees.\nCurrent balance: %s MATIC\nMinimum needed: ~0.01 MATIC\n\nSend MATIC to: `%s`",
-				blockchain.FormatMATIC(eoaBalance), eoaAddress.Hex()))
-			return
-		}
+		log.Printf("Redeem: failed to check EOA balance: %v", err)
+		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Failed to check gas balance: %v", err))
+		return
+	}
+
+	log.Printf("Redeem: EOA balance = %s MATIC", blockchain.FormatMATIC(eoaBalance))
+	minGas := new(big.Int).Mul(big.NewInt(1e16), big.NewInt(1)) // 0.01 MATIC
+	if eoaBalance.Cmp(minGas) < 0 {
+		b.editMessage(chatID, messageID, fmt.Sprintf(
+			"❌ *Insufficient gas*\n\nYour EOA wallet needs MATIC for gas fees.\nCurrent balance: %s MATIC\nMinimum needed: ~0.01 MATIC\n\nSend MATIC to: `%s`",
+			blockchain.FormatMATIC(eoaBalance), eoaAddress.Hex()))
+		return
 	}
 
 	// Group positions by conditionID to avoid duplicate redemptions
@@ -187,6 +195,8 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 	}
 
 	total := len(groupList)
+	log.Printf("Redeem: %d unique conditions to redeem for proxy %s", total, proxyAddress.Hex())
+
 	safeExecutor := blockchain.NewSafeTransactionExecutor(b.blockchain.GetClient(), b.blockchain.GetChainID())
 	balanceChecker := blockchain.NewBalanceChecker(b.blockchain.GetClient())
 
@@ -200,11 +210,13 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 	}
 
 	if hasNegRisk {
-		approved, err := balanceChecker.IsApprovedForAll(ctx, proxyAddress, blockchain.NegRiskAdapterAddress)
+		log.Printf("Redeem: checking NegRisk adapter approval...")
+		approved, err := balanceChecker.IsApprovedForAll(redeemCtx, proxyAddress, blockchain.NegRiskAdapterAddress)
 		if err != nil {
-			log.Printf("Warning: failed to check NegRisk approval: %v", err)
+			log.Printf("Redeem: failed to check NegRisk approval: %v", err)
 		} else if !approved {
 			b.editMessage(chatID, messageID, "⏳ *Approving NegRisk adapter...*")
+			log.Printf("Redeem: NegRisk adapter not approved, sending approval tx...")
 
 			approvalData, err := blockchain.EncodeSetApprovalForAll(blockchain.NegRiskAdapterAddress, true)
 			if err != nil {
@@ -212,12 +224,15 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 				return
 			}
 
-			_, err = safeExecutor.ExecTransaction(ctx, proxyAddress, blockchain.ConditionalTokensAddress, big.NewInt(0), approvalData, userWallet.PrivateKey)
+			_, err = safeExecutor.ExecTransaction(redeemCtx, proxyAddress, blockchain.ConditionalTokensAddress, big.NewInt(0), approvalData, userWallet.PrivateKey)
 			if err != nil {
+				log.Printf("Redeem: NegRisk approval tx failed: %v", err)
 				b.editMessage(chatID, messageID, fmt.Sprintf("❌ Failed to approve NegRisk adapter: %v", err))
 				return
 			}
-			log.Printf("NegRisk adapter approved for proxy %s", proxyAddress.Hex())
+			log.Printf("Redeem: NegRisk adapter approved for proxy %s", proxyAddress.Hex())
+		} else {
+			log.Printf("Redeem: NegRisk adapter already approved")
 		}
 	}
 
@@ -232,6 +247,7 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 	for i, g := range groupList {
 		title := truncateUTF8(g.title, 40)
 		b.editMessage(chatID, messageID, fmt.Sprintf("⏳ *Claiming %d/%d:* %s...", i+1, total, title))
+		log.Printf("Redeem [%d/%d]: %s (conditionID=%s, negRisk=%v)", i+1, total, title, g.conditionID, g.negativeRisk)
 
 		var (
 			target   common.Address
@@ -241,19 +257,21 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 		conditionID := common.HexToHash(g.conditionID)
 
 		if g.negativeRisk {
-			// For neg-risk, we need on-chain token balances
-			amounts, err := b.getNegRiskAmounts(ctx, balanceChecker, proxyAddress, g.positions)
+			log.Printf("Redeem [%d/%d]: fetching on-chain token balances...", i+1, total)
+			amounts, err := b.getNegRiskAmounts(redeemCtx, balanceChecker, proxyAddress, g.positions)
 			if err != nil {
 				errMsg := fmt.Sprintf("%s: failed to get token balances: %v", title, err)
 				errors = append(errors, errMsg)
 				log.Printf("Redeem error: %s", errMsg)
 				continue
 			}
+			log.Printf("Redeem [%d/%d]: token amounts = %v", i+1, total, amounts)
 
 			target, calldata, err = blockchain.EncodeNegRiskRedemption(conditionID, amounts)
 			if err != nil {
 				errMsg := fmt.Sprintf("%s: encoding error: %v", title, err)
 				errors = append(errors, errMsg)
+				log.Printf("Redeem error: %s", errMsg)
 				continue
 			}
 		} else {
@@ -262,11 +280,13 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 			if err != nil {
 				errMsg := fmt.Sprintf("%s: encoding error: %v", title, err)
 				errors = append(errors, errMsg)
+				log.Printf("Redeem error: %s", errMsg)
 				continue
 			}
 		}
 
-		txHash, err := safeExecutor.ExecTransaction(ctx, proxyAddress, target, big.NewInt(0), calldata, userWallet.PrivateKey)
+		log.Printf("Redeem [%d/%d]: executing Safe tx → target=%s, calldataLen=%d", i+1, total, target.Hex(), len(calldata))
+		txHash, err := safeExecutor.ExecTransaction(redeemCtx, proxyAddress, target, big.NewInt(0), calldata, userWallet.PrivateKey)
 		if err != nil {
 			errMsg := fmt.Sprintf("%s: tx failed: %v", title, err)
 			errors = append(errors, errMsg)
@@ -277,13 +297,14 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 		succeeded++
 		totalPayout += g.totalPayout
 		txHashes = append(txHashes, txHash.Hex())
-		log.Printf("Redeemed %s: tx=%s", g.conditionID, txHash.Hex())
+		log.Printf("Redeem [%d/%d]: SUCCESS tx=%s", i+1, total, txHash.Hex())
 	}
 
 	// Build final summary
 	b.stateManager.ClearState(userID)
 	message := b.buildRedeemResult(succeeded, total, totalPayout, txHashes, errors)
 	b.editMessage(chatID, messageID, message)
+	log.Printf("Redeem complete: %d/%d succeeded, totalPayout=%.2f", succeeded, total, totalPayout)
 }
 
 // getNegRiskAmounts fetches on-chain ERC1155 balances for neg-risk redemption.

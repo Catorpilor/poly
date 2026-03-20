@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"fmt"
+	"log"
 	"math/big"
 	"strings"
 	"time"
@@ -94,22 +95,27 @@ func (s *SafeTransactionExecutor) ExecTransaction(
 	eoaAddress := crypto.PubkeyToAddress(*privateKey.Public().(*ecdsa.PublicKey))
 
 	// 1. Get Safe nonce
+	log.Printf("SafeTx: getting nonce for safe %s...", safeAddress.Hex())
 	safeNonce, err := s.getSafeNonce(ctx, safeAddress)
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("get safe nonce: %w", err)
 	}
+	log.Printf("SafeTx: safe nonce = %s", safeNonce.String())
 
 	// 2. Get Safe transaction hash (what the owner must sign)
+	log.Printf("SafeTx: computing transaction hash...")
 	txHash, err := s.getTransactionHash(ctx, safeAddress, to, value, data, safeNonce)
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("get transaction hash: %w", err)
 	}
+	log.Printf("SafeTx: tx hash = %s", txHash.Hex())
 
 	// 3. EOA signs the Safe transaction hash
 	signature, err := signSafeHash(txHash, privateKey)
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("sign safe hash: %w", err)
 	}
+	log.Printf("SafeTx: signature ready (v=%d)", signature[64])
 
 	// 4. Encode the execTransaction call
 	execData, err := packExecTransaction(to, value, data, signature)
@@ -118,10 +124,12 @@ func (s *SafeTransactionExecutor) ExecTransaction(
 	}
 
 	// 5. Estimate gas
+	log.Printf("SafeTx: suggesting gas price...")
 	gasPrice, err := s.client.SuggestGasPrice(ctx)
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("suggest gas price: %w", err)
 	}
+	log.Printf("SafeTx: gas price = %s", gasPrice.String())
 
 	msg := ethereum.CallMsg{
 		From:  eoaAddress,
@@ -130,19 +138,23 @@ func (s *SafeTransactionExecutor) ExecTransaction(
 		Data:  execData,
 	}
 
+	log.Printf("SafeTx: estimating gas...")
 	gasLimit, err := s.client.EstimateGas(ctx, msg)
 	if err != nil {
-		// Fallback to generous default for Safe execTransaction
+		log.Printf("SafeTx: gas estimation failed (%v), using default 500000", err)
 		gasLimit = uint64(500000)
 	}
 	// Add 20% buffer for safety
 	gasLimit = gasLimit * 120 / 100
+	log.Printf("SafeTx: gas limit = %d", gasLimit)
 
 	// 6. Get EOA nonce and build transaction
+	log.Printf("SafeTx: getting EOA nonce for %s...", eoaAddress.Hex())
 	nonce, err := s.client.PendingNonceAt(ctx, eoaAddress)
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("get EOA nonce: %w", err)
 	}
+	log.Printf("SafeTx: EOA nonce = %d", nonce)
 
 	tx := types.NewTransaction(nonce, safeAddress, big.NewInt(0), gasLimit, gasPrice, execData)
 	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(s.chainID), privateKey)
@@ -151,10 +163,12 @@ func (s *SafeTransactionExecutor) ExecTransaction(
 	}
 
 	// 7. Send and wait for receipt
+	log.Printf("SafeTx: sending transaction %s...", signedTx.Hash().Hex())
 	err = s.client.SendTransaction(ctx, signedTx)
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("send transaction: %w", err)
 	}
+	log.Printf("SafeTx: tx sent, waiting for receipt...")
 
 	receipt, err := WaitForReceipt(ctx, s.client, signedTx.Hash(), 2*time.Minute)
 	if err != nil {
@@ -165,6 +179,7 @@ func (s *SafeTransactionExecutor) ExecTransaction(
 		return signedTx.Hash(), fmt.Errorf("transaction reverted (tx: %s)", signedTx.Hash().Hex())
 	}
 
+	log.Printf("SafeTx: confirmed! status=%d gasUsed=%d", receipt.Status, receipt.GasUsed)
 	return signedTx.Hash(), nil
 }
 
