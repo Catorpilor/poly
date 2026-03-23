@@ -87,6 +87,16 @@ func NewMarketClient() *MarketClient {
 	}
 }
 
+// NewMarketClientWithURL creates a market client with a custom base URL (for testing)
+func NewMarketClientWithURL(baseURL string) *MarketClient {
+	return &MarketClient{
+		gammaAPIURL: baseURL,
+		httpClient: &http.Client{
+			Timeout: 15 * time.Second,
+		},
+	}
+}
+
 // GetTrendingMarkets fetches active markets sorted by 24h volume
 func (mc *MarketClient) GetTrendingMarkets(ctx context.Context, limit int) ([]*GammaMarket, error) {
 	url := fmt.Sprintf("%s/markets?closed=false&active=true&limit=%d&order=volume24hr&ascending=false",
@@ -219,6 +229,50 @@ func (mc *MarketClient) GetMarketByConditionID(ctx context.Context, conditionID 
 	}
 
 	return markets[0], nil
+}
+
+// GammaEventDetail represents a full event with nested markets from the Gamma API
+type GammaEventDetail struct {
+	ID      string         `json:"id"`
+	Slug    string         `json:"slug"`
+	Title   string         `json:"title"`
+	Markets []*GammaMarket `json:"markets"`
+}
+
+// GetEventBySlug fetches an event and its markets by event slug
+func (mc *MarketClient) GetEventBySlug(ctx context.Context, slug string) (*GammaEventDetail, error) {
+	url := fmt.Sprintf("%s/events?slug=%s", mc.gammaAPIURL, slug)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := mc.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch event: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("event not found: %s", slug)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Gamma API returned status %d", resp.StatusCode)
+	}
+
+	var events []*GammaEventDetail
+	if err := json.NewDecoder(resp.Body).Decode(&events); err != nil {
+		return nil, fmt.Errorf("failed to decode events: %w", err)
+	}
+
+	if len(events) == 0 {
+		return nil, fmt.Errorf("event not found: %s", slug)
+	}
+
+	return events[0], nil
 }
 
 // FormatVolume formats volume for display

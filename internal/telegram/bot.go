@@ -139,6 +139,7 @@ func (b *Bot) registerHandlers() {
 	b.handlers["/help"] = b.handleHelp
 	b.handlers["/refresh"] = b.handleRefresh
 	b.handlers["/redeem"] = b.handleRedeem
+	b.handlers["/event"] = b.handleEvent
 	// Live monitoring commands
 	b.handlers["/live"] = b.handleLive
 	b.handlers["/stoplive"] = b.handleStopLive
@@ -552,6 +553,99 @@ func (b *Bot) handleMarketByID(ctx context.Context, update *tgbotapi.Update, mar
 	b.displayMarketForTrading(ctx, chatID, market)
 }
 
+// handleEventBySlug fetches an event by slug and displays all its markets
+func (b *Bot) handleEventBySlug(ctx context.Context, chatID int64, slug string) {
+	marketClient := polymarket.NewMarketClient()
+	event, err := marketClient.GetEventBySlug(ctx, slug)
+	if err != nil {
+		b.sendMessage(chatID, fmt.Sprintf("❌ Event not found: %s", slug))
+		return
+	}
+
+	if len(event.Markets) == 0 {
+		b.sendMessage(chatID, fmt.Sprintf("❌ No markets found for event: %s", event.Title))
+		return
+	}
+
+	// Build the message with all markets
+	message := fmt.Sprintf("🏆 *%s*\n\n📊 *Available Markets:*\n", event.Title)
+
+	var rows [][]tgbotapi.InlineKeyboardButton
+	for i, m := range event.Markets {
+		outcomes := m.GetOutcomes()
+		prices := m.GetOutcomePrices()
+
+		// Parse prices
+		price0, price1 := 0.0, 0.0
+		if len(prices) >= 2 {
+			fmt.Sscanf(prices[0], "%f", &price0)
+			fmt.Sscanf(prices[1], "%f", &price1)
+		}
+
+		// Determine outcome labels
+		o0Label, o1Label := "Yes", "No"
+		if len(outcomes) >= 2 {
+			if strings.ToLower(outcomes[0]) != "yes" && strings.ToLower(outcomes[0]) != "no" {
+				o0Label = outcomes[0]
+			}
+			if strings.ToLower(outcomes[1]) != "yes" && strings.ToLower(outcomes[1]) != "no" {
+				o1Label = outcomes[1]
+			}
+		}
+
+		// Market status indicator
+		status := ""
+		if m.Closed {
+			status = " (Closed)"
+		} else if !m.AcceptingOrders {
+			status = " (Paused)"
+		}
+
+		message += fmt.Sprintf("\n*%d.* %s%s\n   %s: %s | %s: %s | Vol: %s\n",
+			i+1, m.Question, status,
+			o0Label, polymarket.FormatPrice(price0),
+			o1Label, polymarket.FormatPrice(price1),
+			polymarket.FormatVolume(m.Volume24hr),
+		)
+
+		// Only add button for active markets
+		if !m.Closed && m.AcceptingOrders {
+			btnText := truncateUTF8(m.Question, 40)
+			rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData(
+					fmt.Sprintf("📈 %s", btnText),
+					fmt.Sprintf("mkt:%s", m.ID),
+				),
+			))
+		}
+	}
+
+	message += "\n_Tap a market to view details & trade_"
+
+	if len(rows) > 0 {
+		keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
+		b.sendMessageWithKeyboard(chatID, message, keyboard)
+	} else {
+		b.sendMessage(chatID, message)
+	}
+}
+
+// handleMarketDetailCallback handles the mkt:<marketID> callback from event listings
+func (b *Bot) handleMarketDetailCallback(ctx context.Context, update *tgbotapi.Update) {
+	chatID := update.CallbackQuery.Message.Chat.ID
+	data := update.CallbackQuery.Data
+	marketID := strings.TrimPrefix(data, "mkt:")
+
+	marketClient := polymarket.NewMarketClient()
+	market, err := marketClient.GetMarketByID(ctx, marketID)
+	if err != nil {
+		b.sendMessage(chatID, fmt.Sprintf("❌ Market not found: %s", marketID))
+		return
+	}
+
+	b.displayMarketForTrading(ctx, chatID, market)
+}
+
 // getMarketStatusFromBot returns market status (duplicate to avoid import cycle)
 func getMarketStatusFromBot(market *polymarket.GammaMarket) string {
 	if market.Closed {
@@ -567,6 +661,12 @@ func getMarketStatusFromBot(market *polymarket.GammaMarket) string {
 func (b *Bot) handleTextMessage(ctx context.Context, update *tgbotapi.Update) {
 	userID := update.Message.From.ID
 	chatID := update.Message.Chat.ID
+
+	// Auto-detect Polymarket URLs and show event markets
+	if slug, ok := polymarket.ParseEventSlug(strings.TrimSpace(update.Message.Text)); ok {
+		b.handleEventBySlug(ctx, chatID, slug)
+		return
+	}
 
 	// Check if user is in a specific state
 	userCtx, exists := b.stateManager.GetState(userID)
@@ -873,6 +973,9 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, update *tgbotapi.Update) 
 
 	case data == "redeem_all":
 		b.handleRedeemAll(ctx, update)
+
+	case strings.HasPrefix(data, "mkt:"):
+		b.handleMarketDetailCallback(ctx, update)
 
 	default:
 		log.Printf("Unknown callback data: %s", data)
