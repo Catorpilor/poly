@@ -4,22 +4,16 @@ A powerful Telegram bot for trading on Polymarket directly through Telegram, fea
 
 ## Features
 
-### Phase 1 (MVP) - Currently Implemented
-- ✅ **Wallet Management**: Generate new EOA wallets with Gnosis Safe proxy support
-- ✅ **Secure Key Storage**: AES-256-GCM encryption for private keys
-- ✅ **Database Schema**: PostgreSQL with full migration support
-- ✅ **Telegram Bot Interface**: Command-based interaction with rate limiting
-- ✅ **Configuration Management**: Environment-based configuration
-- 🚧 **Basic Trading**: Market buy/sell orders (in development)
-- 🚧 **Position Tracking**: Real-time balance checking (in development)
-
-### Planned Features (Phase 2-3)
-- 📅 Quick access links for instant trading
-- 📅 Limit orders with price targets
-- 📅 P&L tracking and analytics
-- 📅 Price alerts and notifications
-- 📅 Multi-wallet support
-- 📅 Automated trading strategies
+- **Wallet Management**: Generate or import EOA wallets with Gnosis Safe proxy support
+- **Secure Key Storage**: AES-256-GCM encryption for private keys in PostgreSQL
+- **Trading**: Market and limit orders for YES/NO tokens via Polymarket CLOB API
+- **Position Tracking**: Real-time positions via Polymarket Data API
+- **Sell Positions**: Interactive sell flow with quantity selection and limit orders
+- **Redeem / Claim All**: Batch-redeem all resolved positions in a single MultiSend transaction via Polymarket's Builder Relayer (gasless)
+- **Live Trade Feed**: Real-time WebSocket trade notifications via Polymarket RTDS
+- **P&L Tracking**: Unrealized profit/loss with percentage indicators
+- **Rate Limiting**: 60 requests per minute per user
+- **Docker Deployment**: Multi-arch images (amd64/arm64) via GitHub Actions CI
 
 ## Architecture
 
@@ -38,12 +32,12 @@ A powerful Telegram bot for trading on Polymarket directly through Telegram, fea
 
 ## Prerequisites
 
-- Go 1.21 or higher
+- Go 1.24 or higher
 - PostgreSQL 14 or higher
 - Redis (for session management)
 - Telegram Bot Token (from [@BotFather](https://t.me/botfather))
 - Polygon RPC URL (e.g., Alchemy, Infura)
-- Polymarket API access
+- Polymarket Builder credentials (for `/redeem` — from [polymarket.com/settings?tab=builder](https://polymarket.com/settings?tab=builder))
 
 ## Installation
 
@@ -71,12 +65,16 @@ cp .env.example .env
 Edit `.env` with your configuration:
 
 ```env
-# Required Configuration
+# Required
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 DATABASE_URL=postgresql://user:pass@localhost:5432/polymarket_bot
-POLYGON_RPC_URL=https://polygon-rpc.com
+POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY
 ENCRYPTION_KEY=your_64_char_hex_key  # Generate with: openssl rand -hex 32
-POLYMARKET_API_KEY=your_api_key
+
+# Builder Relayer (required for /redeem)
+POLYMARKET_BUILDER_API_KEY=your_builder_api_key
+POLYMARKET_BUILDER_SECRET=your_builder_secret
+POLYMARKET_BUILDER_PASSPHRASE=your_builder_passphrase
 ```
 
 ### 4. Set Up Database
@@ -330,14 +328,20 @@ go build -o polymarket-bot cmd/bot/main.go
 - `/markets` - List active markets
 - `/market <id>` - Show market details
 - `/buy <amount> <YES/NO> <market_id> [price]` - Buy tokens
-- `/sell <amount> <YES/NO> <market_id> [price]` - Sell tokens
+- `/sell` - Interactive sell flow (select position, quantity, order type)
 - `/orders` - Show open orders
 - `/cancel <order_id>` - Cancel an order
 
 #### Portfolio
-- `/positions` - Show all positions
+- `/positions` - Show all positions with Refresh, Sell, and Redeem buttons
 - `/pnl` - Calculate unrealized P&L
+- `/redeem` - Claim all resolved positions (gasless, via Builder Relayer)
 - `/history` - View trade history
+
+#### Live Monitoring
+- `/live` - Subscribe to real-time trade notifications
+- `/stoplive` - Unsubscribe from live trades
+- `/subs` - Show active subscriptions
 
 #### Settings & Utilities
 - `/settings` - Configure preferences
@@ -377,18 +381,20 @@ poly/
 │   └── bot/              # Application entry point
 ├── internal/
 │   ├── config/           # Configuration management
-│   ├── database/         # Database connection and models
-│   ├── telegram/         # Telegram bot handlers
-│   ├── wallet/           # Wallet generation and management
-│   ├── polymarket/       # Polymarket API integration
-│   └── blockchain/       # Polygon blockchain interaction
+│   ├── database/         # Database connection and repositories
+│   ├── telegram/         # Telegram bot handlers and state management
+│   ├── wallet/           # Wallet generation, encryption, proxy management
+│   ├── polymarket/       # Polymarket API integration (CLOB, Data API, Relayer)
+│   ├── blockchain/       # Polygon RPC, contract interactions, calldata encoding
+│   └── live/             # Live trade feed (WebSocket) and activity manager
 ├── pkg/
-│   └── encryption/       # Encryption utilities
-├── migrations/           # Database migrations
-├── tests/                # Test files
+│   └── encryption/       # AES-256-GCM encryption utilities
+├── docs/                 # Architecture spec, trading docs, redeem docs
+├── migrations/           # Database migrations (SQL)
 ├── .env.example          # Environment variables example
+├── Dockerfile            # Multi-stage Docker build
 ├── go.mod                # Go module file
-└── README.md            # This file
+└── README.md             # This file
 ```
 
 ## Security
@@ -427,12 +433,15 @@ GOOS=linux GOARCH=amd64 go build -o polymarket-bot cmd/bot/main.go
 go build -ldflags="-s -w" -o polymarket-bot cmd/bot/main.go
 ```
 
-### Docker Support
+### Docker
 
-Docker configuration coming soon. Will include:
-- Multi-stage build for smaller images
-- Docker Compose for full stack deployment
-- Health checks and auto-restart
+Multi-arch images (amd64/arm64) are built automatically via GitHub Actions on tag push:
+
+```bash
+git tag v0.3.0 && git push origin v0.3.0
+```
+
+Image: `cheshire42/poly:<tag>` on Docker Hub.
 
 ## Monitoring
 
@@ -462,22 +471,18 @@ Contributions are welcome! Please follow these steps:
 
 ## Roadmap
 
-### Phase 1 (MVP) ✅
-- [x] Wallet creation/import
-- [x] Basic balance checking
-- [ ] Market buy/sell orders
-- [ ] Position display
+### Completed
+- [x] Wallet creation/import with Gnosis Safe proxy
+- [x] Market and limit buy/sell orders
+- [x] Position tracking and P&L display
+- [x] Redeem / Claim All (gasless, via Builder Relayer + MultiSend)
+- [x] Live trade feed (WebSocket)
+- [x] Docker multi-arch CI/CD
 
-### Phase 2 (Enhanced)
-- [ ] Quick access links
-- [ ] Limit orders
-- [ ] P&L tracking
-- [ ] Price alerts
-
-### Phase 3 (Advanced)
+### Planned
 - [ ] Multi-wallet support
-- [ ] Automated strategies
-- [ ] Copy trading
+- [ ] Automated trading strategies
+- [ ] Copy trading via deep links
 - [ ] Analytics dashboard
 
 ## Support
