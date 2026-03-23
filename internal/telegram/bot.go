@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +35,7 @@ type Bot struct {
 	blockchain     *blockchain.Client
 	proxyResolver  *polymarket.ProxyResolver
 	tradingClient  *polymarket.TradingClient
+	relayerClient  *polymarket.RelayerClient
 	liveManager    *live.LiveTradeManager
 }
 
@@ -70,6 +72,15 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 	// Create trading client
 	tradingClient := polymarket.NewTradingClient(cfg.Polymarket.CLOBAPIUrl, cfg.Blockchain.ChainID)
 
+	// Create relayer client (optional — redeem won't work without Builder credentials)
+	var relayerClient *polymarket.RelayerClient
+	if cfg.Builder.APIKey != "" && cfg.Builder.Secret != "" {
+		relayerClient = polymarket.NewRelayerClient(&cfg.Builder, big.NewInt(cfg.Blockchain.ChainID))
+		log.Printf("Builder Relayer client initialized (url: %s)", cfg.Builder.RelayerURL)
+	} else {
+		log.Printf("Warning: Builder credentials not configured — /redeem will be unavailable")
+	}
+
 	// Create live trade manager
 	liveManager := live.NewLiveTradeManager()
 
@@ -86,6 +97,7 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 		blockchain:     blockchainClient,
 		proxyResolver:  proxyResolver,
 		tradingClient:  tradingClient,
+		relayerClient:  relayerClient,
 		liveManager:    liveManager,
 	}
 
@@ -126,6 +138,7 @@ func (b *Bot) registerHandlers() {
 	b.handlers["/gas"] = b.handleGas
 	b.handlers["/help"] = b.handleHelp
 	b.handlers["/refresh"] = b.handleRefresh
+	b.handlers["/redeem"] = b.handleRedeem
 	// Live monitoring commands
 	b.handlers["/live"] = b.handleLive
 	b.handlers["/stoplive"] = b.handleStopLive
@@ -151,6 +164,7 @@ func (b *Bot) Start(ctx context.Context) error {
 		{Command: "orders", Description: "Show open orders"},
 		{Command: "positions", Description: "Show all positions"},
 		{Command: "pnl", Description: "Calculate unrealized P&L"},
+		{Command: "redeem", Description: "Claim all resolved positions"},
 		{Command: "help", Description: "Show help message"},
 	}
 
@@ -854,6 +868,12 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, update *tgbotapi.Update) 
 	case data == "cancel_all_orders":
 		b.handleCancelAllOrders(ctx, update)
 
+	case data == "redeem_positions":
+		b.handleRedeemPositions(ctx, update)
+
+	case data == "redeem_all":
+		b.handleRedeemAll(ctx, update)
+
 	default:
 		log.Printf("Unknown callback data: %s", data)
 	}
@@ -1397,11 +1417,14 @@ func (b *Bot) handleRefreshPositions(ctx context.Context, update *tgbotapi.Updat
 • Use /wallet to check your USDC balance`
 	}
 
-	// Add refresh and sell buttons
+	// Add refresh, sell, and redeem buttons
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "refresh_positions"),
 			tgbotapi.NewInlineKeyboardButtonData("💰 Sell", "sell_positions"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🎁 Redeem", "redeem_positions"),
 		),
 	)
 

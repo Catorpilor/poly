@@ -131,6 +131,35 @@ func FormatMATIC(balance *big.Int) string {
 	return FormatBalance(balance, 18)
 }
 
+// GetERC1155Balance queries the balance of an ERC1155 token on the ConditionalTokens contract.
+// Used for neg-risk redemptions where explicit token amounts are required.
+func (bc *BalanceChecker) GetERC1155Balance(ctx context.Context, owner common.Address, tokenID *big.Int) (*big.Int, error) {
+	// ERC-1155 balanceOf(address,uint256) returns (uint256)
+	// Method ID: 0x00fdd58e
+	methodID := common.FromHex("0x00fdd58e")
+	paddedOwner := common.LeftPadBytes(owner.Bytes(), 32)
+	paddedTokenID := common.LeftPadBytes(tokenID.Bytes(), 32)
+
+	data := append(methodID, paddedOwner...)
+	data = append(data, paddedTokenID...)
+
+	msg := ethereum.CallMsg{
+		To:   &ConditionalTokensAddress,
+		Data: data,
+	}
+
+	result, err := bc.client.CallContract(ctx, msg, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call ERC1155 balanceOf: %w", err)
+	}
+
+	if len(result) == 0 {
+		return big.NewInt(0), nil
+	}
+
+	return new(big.Int).SetBytes(result), nil
+}
+
 // Polymarket contract addresses on Polygon
 var (
 	ConditionalTokensAddress = common.HexToAddress("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")

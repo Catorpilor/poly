@@ -17,6 +17,7 @@ const (
 	StateSelectingPosition       UserState = "selecting_position"
 	StateWaitingForLimitPrice    UserState = "waiting_for_limit_price"      // For sell limit orders
 	StateWaitingForBuyLimitPrice UserState = "waiting_for_buy_limit_price" // For buy limit orders
+	StateRedeemingPositions      UserState = "redeeming_positions"          // For claim all flow
 )
 
 // UserContext holds the context for a user's current interaction
