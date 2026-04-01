@@ -759,3 +759,52 @@ func TestEventDetection_RequestValidation(t *testing.T) {
 		}
 	})
 }
+
+func TestGetFeeRateBps(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		market   GammaMarket
+		wantBps  int
+	}{
+		{
+			name: "Sports market (rate=0.03)",
+			market: GammaMarket{
+				FeeSchedule: &FeeSchedule{Rate: 0.03, Exponent: 1, TakerOnly: true, RebateRate: 0.25},
+				FeeType:     "sports_fees_v2",
+			},
+			wantBps: 30,
+		},
+		{
+			name: "Crypto market (rate=0.072)",
+			market: GammaMarket{
+				FeeSchedule: &FeeSchedule{Rate: 0.072, Exponent: 1, TakerOnly: true, RebateRate: 0.20},
+				FeeType:     "crypto_fees_v2",
+			},
+			wantBps: 72,
+		},
+		{
+			name:    "No feeSchedule (nil) = 0 bps",
+			market:  GammaMarket{},
+			wantBps: 0,
+		},
+		{
+			name: "Zero rate = 0 bps",
+			market: GammaMarket{
+				FeeSchedule: &FeeSchedule{Rate: 0},
+			},
+			wantBps: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := tt.market.GetFeeRateBps()
+			if got != tt.wantBps {
+				t.Errorf("GetFeeRateBps() = %d, want %d", got, tt.wantBps)
+			}
+		})
+	}
+}

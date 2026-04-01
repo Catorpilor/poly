@@ -707,22 +707,16 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fetch taker fee rate from CLOB API (dynamic, category-based)
+	// Get taker fee and negRisk from Gamma market feeSchedule (dynamic, category-based)
 	var takerFeeBps int
-	if feeRate, err := ws.tradingClient.GetFeeRate(r.Context(), tokenID); err != nil {
-		log.Printf("WebServer: Failed to get fee rate: %v (using 0)", err)
-	} else {
-		takerFeeBps = feeRate
-	}
-
-	// Fetch market info for negRisk flag
 	var negRisk bool
-	marketInfo, err := ws.tradingClient.GetMarketInfo(r.Context(), tokenID)
-	if err != nil {
-		log.Printf("WebServer: Failed to get market info: %v (using negRisk=false)", err)
+	mc := polymarket.NewMarketClient()
+	if gammaMarket, err := mc.GetMarketByID(r.Context(), marketID); err != nil {
+		log.Printf("WebServer: Failed to get Gamma market for fee schedule: %v (using defaults)", err)
 	} else {
-		negRisk = marketInfo.NegRisk
-		log.Printf("WebServer: Market info fetched - takerFeeBps=%d, negRisk=%v", takerFeeBps, negRisk)
+		takerFeeBps = gammaMarket.GetFeeRateBps()
+		negRisk = gammaMarket.NegRisk
+		log.Printf("WebServer: feeSchedule=%+v, feeType=%s, takerFeeBps=%d, negRisk=%v", gammaMarket.FeeSchedule, gammaMarket.FeeType, takerFeeBps, negRisk)
 	}
 
 	// Build trade request

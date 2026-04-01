@@ -2255,13 +2255,9 @@ func (b *Bot) executeBuyOrder(ctx context.Context, user *database.User, market *
 		proxyAddress = common.HexToAddress(user.ProxyAddress)
 	}
 
-	// Fetch taker fee rate from CLOB API (dynamic, category-based)
-	var takerFeeBps int
-	if feeRate, err := b.tradingClient.GetFeeRate(ctx, tokenID); err != nil {
-		log.Printf("Warning: Failed to get fee rate: %v (using 0)", err)
-	} else {
-		takerFeeBps = feeRate
-	}
+	// Get taker fee from Gamma market feeSchedule (dynamic, category-based)
+	takerFeeBps := market.GetFeeRateBps()
+	log.Printf("executeBuyOrder: feeSchedule=%+v, feeType=%s, takerFeeBps=%d", market.FeeSchedule, market.FeeType, takerFeeBps)
 
 	// Build trade request
 	tradeReq := &polymarket.TradeRequest{
@@ -2340,13 +2336,9 @@ func (b *Bot) executeBuyOrderByIndex(ctx context.Context, user *database.User, m
 		proxyAddress = common.HexToAddress(user.ProxyAddress)
 	}
 
-	// Fetch taker fee rate from CLOB API (dynamic, category-based)
-	var takerFeeBps int
-	if feeRate, err := b.tradingClient.GetFeeRate(ctx, tokenID); err != nil {
-		log.Printf("Warning: Failed to get fee rate: %v (using 0)", err)
-	} else {
-		takerFeeBps = feeRate
-	}
+	// Get taker fee from Gamma market feeSchedule (dynamic, category-based)
+	takerFeeBps := market.GetFeeRateBps()
+	log.Printf("executeBuyOrderByIndex: feeSchedule=%+v, feeType=%s, takerFeeBps=%d", market.FeeSchedule, market.FeeType, takerFeeBps)
 
 	// Build trade request
 	tradeReq := &polymarket.TradeRequest{
@@ -2413,13 +2405,9 @@ func (b *Bot) executeSellOrder(ctx context.Context, user *database.User, market 
 		proxyAddress = common.HexToAddress(user.ProxyAddress)
 	}
 
-	// Fetch taker fee rate from CLOB API (dynamic, category-based)
-	var takerFeeBps int
-	if feeRate, err := b.tradingClient.GetFeeRate(ctx, tokenID); err != nil {
-		log.Printf("Warning: Failed to get fee rate: %v (using 0)", err)
-	} else {
-		takerFeeBps = feeRate
-	}
+	// Get taker fee from Gamma market feeSchedule (dynamic, category-based)
+	takerFeeBps := market.GetFeeRateBps()
+	log.Printf("executeSellOrder: feeSchedule=%+v, feeType=%s, takerFeeBps=%d", market.FeeSchedule, market.FeeType, takerFeeBps)
 
 	// Build trade request
 	tradeReq := &polymarket.TradeRequest{
@@ -2478,12 +2466,14 @@ func (b *Bot) executeSellOrderFromPosition(ctx context.Context, user *database.U
 		proxyAddress = common.HexToAddress(user.ProxyAddress)
 	}
 
-	// Fetch taker fee rate from CLOB API (dynamic, category-based)
+	// Get taker fee from Gamma market feeSchedule (dynamic, category-based)
 	var takerFeeBps int
-	if feeRate, err := b.tradingClient.GetFeeRate(ctx, pos.TokenID); err != nil {
-		log.Printf("Warning: Failed to get fee rate: %v (using 0)", err)
+	mc := polymarket.NewMarketClient()
+	if gammaMarket, err := mc.GetMarketByID(ctx, pos.MarketID); err != nil {
+		log.Printf("Warning: Failed to get market for fee schedule: %v (using 0)", err)
 	} else {
-		takerFeeBps = feeRate
+		takerFeeBps = gammaMarket.GetFeeRateBps()
+		log.Printf("executeSellOrderFromPosition: feeSchedule=%+v, feeType=%s, takerFeeBps=%d", gammaMarket.FeeSchedule, gammaMarket.FeeType, takerFeeBps)
 	}
 
 	// Build trade request using position data directly
