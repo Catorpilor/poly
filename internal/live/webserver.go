@@ -707,16 +707,21 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get taker fee and negRisk from Gamma market feeSchedule (dynamic, category-based)
-	var takerFeeBps int
+	// Get fee rates and negRisk: Gamma feeSchedule for calculation, CLOB for order submission
+	var calcFeeBps, orderFeeBps int
 	var negRisk bool
 	mc := polymarket.NewMarketClient()
 	if gammaMarket, err := mc.GetMarketByID(r.Context(), marketID); err != nil {
 		log.Printf("WebServer: Failed to get Gamma market for fee schedule: %v (using defaults)", err)
 	} else {
-		takerFeeBps = gammaMarket.GetFeeRateBps()
+		calcFeeBps = gammaMarket.GetFeeRateBps()
 		negRisk = gammaMarket.NegRisk
-		log.Printf("WebServer: feeSchedule=%+v, feeType=%s, takerFeeBps=%d, negRisk=%v", gammaMarket.FeeSchedule, gammaMarket.FeeType, takerFeeBps, negRisk)
+		log.Printf("WebServer: feeSchedule=%+v, feeType=%s, calcFeeBps=%d, negRisk=%v", gammaMarket.FeeSchedule, gammaMarket.FeeType, calcFeeBps, negRisk)
+	}
+	if feeRate, err := ws.tradingClient.GetFeeRate(r.Context(), tokenID); err != nil {
+		log.Printf("WebServer: Failed to get CLOB fee rate: %v (using 0)", err)
+	} else {
+		orderFeeBps = feeRate
 	}
 
 	// Build trade request
@@ -728,7 +733,8 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 		Amount:       req.Trade.Amount,
 		Price:        0, // Market order - uses VWAP
 		OrderType:    polymarket.OrderTypeGTC,
-		TakerFeeBps:  takerFeeBps,
+		TakerFeeBps:  orderFeeBps,
+		CalcFeeBps:   calcFeeBps,
 		NegativeRisk: negRisk,
 	}
 

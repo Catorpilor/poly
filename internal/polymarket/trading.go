@@ -62,7 +62,8 @@ type TradeRequest struct {
 	OrderType    OrderType
 	Expiration   int64 // Unix timestamp for GTD orders
 	NegativeRisk bool  // Whether this is a negative risk market
-	TakerFeeBps  int   // Taker fee in basis points (e.g., 100 = 1%, 1000 = 10%), fetched from CLOB API
+	TakerFeeBps  int   // Fee rate for CLOB order submission (what the exchange accepts)
+	CalcFeeBps   int   // Fee rate for share/cost calculation (from Gamma feeSchedule, dynamic)
 }
 
 // TradeResult represents the result of a trade
@@ -643,10 +644,10 @@ func (tc *TradingClient) ExecuteTrade(
 		// Dynamic fee formula: fee = C × feeRate × p × (1 - p)
 		// Total cost = C × p + C × feeRate × p × (1-p) = C × p × (1 + feeRate × (1-p))
 		// So: shares = amount / (price * (1 + feeRate * (1 - price)))
-		// TakerFeeBps is in basis points, convert to decimal
+		// Use CalcFeeBps (Gamma dynamic rate) for share estimation, TakerFeeBps for the order
 		// takerAmount (shares): max 2 decimals -> round down to nearest 10000
-		takerFeeDecimal := float64(trade.TakerFeeBps) / 10000.0
-		effectivePrice := price * (1 + takerFeeDecimal*(1-price))
+		calcFeeDecimal := float64(trade.CalcFeeBps) / 10000.0
+		effectivePrice := price * (1 + calcFeeDecimal*(1-price))
 		shares := int64((trade.Amount / effectivePrice) * 1e6)
 		sharesRounded := (shares / 10000) * 10000
 		takerAmount = strconv.FormatInt(sharesRounded, 10)
@@ -658,8 +659,8 @@ func (tc *TradingClient) ExecuteTrade(
 		makerAmountRaw := int64(math.Round(float64(sharesRounded) * price))
 		makerAmountRaw = ((makerAmountRaw + 50) / 100) * 100
 		makerAmount = strconv.FormatInt(makerAmountRaw, 10)
-		log.Printf("ExecuteTrade BUY: makerAmount=%s USDC, takerAmount=%s shares (raw=%d), price=%.6f, effectivePrice=%.6f (feeBps=%d), originalUSDC=%.2f",
-			makerAmount, takerAmount, shares, price, effectivePrice, trade.TakerFeeBps, trade.Amount)
+		log.Printf("ExecuteTrade BUY: makerAmount=%s USDC, takerAmount=%s shares (raw=%d), price=%.6f, effectivePrice=%.6f (calcFeeBps=%d, orderFeeBps=%d), originalUSDC=%.2f",
+			makerAmount, takerAmount, shares, price, effectivePrice, trade.CalcFeeBps, trade.TakerFeeBps, trade.Amount)
 	} else {
 		side = model.SELL
 		// SELL: selling shares to get USDC

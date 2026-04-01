@@ -2255,9 +2255,15 @@ func (b *Bot) executeBuyOrder(ctx context.Context, user *database.User, market *
 		proxyAddress = common.HexToAddress(user.ProxyAddress)
 	}
 
-	// Get taker fee from Gamma market feeSchedule (dynamic, category-based)
-	takerFeeBps := market.GetFeeRateBps()
-	log.Printf("executeBuyOrder: feeSchedule=%+v, feeType=%s, takerFeeBps=%d", market.FeeSchedule, market.FeeType, takerFeeBps)
+	// Get fee rates: Gamma feeSchedule for calculation, CLOB for order submission
+	calcFeeBps := market.GetFeeRateBps()
+	var orderFeeBps int
+	if feeRate, err := b.tradingClient.GetFeeRate(ctx, tokenID); err != nil {
+		log.Printf("Warning: Failed to get CLOB fee rate: %v (using 0)", err)
+	} else {
+		orderFeeBps = feeRate
+	}
+	log.Printf("executeBuyOrder: feeSchedule=%+v, feeType=%s, calcFeeBps=%d, orderFeeBps=%d", market.FeeSchedule, market.FeeType, calcFeeBps, orderFeeBps)
 
 	// Build trade request
 	tradeReq := &polymarket.TradeRequest{
@@ -2268,10 +2274,11 @@ func (b *Bot) executeBuyOrder(ctx context.Context, user *database.User, market *
 		Amount:       amount,
 		OrderType:    polymarket.OrderTypeGTC, // Good-til-cancelled
 		NegativeRisk: market.NegRisk,          // Use negRisk exchange if market is negRisk
-		TakerFeeBps: takerFeeBps,
+		TakerFeeBps:  orderFeeBps,
+		CalcFeeBps:   calcFeeBps,
 	}
 
-	log.Printf("Trade request: negRisk=%v, market.NegRisk=%v, takerFeeBps=%d", tradeReq.NegativeRisk, market.NegRisk, takerFeeBps)
+	log.Printf("Trade request: negRisk=%v, market.NegRisk=%v, orderFeeBps=%d, calcFeeBps=%d", tradeReq.NegativeRisk, market.NegRisk, orderFeeBps, calcFeeBps)
 
 	// Execute the trade
 	result, err := b.tradingClient.ExecuteTrade(ctx, userWallet.PrivateKey, proxyAddress, creds, tradeReq)
@@ -2336,9 +2343,15 @@ func (b *Bot) executeBuyOrderByIndex(ctx context.Context, user *database.User, m
 		proxyAddress = common.HexToAddress(user.ProxyAddress)
 	}
 
-	// Get taker fee from Gamma market feeSchedule (dynamic, category-based)
-	takerFeeBps := market.GetFeeRateBps()
-	log.Printf("executeBuyOrderByIndex: feeSchedule=%+v, feeType=%s, takerFeeBps=%d", market.FeeSchedule, market.FeeType, takerFeeBps)
+	// Get fee rates: Gamma feeSchedule for calculation, CLOB for order submission
+	calcFeeBps := market.GetFeeRateBps()
+	var orderFeeBps int
+	if feeRate, err := b.tradingClient.GetFeeRate(ctx, tokenID); err != nil {
+		log.Printf("Warning: Failed to get CLOB fee rate: %v (using 0)", err)
+	} else {
+		orderFeeBps = feeRate
+	}
+	log.Printf("executeBuyOrderByIndex: feeSchedule=%+v, feeType=%s, calcFeeBps=%d, orderFeeBps=%d", market.FeeSchedule, market.FeeType, calcFeeBps, orderFeeBps)
 
 	// Build trade request
 	tradeReq := &polymarket.TradeRequest{
@@ -2350,11 +2363,12 @@ func (b *Bot) executeBuyOrderByIndex(ctx context.Context, user *database.User, m
 		Price:        limitPrice, // 0 = market order, >0 = limit order
 		OrderType:    polymarket.OrderTypeGTC,
 		NegativeRisk: market.NegRisk,
-		TakerFeeBps: takerFeeBps,
+		TakerFeeBps:  orderFeeBps,
+		CalcFeeBps:   calcFeeBps,
 	}
 
-	log.Printf("Trade request (by index): outcomeIndex=%d, outcomeName=%s, tokenID=%s, negRisk=%v, limitPrice=%.2f, takerFeeBps=%d",
-		outcomeIndex, outcomeName, tokenID, tradeReq.NegativeRisk, limitPrice, takerFeeBps)
+	log.Printf("Trade request (by index): outcomeIndex=%d, outcomeName=%s, tokenID=%s, negRisk=%v, limitPrice=%.2f, orderFeeBps=%d, calcFeeBps=%d",
+		outcomeIndex, outcomeName, tokenID, tradeReq.NegativeRisk, limitPrice, orderFeeBps, calcFeeBps)
 
 	// Execute the trade
 	result, err := b.tradingClient.ExecuteTrade(ctx, userWallet.PrivateKey, proxyAddress, creds, tradeReq)
@@ -2405,9 +2419,15 @@ func (b *Bot) executeSellOrder(ctx context.Context, user *database.User, market 
 		proxyAddress = common.HexToAddress(user.ProxyAddress)
 	}
 
-	// Get taker fee from Gamma market feeSchedule (dynamic, category-based)
-	takerFeeBps := market.GetFeeRateBps()
-	log.Printf("executeSellOrder: feeSchedule=%+v, feeType=%s, takerFeeBps=%d", market.FeeSchedule, market.FeeType, takerFeeBps)
+	// Get fee rates: Gamma feeSchedule for calculation, CLOB for order submission
+	calcFeeBps := market.GetFeeRateBps()
+	var orderFeeBps int
+	if feeRate, err := b.tradingClient.GetFeeRate(ctx, tokenID); err != nil {
+		log.Printf("Warning: Failed to get CLOB fee rate: %v (using 0)", err)
+	} else {
+		orderFeeBps = feeRate
+	}
+	log.Printf("executeSellOrder: feeSchedule=%+v, feeType=%s, calcFeeBps=%d, orderFeeBps=%d", market.FeeSchedule, market.FeeType, calcFeeBps, orderFeeBps)
 
 	// Build trade request
 	tradeReq := &polymarket.TradeRequest{
@@ -2418,11 +2438,12 @@ func (b *Bot) executeSellOrder(ctx context.Context, user *database.User, market 
 		Amount:       amount,
 		OrderType:    polymarket.OrderTypeGTC,
 		NegativeRisk: market.NegRisk, // Use negRisk exchange if market is negRisk
-		TakerFeeBps: takerFeeBps,
+		TakerFeeBps:  orderFeeBps,
+		CalcFeeBps:   calcFeeBps,
 	}
 
-	log.Printf("Trade request (SELL): outcome=%s, tokenID=%s, negRisk=%v, takerFeeBps=%d",
-		outcome, tokenID, tradeReq.NegativeRisk, takerFeeBps)
+	log.Printf("Trade request (SELL): outcome=%s, tokenID=%s, negRisk=%v, orderFeeBps=%d, calcFeeBps=%d",
+		outcome, tokenID, tradeReq.NegativeRisk, orderFeeBps, calcFeeBps)
 
 	// Execute the trade
 	result, execErr := b.tradingClient.ExecuteTrade(ctx, userWallet.PrivateKey, proxyAddress, creds, tradeReq)
@@ -2466,14 +2487,19 @@ func (b *Bot) executeSellOrderFromPosition(ctx context.Context, user *database.U
 		proxyAddress = common.HexToAddress(user.ProxyAddress)
 	}
 
-	// Get taker fee from Gamma market feeSchedule (dynamic, category-based)
-	var takerFeeBps int
+	// Get fee rates: Gamma feeSchedule for calculation, CLOB for order submission
+	var calcFeeBps, orderFeeBps int
 	mc := polymarket.NewMarketClient()
 	if gammaMarket, err := mc.GetMarketByID(ctx, pos.MarketID); err != nil {
 		log.Printf("Warning: Failed to get market for fee schedule: %v (using 0)", err)
 	} else {
-		takerFeeBps = gammaMarket.GetFeeRateBps()
-		log.Printf("executeSellOrderFromPosition: feeSchedule=%+v, feeType=%s, takerFeeBps=%d", gammaMarket.FeeSchedule, gammaMarket.FeeType, takerFeeBps)
+		calcFeeBps = gammaMarket.GetFeeRateBps()
+		log.Printf("executeSellOrderFromPosition: feeSchedule=%+v, feeType=%s, calcFeeBps=%d", gammaMarket.FeeSchedule, gammaMarket.FeeType, calcFeeBps)
+	}
+	if feeRate, err := b.tradingClient.GetFeeRate(ctx, pos.TokenID); err != nil {
+		log.Printf("Warning: Failed to get CLOB fee rate: %v (using 0)", err)
+	} else {
+		orderFeeBps = feeRate
 	}
 
 	// Build trade request using position data directly
@@ -2487,11 +2513,12 @@ func (b *Bot) executeSellOrderFromPosition(ctx context.Context, user *database.U
 		Price:        limitPrice,  // 0 means market order, >0 means limit order
 		OrderType:    polymarket.OrderTypeGTC,
 		NegativeRisk: pos.NegativeRisk,
-		TakerFeeBps: takerFeeBps,
+		TakerFeeBps:  orderFeeBps,
+		CalcFeeBps:   calcFeeBps,
 	}
 
-	log.Printf("Sell trade request: tokenID=%s, negRisk=%v, conditionID=%s, amount=$%.2f, posShares=%s, posValue=$%.2f, limitPrice=%.2f, takerFeeBps=%d",
-		tradeReq.TokenID, tradeReq.NegativeRisk, tradeReq.MarketID, amount, polymarket.FormatShares(pos.Shares), pos.Value, limitPrice, takerFeeBps)
+	log.Printf("Sell trade request: tokenID=%s, negRisk=%v, conditionID=%s, amount=$%.2f, posShares=%s, posValue=$%.2f, limitPrice=%.2f, orderFeeBps=%d, calcFeeBps=%d",
+		tradeReq.TokenID, tradeReq.NegativeRisk, tradeReq.MarketID, amount, polymarket.FormatShares(pos.Shares), pos.Value, limitPrice, orderFeeBps, calcFeeBps)
 
 	// Check if exchange has approval to transfer shares
 	if b.blockchain != nil {
