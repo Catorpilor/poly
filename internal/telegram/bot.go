@@ -2255,13 +2255,12 @@ func (b *Bot) executeBuyOrder(ctx context.Context, user *database.User, market *
 		proxyAddress = common.HexToAddress(user.ProxyAddress)
 	}
 
-	// Fetch taker fee from CLOB API
+	// Fetch taker fee rate from CLOB API (dynamic, category-based)
 	var takerFeeBps int
-	marketInfo, err := b.tradingClient.GetMarketInfo(ctx, tokenID)
-	if err != nil {
-		log.Printf("Warning: Failed to get market info for taker fee: %v (using 0)", err)
+	if feeRate, err := b.tradingClient.GetFeeRate(ctx, tokenID); err != nil {
+		log.Printf("Warning: Failed to get fee rate: %v (using 0)", err)
 	} else {
-		takerFeeBps = marketInfo.TakerBaseFee
+		takerFeeBps = feeRate
 	}
 
 	// Build trade request
@@ -2341,13 +2340,12 @@ func (b *Bot) executeBuyOrderByIndex(ctx context.Context, user *database.User, m
 		proxyAddress = common.HexToAddress(user.ProxyAddress)
 	}
 
-	// Fetch taker fee from CLOB API
+	// Fetch taker fee rate from CLOB API (dynamic, category-based)
 	var takerFeeBps int
-	marketInfo, err := b.tradingClient.GetMarketInfo(ctx, tokenID)
-	if err != nil {
-		log.Printf("Warning: Failed to get market info for taker fee: %v (using 0)", err)
+	if feeRate, err := b.tradingClient.GetFeeRate(ctx, tokenID); err != nil {
+		log.Printf("Warning: Failed to get fee rate: %v (using 0)", err)
 	} else {
-		takerFeeBps = marketInfo.TakerBaseFee
+		takerFeeBps = feeRate
 	}
 
 	// Build trade request
@@ -2415,13 +2413,12 @@ func (b *Bot) executeSellOrder(ctx context.Context, user *database.User, market 
 		proxyAddress = common.HexToAddress(user.ProxyAddress)
 	}
 
-	// Fetch taker fee from CLOB API
+	// Fetch taker fee rate from CLOB API (dynamic, category-based)
 	var takerFeeBps int
-	marketInfo, err := b.tradingClient.GetMarketInfo(ctx, tokenID)
-	if err != nil {
-		log.Printf("Warning: Failed to get market info for taker fee: %v (using 0)", err)
+	if feeRate, err := b.tradingClient.GetFeeRate(ctx, tokenID); err != nil {
+		log.Printf("Warning: Failed to get fee rate: %v (using 0)", err)
 	} else {
-		takerFeeBps = marketInfo.TakerBaseFee
+		takerFeeBps = feeRate
 	}
 
 	// Build trade request
@@ -2481,13 +2478,12 @@ func (b *Bot) executeSellOrderFromPosition(ctx context.Context, user *database.U
 		proxyAddress = common.HexToAddress(user.ProxyAddress)
 	}
 
-	// Fetch taker fee from CLOB API
+	// Fetch taker fee rate from CLOB API (dynamic, category-based)
 	var takerFeeBps int
-	marketInfo, err := b.tradingClient.GetMarketInfo(ctx, pos.TokenID)
-	if err != nil {
-		log.Printf("Warning: Failed to get market info for taker fee: %v (using 0)", err)
+	if feeRate, err := b.tradingClient.GetFeeRate(ctx, pos.TokenID); err != nil {
+		log.Printf("Warning: Failed to get fee rate: %v (using 0)", err)
 	} else {
-		takerFeeBps = marketInfo.TakerBaseFee
+		takerFeeBps = feeRate
 	}
 
 	// Build trade request using position data directly

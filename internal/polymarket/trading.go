@@ -403,6 +403,50 @@ func (tc *TradingClient) GetMarketInfo(ctx context.Context, tokenID string) (*CL
 	return &market, nil
 }
 
+// feeRateResponse is the response from the /fee-rate endpoint
+type feeRateResponse struct {
+	BaseFee int `json:"base_fee"`
+}
+
+// GetFeeRate fetches the taker fee rate in basis points for a token from the CLOB API.
+// This uses the /fee-rate endpoint which returns the current dynamic fee rate per Polymarket's
+// category-based fee model (e.g., 30 bps for Sports, 72 bps for Crypto, 0 for Geopolitics).
+func (tc *TradingClient) GetFeeRate(ctx context.Context, tokenID string) (int, error) {
+	url := fmt.Sprintf("%s/fee-rate?token_id=%s", tc.clobURL, tokenID)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create fee-rate request: %w", err)
+	}
+
+	resp, err := tc.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch fee-rate: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("fee-rate request failed: %s", resp.Status)
+	}
+
+	var feeResp feeRateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&feeResp); err != nil {
+		return 0, fmt.Errorf("failed to decode fee-rate response: %w", err)
+	}
+
+	log.Printf("GetFeeRate: tokenID=%s, baseFee=%d bps", tokenID, feeResp.BaseFee)
+	return feeResp.BaseFee, nil
+}
+
+// CalculateFee computes the taker fee using the dynamic probability-based formula:
+//
+//	fee = C × feeRate × p × (1 - p)
+//
+// where C = shares traded, feeRate = category rate as decimal, p = share price.
+func CalculateFee(shares float64, feeRateBps int, price float64) float64 {
+	feeRate := float64(feeRateBps) / 10000.0
+	return shares * feeRate * price * (1 - price)
+}
+
 // GetBestPrice gets the best available price for a trade
 // For BUY: amount = USDC to spend, returns the VWAP price per share
 // For SELL: amount = shares to sell, returns the VWAP price per share
@@ -596,12 +640,13 @@ func (tc *TradingClient) ExecuteTrade(
 		side = model.BUY
 		// BUY: spending USDC to get shares
 		// Step 1: Calculate shares from USDC amount, accounting for taker fee
-		// Total cost = shares * price * (1 + takerFee)
-		// So: shares = amount / (price * (1 + takerFee))
-		// TakerFeeBps is in basis points (1000 = 10%), convert to decimal
+		// Dynamic fee formula: fee = C × feeRate × p × (1 - p)
+		// Total cost = C × p + C × feeRate × p × (1-p) = C × p × (1 + feeRate × (1-p))
+		// So: shares = amount / (price * (1 + feeRate * (1 - price)))
+		// TakerFeeBps is in basis points, convert to decimal
 		// takerAmount (shares): max 2 decimals -> round down to nearest 10000
 		takerFeeDecimal := float64(trade.TakerFeeBps) / 10000.0
-		effectivePrice := price * (1 + takerFeeDecimal)
+		effectivePrice := price * (1 + takerFeeDecimal*(1-price))
 		shares := int64((trade.Amount / effectivePrice) * 1e6)
 		sharesRounded := (shares / 10000) * 10000
 		takerAmount = strconv.FormatInt(sharesRounded, 10)

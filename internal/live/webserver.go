@@ -707,15 +707,20 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fetch market info from CLOB API to get taker fee and negRisk
+	// Fetch taker fee rate from CLOB API (dynamic, category-based)
 	var takerFeeBps int
+	if feeRate, err := ws.tradingClient.GetFeeRate(r.Context(), tokenID); err != nil {
+		log.Printf("WebServer: Failed to get fee rate: %v (using 0)", err)
+	} else {
+		takerFeeBps = feeRate
+	}
+
+	// Fetch market info for negRisk flag
 	var negRisk bool
 	marketInfo, err := ws.tradingClient.GetMarketInfo(r.Context(), tokenID)
 	if err != nil {
-		log.Printf("WebServer: Failed to get market info: %v (using defaults)", err)
-		// Continue with defaults (0 fee, no negRisk)
+		log.Printf("WebServer: Failed to get market info: %v (using negRisk=false)", err)
 	} else {
-		takerFeeBps = marketInfo.TakerBaseFee
 		negRisk = marketInfo.NegRisk
 		log.Printf("WebServer: Market info fetched - takerFeeBps=%d, negRisk=%v", takerFeeBps, negRisk)
 	}
