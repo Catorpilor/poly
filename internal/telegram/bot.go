@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -44,7 +45,11 @@ type CommandHandler func(ctx context.Context, bot *Bot, update *tgbotapi.Update)
 
 // NewBot creates a new Telegram bot instance
 func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
-	api, err := tgbotapi.NewBotAPI(cfg.Telegram.BotToken)
+	api, err := tgbotapi.NewBotAPIWithClient(
+		cfg.Telegram.BotToken,
+		tgbotapi.APIEndpoint,
+		&http.Client{Timeout: 75 * time.Second},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create bot API: %w", err)
 	}
