@@ -393,6 +393,28 @@ func (b *Bot) handleMarket(ctx context.Context, bot *Bot, update *tgbotapi.Updat
 	return nil
 }
 
+// handleEvent handles the /event command
+func (b *Bot) handleEvent(ctx context.Context, bot *Bot, update *tgbotapi.Update) error {
+	args := strings.Fields(update.Message.CommandArguments())
+	if len(args) == 0 {
+		b.sendMessage(update.Message.Chat.ID,
+			"❌ Please provide an event URL or slug. Usage: /event <polymarket-url-or-slug>")
+		return nil
+	}
+
+	arg := args[0]
+
+	// Try to parse as a Polymarket URL first
+	slug, ok := polymarket.ParseEventSlug(arg)
+	if !ok {
+		// Treat as a bare slug
+		slug = arg
+	}
+
+	b.handleEventBySlug(ctx, update.Message.Chat.ID, slug)
+	return nil
+}
+
 // getMarketStatus returns a status string for a market
 func getMarketStatus(market *polymarket.GammaMarket) string {
 	if market.Closed {

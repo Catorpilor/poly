@@ -15,6 +15,16 @@ type GammaEvent struct {
 	Title string `json:"title"`
 }
 
+// FeeSchedule represents Polymarket's dynamic fee configuration for a market.
+// The fee formula is: fee = C × rate × p × (1-p)
+// where C = shares, rate = category-specific fee rate, p = share price.
+type FeeSchedule struct {
+	Rate       float64 `json:"rate"`       // Fee rate as decimal (e.g., 0.03 = 30 bps for Sports)
+	Exponent   int     `json:"exponent"`   // Fee curve exponent (currently 1)
+	TakerOnly  bool    `json:"takerOnly"`  // Whether fees apply only to takers
+	RebateRate float64 `json:"rebateRate"` // Maker rebate rate (e.g., 0.25 = 25%)
+}
+
 // GammaMarket represents a market from the Gamma API
 type GammaMarket struct {
 	ID               string        `json:"id"`
@@ -42,6 +52,19 @@ type GammaMarket struct {
 	NegRisk          bool          `json:"negRisk"`         // Whether this is a negative risk market
 	NegRiskMarketID  string        `json:"negRiskMarketID"` // Neg risk market ID if applicable
 	Events           []*GammaEvent `json:"events"`          // Parent events this market belongs to
+	FeeSchedule      *FeeSchedule  `json:"feeSchedule"`     // Dynamic fee config (nil = no fees / legacy)
+	FeeType          string        `json:"feeType"`         // Fee category (e.g., "sports_fees_v2", "crypto_fees_v2")
+}
+
+// GetFeeRateBps returns the taker fee rate in basis points from the market's feeSchedule.
+// The Gamma API rate field is in per-mille units (0.03 = 30 bps, 0.072 = 72 bps),
+// so we multiply by 1000 to convert to basis points.
+// Returns 0 if no feeSchedule is set (fee-free markets like Geopolitics).
+func (m *GammaMarket) GetFeeRateBps() int {
+	if m.FeeSchedule == nil {
+		return 0
+	}
+	return int(m.FeeSchedule.Rate * 1000)
 }
 
 // GetOutcomes parses the outcomes JSON string into a slice
@@ -81,6 +104,16 @@ type MarketClient struct {
 func NewMarketClient() *MarketClient {
 	return &MarketClient{
 		gammaAPIURL: "https://gamma-api.polymarket.com",
+		httpClient: &http.Client{
+			Timeout: 15 * time.Second,
+		},
+	}
+}
+
+// NewMarketClientWithURL creates a market client with a custom base URL (for testing)
+func NewMarketClientWithURL(baseURL string) *MarketClient {
+	return &MarketClient{
+		gammaAPIURL: baseURL,
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 		},
@@ -219,6 +252,50 @@ func (mc *MarketClient) GetMarketByConditionID(ctx context.Context, conditionID 
 	}
 
 	return markets[0], nil
+}
+
+// GammaEventDetail represents a full event with nested markets from the Gamma API
+type GammaEventDetail struct {
+	ID      string         `json:"id"`
+	Slug    string         `json:"slug"`
+	Title   string         `json:"title"`
+	Markets []*GammaMarket `json:"markets"`
+}
+
+// GetEventBySlug fetches an event and its markets by event slug
+func (mc *MarketClient) GetEventBySlug(ctx context.Context, slug string) (*GammaEventDetail, error) {
+	url := fmt.Sprintf("%s/events?slug=%s", mc.gammaAPIURL, slug)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := mc.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch event: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("event not found: %s", slug)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Gamma API returned status %d", resp.StatusCode)
+	}
+
+	var events []*GammaEventDetail
+	if err := json.NewDecoder(resp.Body).Decode(&events); err != nil {
+		return nil, fmt.Errorf("failed to decode events: %w", err)
+	}
+
+	if len(events) == 0 {
+		return nil, fmt.Errorf("event not found: %s", slug)
+	}
+
+	return events[0], nil
 }
 
 // FormatVolume formats volume for display
