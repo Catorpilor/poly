@@ -29,6 +29,7 @@ type Bot struct {
 	db             *database.DB
 	userRepo       repositories.UserRepository
 	loginTokenRepo repositories.LoginTokenRepository
+	sltpArmRepo    repositories.SLTPArmRepository
 	handlers       map[string]CommandHandler
 	rateLimiter    *RateLimiter
 	stateManager   *StateManager
@@ -38,6 +39,7 @@ type Bot struct {
 	tradingClient  *polymarket.TradingClient
 	relayerClient  *polymarket.RelayerClient
 	liveManager    *live.LiveTradeManager
+	sltpMonitor    *live.SLTPMonitor
 }
 
 // CommandHandler is a function that handles a command
@@ -95,6 +97,7 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 		db:             db,
 		userRepo:       repositories.NewUserRepository(db),
 		loginTokenRepo: repositories.NewLoginTokenRepository(db),
+		sltpArmRepo:    repositories.NewSLTPArmRepository(db),
 		handlers:       make(map[string]CommandHandler),
 		rateLimiter:    NewRateLimiter(cfg.Security.RateLimitPerUser, time.Duration(cfg.Security.RateLimitWindowMins)*time.Minute),
 		stateManager:   NewStateManager(),
@@ -878,6 +881,18 @@ func (b *Bot) GetTradingClient() *polymarket.TradingClient {
 	return b.tradingClient
 }
 
+// GetSLTPArmRepository returns the SL/TP arm repository.
+func (b *Bot) GetSLTPArmRepository() repositories.SLTPArmRepository {
+	return b.sltpArmRepo
+}
+
+// SetSLTPMonitor wires the monitor into the bot so arm/disarm handlers can
+// update its subscription set. Must be called after the bot is constructed,
+// since the monitor depends on the bot (executor + notifier) — breaking the cycle.
+func (b *Bot) SetSLTPMonitor(m *live.SLTPMonitor) {
+	b.sltpMonitor = m
+}
+
 // sendMessageAndReturn sends a message and returns the sent message
 func (b *Bot) sendMessageAndReturn(chatID int64, text string) tgbotapi.Message {
 	msg := tgbotapi.NewMessage(chatID, text)
@@ -981,6 +996,15 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, update *tgbotapi.Update) 
 
 	case strings.HasPrefix(data, "mkt:"):
 		b.handleMarketDetailCallback(ctx, update)
+
+	case data == "sltp_list":
+		b.handleSLTPList(ctx, update)
+
+	case strings.HasPrefix(data, "sltp:arm:"):
+		b.handleSLTPArmCallback(ctx, update)
+
+	case strings.HasPrefix(data, "sltp:off:"):
+		b.handleSLTPDisarmCallback(ctx, update)
 
 	default:
 		log.Printf("Unknown callback data: %s", data)
@@ -1525,7 +1549,7 @@ func (b *Bot) handleRefreshPositions(ctx context.Context, update *tgbotapi.Updat
 • Use /wallet to check your USDC balance`
 	}
 
-	// Add refresh, sell, and redeem buttons
+	// Add refresh, sell, redeem, and SL/TP buttons
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "refresh_positions"),
@@ -1533,6 +1557,7 @@ func (b *Bot) handleRefreshPositions(ctx context.Context, update *tgbotapi.Updat
 		),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🎁 Redeem", "redeem_positions"),
+			tgbotapi.NewInlineKeyboardButtonData("🎯 SL/TP", "sltp_list"),
 		),
 	)
 

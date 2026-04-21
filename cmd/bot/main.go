@@ -48,6 +48,25 @@ func main() {
 		log.Fatalf("Failed to create bot: %v", err)
 	}
 
+	// Start price feed + SL/TP monitor for auto-sell threshold evaluation.
+	// Monitor depends on bot (executor + notifier); bot holds a reference to
+	// the monitor so arm/disarm handlers can update WS subscriptions.
+	priceFeed := live.NewPriceFeedManager(bot.GetTradingClient())
+	priceFeed.Start()
+	sltpMonitor := live.NewSLTPMonitor(
+		bot.GetSLTPArmRepository(),
+		priceFeed,
+		bot, // live.TradeExecutor
+		bot, // live.Notifier
+		live.V2CutoverPause,
+	)
+	bot.SetSLTPMonitor(sltpMonitor)
+	if err := sltpMonitor.Start(); err != nil {
+		log.Printf("Warning: Failed to start SL/TP monitor: %v", err)
+	}
+	defer priceFeed.Stop()
+	defer sltpMonitor.Stop()
+
 	// Start live monitoring web server
 	liveWebPort := 8081 // Default port for live monitoring web interface
 	if cfg.App.Port > 0 {
