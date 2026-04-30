@@ -196,6 +196,25 @@ func (bc *BalanceChecker) IsApprovedForAll(ctx context.Context, owner, operator 
 	return new(big.Int).SetBytes(result).Cmp(big.NewInt(0)) != 0, nil
 }
 
+// GetERC20Allowance returns the current allowance of `spender` over `owner`'s
+// balance for the ERC-20 token at `tokenAddress`. Used for reading pUSD
+// allowances against the V2 exchanges before deciding whether to re-approve.
+func (bc *BalanceChecker) GetERC20Allowance(ctx context.Context, tokenAddress, owner, spender common.Address) (*big.Int, error) {
+	data, err := EncodeAllowanceCall(owner, spender)
+	if err != nil {
+		return nil, fmt.Errorf("encode allowance call: %w", err)
+	}
+
+	result, err := bc.client.CallContract(ctx, ethereum.CallMsg{To: &tokenAddress, Data: data}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("call allowance: %w", err)
+	}
+	if len(result) == 0 {
+		return big.NewInt(0), nil
+	}
+	return new(big.Int).SetBytes(result), nil
+}
+
 // CheckExchangeApproval checks if the proxy has approved the appropriate exchange
 func (bc *BalanceChecker) CheckExchangeApproval(ctx context.Context, proxyAddress common.Address, isNegRisk bool) (bool, common.Address, error) {
 	var exchangeAddress common.Address

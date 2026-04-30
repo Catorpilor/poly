@@ -3,13 +3,15 @@ package polymarket
 import (
 	"context"
 	"fmt"
-	"math/big"
 	"log"
+	"math/big"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+
+	"github.com/Catorpilor/poly/internal/blockchain"
 )
 
 // CTFExchangeScanner looks for positions through CTF Exchange interactions
@@ -19,12 +21,13 @@ type CTFExchangeScanner struct {
 	conditionalTokens common.Address
 }
 
-// NewCTFExchangeScanner creates a scanner that looks at CTF Exchange
+// NewCTFExchangeScanner creates a scanner that looks at CTF Exchange.
+// Reads addresses from blockchain package vars (configured via blockchain.InitAddresses at startup).
 func NewCTFExchangeScanner(client *ethclient.Client) *CTFExchangeScanner {
 	return &CTFExchangeScanner{
 		client:            client,
-		ctfExchange:       common.HexToAddress("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"), // CTF Exchange
-		conditionalTokens: common.HexToAddress("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"), // ConditionalTokens
+		ctfExchange:       blockchain.CTFExchangeAddress,
+		conditionalTokens: blockchain.ConditionalTokensAddress,
 	}
 }
 

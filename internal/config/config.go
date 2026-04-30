@@ -68,15 +68,20 @@ type BlockchainConfig struct {
 
 // PolymarketConfig holds Polymarket API configuration
 type PolymarketConfig struct {
-	CLOBAPIUrl string
-	DataAPIUrl string // Polymarket Data API for positions
-	APIKey     string
+	CLOBAPIUrl  string
+	DataAPIUrl  string // Polymarket Data API for positions
+	GammaAPIURL string // Gamma API for market metadata
+	APIKey      string
 	// ConditionalTokens contract address on Polygon
 	ConditionalTokensAddress string
-	// USDC contract address on Polygon
+	// USDC / pUSD collateral contract address
 	USDCAddress string
 	// CTFExchange contract address
 	CTFExchangeAddress string
+	// NegRiskCTFExchange contract address
+	NegRiskExchangeAddress string
+	// CollateralOnramp wraps USDC/USDC.e → pUSD (V2 only; empty pre-V2)
+	CollateralOnrampAddress string
 }
 
 // RedisConfig holds Redis configuration
@@ -166,11 +171,15 @@ func Load() (*Config, error) {
 	// Load Polymarket configuration
 	cfg.Polymarket.CLOBAPIUrl = getEnv("POLYMARKET_CLOB_API_URL", "https://clob.polymarket.com")
 	cfg.Polymarket.DataAPIUrl = getEnv("POLYMARKET_DATA_API_URL", "https://data-api.polymarket.com")
+	cfg.Polymarket.GammaAPIURL = getEnv("POLYMARKET_GAMMA_API_URL", "https://gamma-api.polymarket.com")
 	cfg.Polymarket.APIKey = getEnv("POLYMARKET_API_KEY", "")
-	// Contract addresses from the spec
-	cfg.Polymarket.ConditionalTokensAddress = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-	cfg.Polymarket.USDCAddress = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174" // USDC on Polygon
-	cfg.Polymarket.CTFExchangeAddress = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E" // CTFExchange on Polygon
+	// Contract addresses (defaults are V2, post-2026-04-28 cutover).
+	// ConditionalTokens address did not change between V1 and V2.
+	cfg.Polymarket.ConditionalTokensAddress = getEnv("POLYMARKET_CONDITIONAL_TOKENS_ADDRESS", "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+	cfg.Polymarket.USDCAddress = getEnv("POLYMARKET_COLLATERAL_ADDRESS", "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB") // pUSD
+	cfg.Polymarket.CTFExchangeAddress = getEnv("POLYMARKET_CTF_EXCHANGE_ADDRESS", "0xE111180000d2663C0091e4f400237545B87B996B")
+	cfg.Polymarket.NegRiskExchangeAddress = getEnv("POLYMARKET_NEGRISK_EXCHANGE_ADDRESS", "0xe2222d279d744050d28e00520010520000310F59")
+	cfg.Polymarket.CollateralOnrampAddress = getEnv("POLYMARKET_COLLATERAL_ONRAMP_ADDRESS", "0x93070a847efEf7F70739046A929D47a521F5B8ee")
 
 	// Load Redis configuration
 	cfg.Redis.URL = getEnv("REDIS_URL", "redis://localhost:6379/0")
