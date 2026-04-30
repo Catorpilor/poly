@@ -98,10 +98,22 @@ type EventSlugResolver struct {
 	mu          sync.RWMutex
 }
 
+// defaultGammaAPIURL is the Gamma API base URL used by NewEventSlugResolver.
+// Override with SetGammaAPIURL during startup to honor POLYMARKET_GAMMA_API_URL.
+var defaultGammaAPIURL = "https://gamma-api.polymarket.com"
+
+// SetGammaAPIURL overrides the default Gamma API URL used by NewEventSlugResolver.
+// Empty input is ignored.
+func SetGammaAPIURL(url string) {
+	if url != "" {
+		defaultGammaAPIURL = url
+	}
+}
+
 // NewEventSlugResolver creates a new event slug resolver
 func NewEventSlugResolver() *EventSlugResolver {
 	return &EventSlugResolver{
-		gammaAPIURL: "https://gamma-api.polymarket.com",
+		gammaAPIURL: defaultGammaAPIURL,
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 		},

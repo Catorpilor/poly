@@ -100,10 +100,28 @@ type MarketClient struct {
 	httpClient  *http.Client
 }
 
+// defaultGammaAPIURL is the Gamma API base URL used by NewMarketClient.
+// Override with SetGammaAPIURL during startup to honor POLYMARKET_GAMMA_API_URL.
+var defaultGammaAPIURL = "https://gamma-api.polymarket.com"
+
+// SetGammaAPIURL overrides the default Gamma API URL used by NewMarketClient.
+// Empty input is ignored.
+func SetGammaAPIURL(url string) {
+	if url != "" {
+		defaultGammaAPIURL = url
+	}
+}
+
+// DefaultGammaAPIURL returns the Gamma API URL used by NewMarketClient.
+// Exposed so other packages (e.g., trading.go) can reuse the same value.
+func DefaultGammaAPIURL() string {
+	return defaultGammaAPIURL
+}
+
 // NewMarketClient creates a new market client
 func NewMarketClient() *MarketClient {
 	return &MarketClient{
-		gammaAPIURL: "https://gamma-api.polymarket.com",
+		gammaAPIURL: defaultGammaAPIURL,
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 		},

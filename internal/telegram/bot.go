@@ -57,6 +57,12 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 	// Set debug mode based on environment
 	api.Debug = cfg.App.Environment == "development"
 
+	// Apply Polymarket address + URL overrides from config to the package-level
+	// vars consumed by blockchain/, polymarket/, and live/ constructors.
+	blockchain.InitAddresses(&cfg.Polymarket)
+	polymarket.SetGammaAPIURL(cfg.Polymarket.GammaAPIURL)
+	live.SetGammaAPIURL(cfg.Polymarket.GammaAPIURL)
+
 	// Create wallet manager
 	walletManager, err := wallet.NewManager(cfg.Security.EncryptionKey)
 	if err != nil {
@@ -144,6 +150,7 @@ func (b *Bot) registerHandlers() {
 	b.handlers["/help"] = b.handleHelp
 	b.handlers["/refresh"] = b.handleRefresh
 	b.handlers["/redeem"] = b.handleRedeem
+	b.handlers["/migrate"] = b.handleMigrate
 	b.handlers["/event"] = b.handleEvent
 	// Live monitoring commands
 	b.handlers["/live"] = b.handleLive

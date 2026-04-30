@@ -135,11 +135,11 @@ func (b *Bot) handleWallet(ctx context.Context, bot *Bot, update *tgbotapi.Updat
 
 *EOA Wallet:*
 • MATIC: %s (gas)
-• USDC: %s
+• pUSD: %s
 
 *Proxy Wallet (Trading):*
 • MATIC: %s (gas)
-• USDC: %s
+• pUSD: %s
 
 `,
 				blockchain.FormatMATIC(eoaBalance.MATIC),

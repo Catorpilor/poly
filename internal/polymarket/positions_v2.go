@@ -11,6 +11,8 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+
+	"github.com/Catorpilor/poly/internal/blockchain"
 )
 
 // PositionV2 represents a user's position with market details
@@ -28,16 +30,15 @@ type PositionV2 struct {
 type PositionManagerV2 struct {
 	client            *ethclient.Client
 	conditionalTokens common.Address
-	usdcAddress       common.Address
 	subgraph          *SubgraphClient
 }
 
-// NewPositionManagerV2 creates a new position manager
+// NewPositionManagerV2 creates a new position manager.
+// Reads addresses from blockchain package vars (configured via blockchain.InitAddresses at startup).
 func NewPositionManagerV2(client *ethclient.Client) *PositionManagerV2 {
 	return &PositionManagerV2{
 		client:            client,
-		conditionalTokens: common.HexToAddress("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"), // ConditionalTokens on Polygon
-		usdcAddress:       common.HexToAddress("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"), // USDC on Polygon
+		conditionalTokens: blockchain.ConditionalTokensAddress,
 		subgraph:          NewSubgraphClient(),
 	}
 }

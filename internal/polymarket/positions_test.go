@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -218,15 +219,26 @@ func TestGetRedeemablePositions_URLFormat(t *testing.T) {
 	pm := NewPositionManagerWithDataAPI(nil, "", server.URL)
 	pm.GetRedeemablePositions(context.Background(), proxyAddr)
 
-	expectedPath := "/positions"
-	if r := requestURL; r == "" {
+	if requestURL == "" {
 		t.Fatal("no request made")
 	}
 
-	// Should contain the path and redeemable param
-	if requestURL != expectedPath+"?redeemable=true&user=0xabcdef1234567890abcdef1234567890abcdef12" &&
-		requestURL != expectedPath+"?user=0xabcdef1234567890abcdef1234567890abcdef12&redeemable=true" {
-		t.Errorf("unexpected URL: %s", requestURL)
+	parsed, err := url.Parse(requestURL)
+	if err != nil {
+		t.Fatalf("parse request URL: %v", err)
+	}
+	if parsed.Path != "/positions" {
+		t.Errorf("path = %q, want /positions", parsed.Path)
+	}
+	q := parsed.Query()
+	if got, want := q.Get("user"), "0xabcdef1234567890abcdef1234567890abcdef12"; got != want {
+		t.Errorf("user param = %q, want %q", got, want)
+	}
+	if q.Get("redeemable") != "true" {
+		t.Errorf("redeemable param = %q, want true", q.Get("redeemable"))
+	}
+	if q.Get("limit") == "" {
+		t.Errorf("limit param missing, expected to be set to bypass default 100-row pagination")
 	}
 }
 

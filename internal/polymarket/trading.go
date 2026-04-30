@@ -22,16 +22,16 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/polymarket/go-order-utils/pkg/builder"
-	"github.com/polymarket/go-order-utils/pkg/model"
+
+	"github.com/Catorpilor/poly/internal/polymarket/orderv2"
 )
 
-// TradingClient handles order creation and submission to Polymarket CLOB
+// TradingClient handles order creation and submission to Polymarket CLOB V2.
 type TradingClient struct {
 	clobURL    string
 	chainID    *big.Int
 	httpClient *http.Client
-	builder    builder.ExchangeOrderBuilder
+	builder    *orderv2.Builder
 }
 
 // APICredentials holds L2 API credentials for authenticated requests
@@ -94,7 +94,7 @@ func NewTradingClient(clobURL string, chainID int64) *TradingClient {
 		clobURL:    clobURL,
 		chainID:    big.NewInt(chainID),
 		httpClient: &http.Client{Timeout: 30 * time.Second},
-		builder:    builder.NewExchangeOrderBuilderImpl(big.NewInt(chainID), nil),
+		builder:    orderv2.NewBuilder(chainID),
 	}
 }
 
@@ -635,10 +635,10 @@ func (tc *TradingClient) ExecuteTrade(
 	// - 4 decimals = must be divisible by 100
 	// - 2 decimals = must be divisible by 10000
 	var makerAmount, takerAmount string
-	var side model.Side
+	var side orderv2.Side
 
 	if strings.ToUpper(trade.Side) == "BUY" {
-		side = model.BUY
+		side = orderv2.BUY
 		// BUY: spending USDC to get shares
 		// Step 1: Calculate shares from USDC amount, accounting for taker fee
 		// Dynamic fee formula: fee = C × feeRate × p × (1 - p)
@@ -662,7 +662,7 @@ func (tc *TradingClient) ExecuteTrade(
 		log.Printf("ExecuteTrade BUY: makerAmount=%s USDC, takerAmount=%s shares (raw=%d), price=%.6f, effectivePrice=%.6f (calcFeeBps=%d, orderFeeBps=%d), originalUSDC=%.2f",
 			makerAmount, takerAmount, shares, price, effectivePrice, trade.CalcFeeBps, trade.TakerFeeBps, trade.Amount)
 	} else {
-		side = model.SELL
+		side = orderv2.SELL
 		// SELL: selling shares to get USDC
 		// makerAmount (shares): max 2 decimals -> round to nearest 10000
 		var shares int64
@@ -688,7 +688,7 @@ func (tc *TradingClient) ExecuteTrade(
 	}
 
 	// Determine signature type based on whether we're using a proxy
-	sigType := model.EOA
+	sigType := orderv2.EOA
 	eoaAddress := crypto.PubkeyToAddress(privateKey.PublicKey)
 	maker := eoaAddress.Hex()
 
@@ -696,38 +696,34 @@ func (tc *TradingClient) ExecuteTrade(
 		// POLY_GNOSIS_SAFE (2) is for browser wallet proxies (most common)
 		// POLY_PROXY (1) is for email/Magic wallet proxies
 		// Most users connecting via browser wallets use Gnosis Safe
-		sigType = model.POLY_GNOSIS_SAFE
+		sigType = orderv2.POLY_GNOSIS_SAFE
 		maker = proxyAddress.Hex()
 		log.Printf("ExecuteTrade: Using proxy wallet, sigType=POLY_GNOSIS_SAFE(2)")
 	}
 
-	// Use taker fee (already in basis points from CLOB API)
-	log.Printf("ExecuteTrade: TakerFeeBps=%d", trade.TakerFeeBps)
-
-	// Build order data
-	orderData := &model.OrderData{
+	// Build order data. V2 dropped feeRateBps/nonce/taker — fees are
+	// computed at protocol match-time and signed timestamp replaces nonce.
+	orderData := &orderv2.OrderData{
 		Maker:         maker,
-		Taker:         "0x0000000000000000000000000000000000000000", // Public order
+		Signer:        eoaAddress.Hex(),
 		TokenId:       trade.TokenID,
 		MakerAmount:   makerAmount,
 		TakerAmount:   takerAmount,
 		Side:          side,
-		FeeRateBps:    strconv.Itoa(trade.TakerFeeBps),
-		Nonce:         "0",
-		Signer:        eoaAddress.Hex(),
 		SignatureType: sigType,
 	}
 
-	// Set expiration for GTD orders
+	// Set expiration for GTD orders. Note: expiration goes in the API
+	// JSON payload but is NOT included in the signed EIP-712 message in V2.
 	if trade.OrderType == OrderTypeGTD && trade.Expiration > 0 {
 		orderData.Expiration = strconv.FormatInt(trade.Expiration, 10)
 	}
 
 	// Determine which exchange to use
-	contract := model.CTFExchange
+	contract := orderv2.CTFExchange
 	contractName := "CTFExchange"
 	if trade.NegativeRisk {
-		contract = model.NegRiskCTFExchange
+		contract = orderv2.NegRiskCTFExchange
 		contractName = "NegRiskCTFExchange"
 	}
 	log.Printf("ExecuteTrade: Using contract=%s (negRisk=%v)", contractName, trade.NegativeRisk)
@@ -747,31 +743,31 @@ func (tc *TradingClient) submitOrder(
 	ctx context.Context,
 	creds *APICredentials,
 	address common.Address,
-	signedOrder *model.SignedOrder,
+	signedOrder *orderv2.SignedOrder,
 	orderType OrderType,
 ) (*TradeResult, error) {
-	// Convert side from int to string
 	sideStr := "BUY"
-	if signedOrder.Side.Int64() == 1 {
+	if signedOrder.Side == orderv2.SELL {
 		sideStr = "SELL"
 	}
 
-	// Build request body
-	// Note: salt is an integer, most other fields are strings
+	// V2 API JSON shape — mirrors orderToJsonV2 in @polymarket/clob-client-v2.
+	// Drops nonce/feeRateBps/taker; adds timestamp/metadata/builder.
+	// `expiration` ships in JSON but is NOT in the signed EIP-712 message.
 	orderPayload := map[string]any{
 		"order": map[string]any{
-			"salt":          signedOrder.Salt.Int64(), // Integer, not string
+			"salt":          signedOrder.Salt.Int64(), // integer, not string
 			"maker":         signedOrder.Maker.Hex(),
 			"signer":        signedOrder.Signer.Hex(),
-			"taker":         signedOrder.Taker.Hex(),
 			"tokenId":       signedOrder.TokenId.String(),
 			"makerAmount":   signedOrder.MakerAmount.String(),
 			"takerAmount":   signedOrder.TakerAmount.String(),
-			"expiration":    signedOrder.Expiration.String(),
-			"nonce":         signedOrder.Nonce.String(),
-			"feeRateBps":    signedOrder.FeeRateBps.String(),
 			"side":          sideStr,
-			"signatureType": signedOrder.SignatureType.Int64(),
+			"signatureType": int(signedOrder.SignatureType),
+			"timestamp":     signedOrder.Timestamp.String(),
+			"expiration":    signedOrder.Expiration.String(),
+			"metadata":      signedOrder.Metadata.Hex(),
+			"builder":       signedOrder.Builder.Hex(),
 			"signature":     "0x" + hex.EncodeToString(signedOrder.Signature),
 		},
 		"owner":     creds.APIKey,
@@ -1119,7 +1115,7 @@ func (tc *TradingClient) CancelAllOrders(ctx context.Context, address common.Add
 
 // GetTokenIDByIndex gets the token ID for a specific outcome index (0 or 1)
 func (tc *TradingClient) GetTokenIDByIndex(ctx context.Context, marketID string, outcomeIndex int) (string, error) {
-	url := fmt.Sprintf("https://gamma-api.polymarket.com/markets/%s", marketID)
+	url := fmt.Sprintf("%s/markets/%s", defaultGammaAPIURL, marketID)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return "", err
@@ -1165,7 +1161,7 @@ func (tc *TradingClient) GetTokenIDForOutcome(ctx context.Context, market *Gamma
 	// The market should have clobTokenIds field
 	// For now, we'll need to fetch it from the Gamma API
 
-	url := fmt.Sprintf("https://gamma-api.polymarket.com/markets/%s", market.ID)
+	url := fmt.Sprintf("%s/markets/%s", defaultGammaAPIURL, market.ID)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return "", err
