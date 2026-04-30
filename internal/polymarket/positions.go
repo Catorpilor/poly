@@ -119,7 +119,11 @@ func NewPositionManagerWithDataAPI(client *ethclient.Client, clobAPIURL, dataAPI
 // GetUserPositionsFromAPI fetches positions using the Polymarket Data API
 // This is the preferred method as it returns complete position data including P&L
 func (pm *PositionManager) GetUserPositionsFromAPI(ctx context.Context, proxyAddress common.Address) ([]*Position, error) {
-	url := fmt.Sprintf("%s/positions?user=%s", pm.dataAPIURL, strings.ToLower(proxyAddress.Hex()))
+	// limit=500: the API defaults to 100 and we've seen users with 160+
+	// historical positions where the newest active position falls past the
+	// default page boundary, leading to /positions returning "no positions"
+	// despite the trade succeeding.
+	url := fmt.Sprintf("%s/positions?user=%s&limit=500", pm.dataAPIURL, strings.ToLower(proxyAddress.Hex()))
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -178,7 +182,7 @@ func (pm *PositionManager) GetUserPositionsFromAPI(ctx context.Context, proxyAdd
 // excluded from display but still get burned automatically by the CTF contract when
 // the winning side is redeemed.
 func (pm *PositionManager) GetRedeemablePositions(ctx context.Context, proxyAddress common.Address) ([]*RedeemablePositionInfo, error) {
-	url := fmt.Sprintf("%s/positions?user=%s&redeemable=true",
+	url := fmt.Sprintf("%s/positions?user=%s&redeemable=true&limit=500",
 		pm.dataAPIURL, strings.ToLower(proxyAddress.Hex()))
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
