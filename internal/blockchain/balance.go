@@ -19,16 +19,11 @@ type Balance struct {
 // BalanceChecker handles balance queries
 type BalanceChecker struct {
 	client *ethclient.Client
-	// USDC contract address on Polygon
-	usdcAddress common.Address
 }
 
 // NewBalanceChecker creates a new balance checker
 func NewBalanceChecker(client *ethclient.Client) *BalanceChecker {
-	return &BalanceChecker{
-		client:      client,
-		usdcAddress: common.HexToAddress("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"), // USDC on Polygon
-	}
+	return &BalanceChecker{client: client}
 }
 
 // GetBalances fetches both MATIC and USDC balances for an address
@@ -42,10 +37,10 @@ func (bc *BalanceChecker) GetBalances(ctx context.Context, address common.Addres
 	}
 	balance.MATIC = maticBalance
 
-	// Get USDC balance
-	usdcBalance, err := bc.getERC20Balance(ctx, address, bc.usdcAddress)
+	// Get collateral balance (pUSD on V2, USDC.e on V1 — selected via InitAddresses).
+	usdcBalance, err := bc.getERC20Balance(ctx, address, USDCAddress)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get USDC balance: %w", err)
+		return nil, fmt.Errorf("failed to get collateral balance: %w", err)
 	}
 	balance.USDC = usdcBalance
 
