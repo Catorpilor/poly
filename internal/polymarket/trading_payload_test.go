@@ -52,3 +52,33 @@ func TestBuildOrderPayloadV2_SaltAboveInt64Range(t *testing.T) {
 		t.Fatalf("payload missing %s\nbody: %s", want, body)
 	}
 }
+
+// TestBuildOrderPayloadV2_HasDeferExecAndPostOnly pins two top-level fields
+// the CLOB schema validator requires (mirrors @polymarket/clob-client-v2's
+// orderToJsonV2). Without them the server returns `Invalid order payload`.
+func TestBuildOrderPayloadV2_HasDeferExecAndPostOnly(t *testing.T) {
+	t.Parallel()
+
+	signed := &orderv2.SignedOrder{
+		Order: orderv2.Order{
+			Salt:          big.NewInt(1),
+			TokenId:       big.NewInt(1),
+			MakerAmount:   big.NewInt(1),
+			TakerAmount:   big.NewInt(1),
+			Side:          orderv2.BUY,
+			SignatureType: orderv2.POLY_GNOSIS_SAFE,
+			Timestamp:     big.NewInt(0),
+			Expiration:    big.NewInt(0),
+		},
+		Signature: []byte{},
+	}
+
+	payload := buildOrderPayloadV2(signed, "owner-key", OrderTypeGTC)
+
+	if got, ok := payload["deferExec"]; !ok || got != false {
+		t.Errorf("deferExec = %v, ok=%v; want false present", got, ok)
+	}
+	if got, ok := payload["postOnly"]; !ok || got != false {
+		t.Errorf("postOnly = %v, ok=%v; want false present", got, ok)
+	}
+}
