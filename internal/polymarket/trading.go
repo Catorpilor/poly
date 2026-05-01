@@ -773,21 +773,23 @@ func (tc *TradingClient) ExecuteTrade(
 }
 
 // buildOrderPayloadV2 constructs the JSON map sent to POST /order.
-// Mirrors orderToJsonV2 in @polymarket/clob-client-v2 — including the
-// top-level `deferExec` and `postOnly` fields, whose absence makes the CLOB
-// schema validator return "Invalid order payload".
+// Mirrors orderToJsonV2 in @polymarket/clob-client-v2.
 // V2 drops nonce/feeRateBps/taker; adds timestamp/metadata/builder.
 // `expiration` ships in JSON but is NOT in the signed EIP-712 message.
+//
+// Salt is emitted as an unquoted JSON number via big.Int.MarshalJSON. Earlier
+// versions used Salt.Int64() which silently overflowed to a negative integer
+// for values ≥ 2^63 (defaultSalt() draws from [0, 2^64)) — the CLOB then
+// rejected the order with `abi: negatively-signed value cannot be packed into
+// uint parameter`. Sending the bare *big.Int is safe up to 2^256.
 func buildOrderPayloadV2(signedOrder *orderv2.SignedOrder, owner string, orderType OrderType) map[string]any {
 	sideStr := "BUY"
 	if signedOrder.Side == orderv2.SELL {
 		sideStr = "SELL"
 	}
 	return map[string]any{
-		"deferExec": false,
-		"postOnly":  false,
 		"order": map[string]any{
-			"salt":          signedOrder.Salt.String(), // uint256 — string, not int (would overflow when ≥ 2^63)
+			"salt":          signedOrder.Salt,
 			"maker":         signedOrder.Maker.Hex(),
 			"signer":        signedOrder.Signer.Hex(),
 			"tokenId":       signedOrder.TokenId.String(),
