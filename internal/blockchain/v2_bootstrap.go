@@ -90,7 +90,7 @@ func PlanV2Bootstrap(ctx context.Context, bc *BalanceChecker, proxyAddress commo
 		}
 		plan.Txs = append(plan.Txs, MultiSendTx{To: LegacyUSDCAddress, Data: approveData})
 
-		wrapData, err := EncodeWrapCollateral(usdcEBalance)
+		wrapData, err := EncodeWrapCollateral(LegacyUSDCAddress, proxyAddress, usdcEBalance)
 		if err != nil {
 			return nil, fmt.Errorf("encode wrap: %w", err)
 		}

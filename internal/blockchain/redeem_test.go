@@ -2,8 +2,10 @@ package blockchain
 
 import (
 	"math/big"
+	"strings"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 )
 
@@ -30,6 +32,43 @@ func TestEncodeStandardRedemption(t *testing.T) {
 	// First 4 bytes are the method selector for redeemPositions(address,bytes32,bytes32,uint256[])
 	if len(calldata) < 4 {
 		t.Fatal("calldata too short for method selector")
+	}
+}
+
+// TestEncodeStandardRedemption_UsesUSDCe pins the collateral token argument
+// to USDC.e (LegacyUSDCAddress). All currently-resolvable Polymarket
+// conditions were minted pre-V2, so their CTF positions are backed by USDC.e.
+// Passing pUSD instead would compute a different position ID and silently
+// no-op — see the redeem incident on tx 0xbac169e7…92a6f5.
+//
+// The test simulates production startup by overriding USDCAddress to pUSD
+// (as InitAddresses does), then asserts the encoder still uses USDC.e.
+func TestEncodeStandardRedemption_UsesUSDCe(t *testing.T) {
+	originalUSDC := USDCAddress
+	t.Cleanup(func() { USDCAddress = originalUSDC })
+	USDCAddress = common.HexToAddress("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB") // pUSD
+
+	conditionID := common.HexToHash("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
+	_, calldata, err := EncodeStandardRedemption(conditionID)
+	if err != nil {
+		t.Fatalf("EncodeStandardRedemption() error = %v", err)
+	}
+
+	parsed, err := abi.JSON(strings.NewReader(ctfRedeemABI))
+	if err != nil {
+		t.Fatalf("parse abi: %v", err)
+	}
+	args, err := parsed.Methods["redeemPositions"].Inputs.Unpack(calldata[4:])
+	if err != nil {
+		t.Fatalf("unpack: %v", err)
+	}
+
+	gotCollateral, ok := args[0].(common.Address)
+	if !ok {
+		t.Fatalf("collateralToken arg type = %T, want common.Address", args[0])
+	}
+	if gotCollateral != LegacyUSDCAddress {
+		t.Errorf("collateralToken = %s, want %s (USDC.e)", gotCollateral.Hex(), LegacyUSDCAddress.Hex())
 	}
 }
 

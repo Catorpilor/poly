@@ -57,7 +57,14 @@ const setApprovalForAllABI = `[{
 }]`
 
 // EncodeStandardRedemption builds calldata for CTF.redeemPositions on standard (binary) markets.
-// Burns the caller's entire position balance for the condition and pays out USDC for winning tokens.
+// Burns the caller's entire position balance for the condition and pays out the
+// underlying collateral for winning tokens.
+//
+// Collateral is hardcoded to USDC.e (LegacyUSDCAddress). The collateral token
+// is part of the position-ID hash, so it must match what the position was minted
+// with. Every currently-resolvable Polymarket market was created pre-V2 and is
+// therefore USDC.e-backed. When V2-era markets begin resolving, this needs to
+// become per-market (look up the market's collateralToken from Gamma).
 func EncodeStandardRedemption(conditionID common.Hash) (common.Address, []byte, error) {
 	parsed, err := abi.JSON(strings.NewReader(ctfRedeemABI))
 	if err != nil {
@@ -69,7 +76,7 @@ func EncodeStandardRedemption(conditionID common.Hash) (common.Address, []byte, 
 	indexSets := []*big.Int{big.NewInt(1), big.NewInt(2)}
 	parentCollectionID := common.Hash{} // bytes32(0)
 
-	data, err := parsed.Pack("redeemPositions", USDCAddress, parentCollectionID, conditionID, indexSets)
+	data, err := parsed.Pack("redeemPositions", LegacyUSDCAddress, parentCollectionID, conditionID, indexSets)
 	if err != nil {
 		return common.Address{}, nil, fmt.Errorf("pack redeemPositions: %w", err)
 	}
