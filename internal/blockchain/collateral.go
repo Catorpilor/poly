@@ -21,6 +21,8 @@ const collateralOnrampABI = `[{
 	"name": "wrap",
 	"type": "function",
 	"inputs": [
+		{"name": "asset",  "type": "address"},
+		{"name": "to",     "type": "address"},
 		{"name": "amount", "type": "uint256"}
 	],
 	"outputs": []
@@ -28,6 +30,8 @@ const collateralOnrampABI = `[{
 	"name": "unwrap",
 	"type": "function",
 	"inputs": [
+		{"name": "asset",  "type": "address"},
+		{"name": "to",     "type": "address"},
 		{"name": "amount", "type": "uint256"}
 	],
 	"outputs": []
@@ -51,28 +55,29 @@ const erc20ApproveABI = `[{
 	"outputs": [{"name": "", "type": "uint256"}]
 }]`
 
-// EncodeWrapCollateral builds calldata for CollateralOnramp.wrap(amount).
-// Submit the resulting tx with To=CollateralOnrampAddress.
-func EncodeWrapCollateral(amount *big.Int) ([]byte, error) {
+// EncodeWrapCollateral builds calldata for CollateralOnramp.wrap(asset, to, amount).
+// `asset` is the input ERC-20 (USDC.e or USDC native); `to` is the recipient of
+// the minted pUSD. Submit the resulting tx with To=CollateralOnrampAddress.
+func EncodeWrapCollateral(asset, to common.Address, amount *big.Int) ([]byte, error) {
 	parsed, err := abi.JSON(strings.NewReader(collateralOnrampABI))
 	if err != nil {
 		return nil, fmt.Errorf("parse onramp ABI: %w", err)
 	}
-	data, err := parsed.Pack("wrap", amount)
+	data, err := parsed.Pack("wrap", asset, to, amount)
 	if err != nil {
 		return nil, fmt.Errorf("pack wrap: %w", err)
 	}
 	return data, nil
 }
 
-// EncodeUnwrapCollateral builds calldata for CollateralOnramp.unwrap(amount).
+// EncodeUnwrapCollateral builds calldata for CollateralOnramp.unwrap(asset, to, amount).
 // Submit the resulting tx with To=CollateralOnrampAddress.
-func EncodeUnwrapCollateral(amount *big.Int) ([]byte, error) {
+func EncodeUnwrapCollateral(asset, to common.Address, amount *big.Int) ([]byte, error) {
 	parsed, err := abi.JSON(strings.NewReader(collateralOnrampABI))
 	if err != nil {
 		return nil, fmt.Errorf("parse onramp ABI: %w", err)
 	}
-	data, err := parsed.Pack("unwrap", amount)
+	data, err := parsed.Pack("unwrap", asset, to, amount)
 	if err != nil {
 		return nil, fmt.Errorf("pack unwrap: %w", err)
 	}
