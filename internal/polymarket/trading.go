@@ -404,6 +404,33 @@ func (tc *TradingClient) GetMarketInfo(ctx context.Context, tokenID string) (*CL
 	return &market, nil
 }
 
+// GetMinimumTickSize returns the per-market price tick (e.g. 0.01, 0.001).
+// Falls back to 0.01 with a warning log when the API response omits it or
+// returns zero — every active market should set this, but defaulting keeps
+// us from crashing on a malformed response.
+func (tc *TradingClient) GetMinimumTickSize(ctx context.Context, tokenID string) (float64, error) {
+	market, err := tc.GetMarketInfo(ctx, tokenID)
+	if err != nil {
+		return 0, err
+	}
+	if market.MinimumTickSize <= 0 {
+		log.Printf("GetMinimumTickSize: tokenID=%s missing/zero minimum_tick_size — defaulting to 0.01", tokenID)
+		return 0.01, nil
+	}
+	return market.MinimumTickSize, nil
+}
+
+// roundToTick rounds price to the nearest multiple of tick.
+// Uses math.Round (banker's-rounding-free) rather than int64(x+0.5),
+// which has negative-rounding and precision quirks at sub-cent ticks.
+func roundToTick(price, tick float64) float64 {
+	if tick <= 0 {
+		return price
+	}
+	inv := 1.0 / tick
+	return math.Round(price*inv) / inv
+}
+
 // feeRateResponse is the response from the /fee-rate endpoint
 type feeRateResponse struct {
 	BaseFee int `json:"base_fee"`
@@ -619,10 +646,17 @@ func (tc *TradingClient) ExecuteTrade(
 		return &TradeResult{Success: false, ErrorMsg: fmt.Sprintf("Invalid price: %.6f (must be between 0 and 1)", price)}, nil
 	}
 
-	// Round price to 2 decimal places (Polymarket tick size requirement)
-	// This must be done BEFORE calculating amounts to ensure consistency
-	price = float64(int64(price*100+0.5)) / 100
-	log.Printf("ExecuteTrade: Price rounded to tick size=%.2f", price)
+	// Round price to the market's actual tick size BEFORE calculating amounts.
+	// Hardcoding 1¢ (the previous behavior) silently rounded sub-cent asks like
+	// 0.051 down to 0.050, sending "market" buys to the CLOB at a price below
+	// the real ask — they'd sit as stuck limit orders and never fill.
+	tick, tickErr := tc.GetMinimumTickSize(ctx, trade.TokenID)
+	if tickErr != nil {
+		log.Printf("ExecuteTrade: tick lookup failed (%v) — defaulting to 0.01", tickErr)
+		tick = 0.01
+	}
+	price = roundToTick(price, tick)
+	log.Printf("ExecuteTrade: Price rounded to tick=%g → %.4f", tick, price)
 
 	// Calculate order amounts
 	// For BUY: makerAmount = USDC spent, takerAmount = shares received
