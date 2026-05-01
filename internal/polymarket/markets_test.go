@@ -808,3 +808,34 @@ func TestGetFeeRateBps(t *testing.T) {
 		})
 	}
 }
+
+// TestFormatPrice covers the precision boundary between low-priced (long-shot)
+// markets and standard ones. Prices < 10% must show one decimal, otherwise
+// 0.051 displayed as "5%" hides the precision class from /market and /buy
+// previews — the exact issue that masked the tick-size bug from the user.
+func TestFormatPrice(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		price float64
+		want  string
+	}{
+		{0.051, "5.1%"},
+		{0.005, "0.5%"},
+		{0.099, "9.9%"},
+		{0.10, "10%"},
+		{0.16, "16%"},
+		{0.84, "84%"},
+		{0.999, "100%"}, // documents existing rounding-to-100 behavior — fine
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			t.Parallel()
+			got := FormatPrice(tt.price)
+			if got != tt.want {
+				t.Errorf("FormatPrice(%v) = %q, want %q", tt.price, got, tt.want)
+			}
+		})
+	}
+}

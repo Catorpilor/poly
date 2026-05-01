@@ -327,7 +327,12 @@ func FormatVolume(volume float64) string {
 	return fmt.Sprintf("$%.0f", volume)
 }
 
-// FormatPrice formats a price as percentage
+// FormatPrice formats a price as a percentage. Long-shot markets price below
+// 10% in 0.1¢ ticks, so we keep one decimal there to make the precision class
+// visible (e.g. "5.1%" vs "5%"); 10%+ markets stay whole-percent for readability.
 func FormatPrice(price float64) string {
+	if price < 0.10 {
+		return fmt.Sprintf("%.1f%%", price*100)
+	}
 	return fmt.Sprintf("%.0f%%", price*100)
 }
