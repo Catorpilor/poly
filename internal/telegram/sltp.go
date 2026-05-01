@@ -154,7 +154,7 @@ func (b *Bot) handleSLTPArmCallback(ctx context.Context, update *tgbotapi.Update
 		TokenID:     pos.TokenID,
 		ConditionID: pos.ConditionID,
 		MarketID:    &marketID,
-		Outcome:     database.Outcome(pos.Outcome),
+		Outcome:     normalizeOutcome(pos.Outcome),
 		AvgPrice:    pos.AveragePrice,
 		SharesAtArm: sharesFloat,
 		NegRisk:     pos.NegativeRisk,
@@ -248,6 +248,13 @@ func sharesBigIntToFloat(b *big.Int) float64 {
 	}
 	f, _ := new(big.Float).Quo(new(big.Float).SetInt(b), big.NewFloat(1e6)).Float64()
 	return f
+}
+
+// normalizeOutcome upper-cases an outcome string so it matches the
+// database.Outcome enum. The unified position scanner emits "Yes"/"No"
+// (display casing); SLTPArm.Validate requires "YES"/"NO".
+func normalizeOutcome(s string) database.Outcome {
+	return database.Outcome(strings.ToUpper(s))
 }
 
 // --- live.TradeExecutor / live.Notifier adapters ---

@@ -96,3 +96,26 @@ func cbString(p *string) string {
 	}
 	return *p
 }
+
+// TestNormalizeOutcome covers the boundary between the position scanner
+// (returns "Yes"/"No" for display) and SLTPArm.Validate (requires "YES"/"NO").
+// Without this normalization, arming a position fails with
+// `invalid arm: invalid outcome: Yes`.
+func TestNormalizeOutcome(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in   string
+		want database.Outcome
+	}{
+		{"Yes", database.OutcomeYes},
+		{"yes", database.OutcomeYes},
+		{"YES", database.OutcomeYes},
+		{"No", database.OutcomeNo},
+		{"NO", database.OutcomeNo},
+	}
+	for _, c := range cases {
+		if got := normalizeOutcome(c.in); got != c.want {
+			t.Errorf("normalizeOutcome(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
