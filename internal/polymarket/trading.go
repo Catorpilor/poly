@@ -773,7 +773,9 @@ func (tc *TradingClient) ExecuteTrade(
 }
 
 // buildOrderPayloadV2 constructs the JSON map sent to POST /order.
-// Mirrors orderToJsonV2 in @polymarket/clob-client-v2.
+// Mirrors orderToJsonV2 in @polymarket/clob-client-v2 — including the
+// top-level `deferExec` and `postOnly` fields, whose absence makes the CLOB
+// schema validator return "Invalid order payload".
 // V2 drops nonce/feeRateBps/taker; adds timestamp/metadata/builder.
 // `expiration` ships in JSON but is NOT in the signed EIP-712 message.
 func buildOrderPayloadV2(signedOrder *orderv2.SignedOrder, owner string, orderType OrderType) map[string]any {
@@ -782,6 +784,8 @@ func buildOrderPayloadV2(signedOrder *orderv2.SignedOrder, owner string, orderTy
 		sideStr = "SELL"
 	}
 	return map[string]any{
+		"deferExec": false,
+		"postOnly":  false,
 		"order": map[string]any{
 			"salt":          signedOrder.Salt.String(), // uint256 — string, not int (would overflow when ≥ 2^63)
 			"maker":         signedOrder.Maker.Hex(),
