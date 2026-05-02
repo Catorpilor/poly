@@ -270,8 +270,11 @@ func (o *Order) Validate() error {
 	if o.Side != OrderSideBuy && o.Side != OrderSideSell {
 		return fmt.Errorf("invalid order side: %s", o.Side)
 	}
-	if o.Outcome != OutcomeYes && o.Outcome != OutcomeNo {
-		return fmt.Errorf("invalid outcome: %s", o.Outcome)
+	// See SLTPArm.Validate — outcome is display metadata, token_id is the
+	// canonical key. Sports/esports/election markets use team or candidate
+	// names as the outcome string.
+	if o.Outcome == "" {
+		return fmt.Errorf("outcome is required")
 	}
 	return nil
 }
@@ -284,8 +287,8 @@ func (p *PriceAlert) Validate() error {
 	if p.AlertType != AlertTypeAbove && p.AlertType != AlertTypeBelow {
 		return fmt.Errorf("invalid alert type: %s", p.AlertType)
 	}
-	if p.Outcome != OutcomeYes && p.Outcome != OutcomeNo {
-		return fmt.Errorf("invalid outcome: %s", p.Outcome)
+	if p.Outcome == "" {
+		return fmt.Errorf("outcome is required")
 	}
 	return nil
 }
