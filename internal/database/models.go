@@ -191,8 +191,13 @@ func (a *SLTPArm) Validate() error {
 	if a.SharesAtArm <= 0 {
 		return fmt.Errorf("shares_at_arm must be positive")
 	}
-	if a.Outcome != OutcomeYes && a.Outcome != OutcomeNo {
-		return fmt.Errorf("invalid outcome: %s", a.Outcome)
+	// Outcome is display metadata only — token_id is the canonical key for
+	// SL/TP. Polymarket markets are binary at the contract level but their
+	// display outcome is the user-facing name (YES/NO for prediction
+	// questions, but team/candidate names for sports/esports/elections
+	// like "WEIBO GAMING" or "KNICKS"). We only require it be non-empty.
+	if a.Outcome == "" {
+		return fmt.Errorf("outcome is required")
 	}
 	return nil
 }

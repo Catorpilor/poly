@@ -78,7 +78,14 @@ func TestSLTPArm_Validate(t *testing.T) {
 		{"avg price above 1", func(a *SLTPArm) { a.AvgPrice = 1.5 }, "avg_price"},
 		{"shares zero", func(a *SLTPArm) { a.SharesAtArm = 0 }, "shares_at_arm"},
 		{"shares negative", func(a *SLTPArm) { a.SharesAtArm = -1 }, "shares_at_arm"},
-		{"bad outcome", func(a *SLTPArm) { a.Outcome = Outcome("MAYBE") }, "outcome"},
+		{"empty outcome rejected", func(a *SLTPArm) { a.Outcome = Outcome("") }, "outcome"},
+		// Sports/esports/election markets have team/candidate names as the
+		// outcome string ("WEIBO GAMING", "DN SOOPERS", "Knicks"). These
+		// must arm — token_id is the canonical key for SL/TP, outcome is
+		// just display metadata. Strict YES/NO validation here masked
+		// real positions on multi-outcome markets.
+		{"non-binary outcome (esports team) accepted", func(a *SLTPArm) { a.Outcome = Outcome("WEIBO GAMING") }, ""},
+		{"non-binary outcome (sports team) accepted", func(a *SLTPArm) { a.Outcome = Outcome("KNICKS") }, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
