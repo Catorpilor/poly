@@ -130,6 +130,78 @@ type PriceAlert struct {
 	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
 }
 
+// SLTPArm represents an armed take-profit / stop-loss for a user's position on a token.
+// v1 uses fixed presets: TP fires at avg_price*2.0 selling 50% of remaining;
+// SL fires at avg_price*0.70 selling 100% of remaining.
+// avg_price and shares_at_arm are snapshotted at arm time so threshold evaluation is
+// deterministic and independent of later Data API drift.
+type SLTPArm struct {
+	ID           int       `json:"id" db:"id"`
+	TelegramID   int64     `json:"telegram_id" db:"telegram_id"`
+	TokenID      string    `json:"token_id" db:"token_id"`
+	ConditionID  string    `json:"condition_id" db:"condition_id"`
+	MarketID     *string   `json:"market_id" db:"market_id"`
+	Outcome      Outcome   `json:"outcome" db:"outcome"`
+	AvgPrice     float64   `json:"avg_price" db:"avg_price"`
+	SharesAtArm  float64   `json:"shares_at_arm" db:"shares_at_arm"`
+	TPArmed      bool      `json:"tp_armed" db:"tp_armed"`
+	SLArmed      bool      `json:"sl_armed" db:"sl_armed"`
+	NegRisk      bool      `json:"neg_risk" db:"neg_risk"`
+	CreatedAt    time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// TPMultiplier is the fixed v1 take-profit multiplier: trigger when bid >= avg_price * TPMultiplier.
+const TPMultiplier = 2.0
+
+// SLMultiplier is the fixed v1 stop-loss multiplier: trigger when bid <= avg_price * SLMultiplier.
+const SLMultiplier = 0.70
+
+// TPSellFraction is the fraction of current shares sold on a TP fire.
+const TPSellFraction = 0.50
+
+// TPTriggerPrice returns the bid threshold for TP on this arm, capped at 0.99.
+func (a *SLTPArm) TPTriggerPrice() float64 {
+	p := a.AvgPrice * TPMultiplier
+	if p > 0.99 {
+		return 0.99
+	}
+	return p
+}
+
+// SLTriggerPrice returns the bid threshold for SL on this arm.
+func (a *SLTPArm) SLTriggerPrice() float64 {
+	return a.AvgPrice * SLMultiplier
+}
+
+// Validate validates the SLTPArm.
+func (a *SLTPArm) Validate() error {
+	if a.TelegramID == 0 {
+		return fmt.Errorf("telegram_id is required")
+	}
+	if a.TokenID == "" {
+		return fmt.Errorf("token_id is required")
+	}
+	if a.ConditionID == "" {
+		return fmt.Errorf("condition_id is required")
+	}
+	if a.AvgPrice <= 0 || a.AvgPrice > 1 {
+		return fmt.Errorf("avg_price must be in (0, 1]")
+	}
+	if a.SharesAtArm <= 0 {
+		return fmt.Errorf("shares_at_arm must be positive")
+	}
+	// Outcome is display metadata only — token_id is the canonical key for
+	// SL/TP. Polymarket markets are binary at the contract level but their
+	// display outcome is the user-facing name (YES/NO for prediction
+	// questions, but team/candidate names for sports/esports/elections
+	// like "WEIBO GAMING" or "KNICKS"). We only require it be non-empty.
+	if a.Outcome == "" {
+		return fmt.Errorf("outcome is required")
+	}
+	return nil
+}
+
 // LoginToken represents a web authentication token
 type LoginToken struct {
 	Token           pgtype.UUID `json:"token" db:"token"`
@@ -198,8 +270,11 @@ func (o *Order) Validate() error {
 	if o.Side != OrderSideBuy && o.Side != OrderSideSell {
 		return fmt.Errorf("invalid order side: %s", o.Side)
 	}
-	if o.Outcome != OutcomeYes && o.Outcome != OutcomeNo {
-		return fmt.Errorf("invalid outcome: %s", o.Outcome)
+	// See SLTPArm.Validate — outcome is display metadata, token_id is the
+	// canonical key. Sports/esports/election markets use team or candidate
+	// names as the outcome string.
+	if o.Outcome == "" {
+		return fmt.Errorf("outcome is required")
 	}
 	return nil
 }
@@ -212,8 +287,8 @@ func (p *PriceAlert) Validate() error {
 	if p.AlertType != AlertTypeAbove && p.AlertType != AlertTypeBelow {
 		return fmt.Errorf("invalid alert type: %s", p.AlertType)
 	}
-	if p.Outcome != OutcomeYes && p.Outcome != OutcomeNo {
-		return fmt.Errorf("invalid outcome: %s", p.Outcome)
+	if p.Outcome == "" {
+		return fmt.Errorf("outcome is required")
 	}
 	return nil
 }

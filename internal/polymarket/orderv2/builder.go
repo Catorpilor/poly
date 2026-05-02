@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"time"
 
@@ -242,16 +243,27 @@ func parseBigInt(name, s string) (*big.Int, error) {
 	return v, nil
 }
 
-// defaultSalt returns a uniformly random uint64-range salt drawn from
-// crypto/rand. Salt only needs to be unique per (maker, timestamp) pair —
-// the V2 contract uses (salt, maker, timestamp) for replay protection.
+// defaultSalt mirrors the JS SDK's `Math.round(Math.random() * Date.now())`.
+//
+// The CLOB server is JS — JSON.parse / parseInt of a salt above
+// Number.MAX_SAFE_INTEGER (2^53-1) loses precision, and above 2^63 most JSON
+// libraries either signed-overflow or wrap. Either way the recomputed signature
+// won't match what we signed, and the server replies with the generic
+// "Invalid order payload". The SDK avoids this entirely by capping salt at
+// `random * Date.now()` ≈ 1.7e12. We do the same — exactly — to stay
+// byte-for-byte compatible. Salt only needs to be unique per (maker, timestamp)
+// for replay protection; ~10^12 of randomness is ample.
 func defaultSalt() *big.Int {
-	max := new(big.Int).Lsh(big.NewInt(1), 64) // 2^64
-	n, err := rand.Int(rand.Reader, max)
+	// Draw a 53-bit unsigned int and convert to a [0,1) float64 — same
+	// distribution as JS's Math.random().
+	const mantissa53 = int64(1) << 53
+	r, err := rand.Int(rand.Reader, big.NewInt(mantissa53))
 	if err != nil {
 		// crypto/rand.Reader is not expected to fail on Linux; fall back
 		// to a time-derived salt rather than panicking.
 		return big.NewInt(time.Now().UnixNano())
 	}
-	return n
+	random01 := float64(r.Int64()) / float64(mantissa53)
+	salt := math.Round(random01 * float64(time.Now().UnixMilli()))
+	return new(big.Int).SetInt64(int64(salt))
 }
