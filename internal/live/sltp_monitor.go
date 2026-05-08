@@ -29,6 +29,10 @@ type PriceFeedSubscriber interface {
 	Subscribe(tokenID string)
 	Unsubscribe(tokenID string)
 	BestBid(tokenID string) (float64, bool)
+	// BidWithFallback returns the freshest available bid: WS if the per-token
+	// last update is within maxAge, else an HTTP fetch. Used by the periodic
+	// tick to backstop a silent WS subscription.
+	BidWithFallback(tokenID string, maxAge time.Duration) (float64, string, bool)
 	OnUpdate(PriceUpdateListener)
 }
 
@@ -49,6 +53,17 @@ type Notifier interface {
 // PauseWindow returns true when the monitor must skip evaluation (e.g., V2 cutover).
 type PauseWindow func(now time.Time) bool
 
+// sltpTickInterval is the cadence of the periodic re-evaluation tick.
+// Backstops a silent WS subscription where evaluate() would otherwise never
+// run for a token: PONGs keep the connection-level lastMsgAt fresh even when
+// no book events flow for a specific asset, so per-token staleness is invisible
+// to the WS health check.
+const sltpTickInterval = 20 * time.Second
+
+// sltpFreshnessMaxAge is how recent the per-token WS update must be for the
+// tick to trust the cached bid; older = HTTP fallback.
+const sltpFreshnessMaxAge = 30 * time.Second
+
 // SLTPMonitor evaluates armed TP/SL thresholds on each price update and fires
 // SELL orders when thresholds are crossed. Safe to call Start once per process.
 type SLTPMonitor struct {
@@ -60,6 +75,12 @@ type SLTPMonitor struct {
 	notifier Notifier
 	paused   PauseWindow
 	now      sltpMonitorTickSource
+
+	// tickInterval is the periodic re-evaluation cadence. Tests override it
+	// before Start() to make ticker-driven tests deterministic.
+	tickInterval time.Duration
+	// freshnessMaxAge is the per-token WS staleness threshold used by the tick.
+	freshnessMaxAge time.Duration
 
 	mu           sync.Mutex
 	pauseNotified map[int64]bool // telegramID -> notified at window start
@@ -75,19 +96,22 @@ func NewSLTPMonitor(
 ) *SLTPMonitor {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &SLTPMonitor{
-		ctx:           ctx,
-		cancel:        cancel,
-		store:         store,
-		feed:          feed,
-		executor:      executor,
-		notifier:      notifier,
-		paused:        paused,
-		now:           time.Now,
-		pauseNotified: make(map[int64]bool),
+		ctx:             ctx,
+		cancel:          cancel,
+		store:           store,
+		feed:            feed,
+		executor:        executor,
+		notifier:        notifier,
+		paused:          paused,
+		now:             time.Now,
+		tickInterval:    sltpTickInterval,
+		freshnessMaxAge: sltpFreshnessMaxAge,
+		pauseNotified:   make(map[int64]bool),
 	}
 }
 
-// Start seeds WS subscriptions from the DB and registers the update handler.
+// Start seeds WS subscriptions from the DB, registers the update handler, and
+// launches the periodic re-evaluation tick.
 func (m *SLTPMonitor) Start() error {
 	tokenIDs, err := m.store.ListArmedTokenIDs(m.ctx)
 	if err != nil {
@@ -97,6 +121,7 @@ func (m *SLTPMonitor) Start() error {
 		m.feed.Subscribe(id)
 	}
 	m.feed.OnUpdate(m.handleUpdate)
+	go m.tickLoop()
 	log.Printf("SLTPMonitor: Started with %d armed token(s)", len(tokenIDs))
 	return nil
 }
@@ -123,9 +148,18 @@ func (m *SLTPMonitor) handleUpdate(tokenID string) {
 	go m.evaluate(tokenID)
 }
 
-// evaluate loads armed rows for tokenID and checks each against the current best bid.
-// Skipped if the pause window is active; users are notified at most once.
+// evaluate is the WS-driven path: resolves the bid from the local WS book and
+// hands off to evaluateToken.
 func (m *SLTPMonitor) evaluate(tokenID string) {
+	bid, ok := m.feed.BestBid(tokenID)
+	m.evaluateToken(tokenID, bid, ok, "ws")
+}
+
+// evaluateToken loads armed rows for tokenID and checks each against the
+// supplied bid. Skipped if the pause window is active. The source argument is
+// recorded in logs only ("ws", "tick:ws", "tick:http") so we can tell which
+// path made the decision.
+func (m *SLTPMonitor) evaluateToken(tokenID string, bid float64, ok bool, source string) {
 	if m.paused != nil && m.paused(m.now()) {
 		m.notifyPauseOnce(tokenID)
 		return
@@ -140,13 +174,47 @@ func (m *SLTPMonitor) evaluate(tokenID string) {
 		return
 	}
 
-	bid, ok := m.feed.BestBid(tokenID)
+	log.Printf("SLTPMonitor eval: token=%s bid=%.4f ok=%v src=%s arms=%d",
+		tokenID, bid, ok, source, len(arms))
+
 	if !ok || bid <= 0 {
 		return
 	}
 
 	for _, arm := range arms {
 		m.evaluateArm(arm, bid)
+	}
+}
+
+// tickLoop runs the periodic re-evaluation. Exits when the monitor's context
+// is cancelled (Stop()).
+func (m *SLTPMonitor) tickLoop() {
+	t := time.NewTicker(m.tickInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-t.C:
+			m.tickEvaluateAll()
+		}
+	}
+}
+
+// tickEvaluateAll fans out one goroutine per armed token so a slow HTTP fetch
+// for one token doesn't stall others.
+func (m *SLTPMonitor) tickEvaluateAll() {
+	tokenIDs, err := m.store.ListArmedTokenIDs(m.ctx)
+	if err != nil {
+		log.Printf("SLTPMonitor tick: list armed: %v", err)
+		return
+	}
+	for _, id := range tokenIDs {
+		id := id
+		go func() {
+			bid, src, ok := m.feed.BidWithFallback(id, m.freshnessMaxAge)
+			m.evaluateToken(id, bid, ok, "tick:"+src)
+		}()
 	}
 }
 

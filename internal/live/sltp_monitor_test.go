@@ -91,13 +91,24 @@ func (s *fakeStore) Disarm(_ context.Context, telegramID int64, tokenID string) 
 type fakeFeed struct {
 	mu            sync.Mutex
 	bids          map[string]float64
-	subscribes    []string
-	unsubscribes  []string
-	listeners     []PriceUpdateListener
+	// fallbackBids overrides the value returned by BidWithFallback when set.
+	// The string is the source returned ("ws"/"http"); empty means "use bids".
+	fallbackBids   map[string]float64
+	fallbackSource map[string]string
+	fallbackOK     map[string]bool
+	fallbackCalls  []string
+	subscribes     []string
+	unsubscribes   []string
+	listeners      []PriceUpdateListener
 }
 
 func newFakeFeed() *fakeFeed {
-	return &fakeFeed{bids: make(map[string]float64)}
+	return &fakeFeed{
+		bids:           make(map[string]float64),
+		fallbackBids:   make(map[string]float64),
+		fallbackSource: make(map[string]string),
+		fallbackOK:     make(map[string]bool),
+	}
 }
 
 func (f *fakeFeed) Subscribe(tokenID string) {
@@ -119,6 +130,28 @@ func (f *fakeFeed) BestBid(tokenID string) (float64, bool) {
 	return p, ok
 }
 
+func (f *fakeFeed) BidWithFallback(tokenID string, _ time.Duration) (float64, string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fallbackCalls = append(f.fallbackCalls, tokenID)
+	if p, isSet := f.fallbackBids[tokenID]; isSet {
+		src := f.fallbackSource[tokenID]
+		if src == "" {
+			src = "http"
+		}
+		ok, hasOK := f.fallbackOK[tokenID]
+		if !hasOK {
+			ok = true
+		}
+		return p, src, ok
+	}
+	// Default: mirror the WS bid if available, source "ws".
+	if p, ok := f.bids[tokenID]; ok {
+		return p, "ws", true
+	}
+	return 0, "http", false
+}
+
 func (f *fakeFeed) OnUpdate(l PriceUpdateListener) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -129,6 +162,17 @@ func (f *fakeFeed) setBid(tokenID string, price float64) {
 	f.mu.Lock()
 	f.bids[tokenID] = price
 	f.mu.Unlock()
+}
+
+// setFallbackBid forces BidWithFallback to return (price, source, ok) for
+// tokenID regardless of the WS-cached bid. Used in ticker tests to simulate a
+// silent WS where BestBid is stale but the HTTP fallback returns a fresh value.
+func (f *fakeFeed) setFallbackBid(tokenID string, price float64, source string, ok bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fallbackBids[tokenID] = price
+	f.fallbackSource[tokenID] = source
+	f.fallbackOK[tokenID] = ok
 }
 
 func (f *fakeFeed) emit(tokenID string) {
@@ -489,4 +533,193 @@ func TestSLTPMonitor_ConcurrentUpdatesFireOnce(t *testing.T) {
 	if len(exec.calls) != 1 {
 		t.Errorf("expected exactly 1 fire under concurrent updates, got %d", len(exec.calls))
 	}
+}
+
+// --- ticker tests (sltp-silent-feed-fix) ---
+
+// fastTickMonitor builds a monitor with a near-instant tick interval so tests
+// don't have to wait. Tests must call Start() to launch the tick loop.
+func fastTickMonitor(store SLTPArmStore, feed PriceFeedSubscriber, exec TradeExecutor, notif Notifier, paused PauseWindow) *SLTPMonitor {
+	m := NewSLTPMonitor(store, feed, exec, notif, paused)
+	m.tickInterval = 5 * time.Millisecond
+	return m
+}
+
+func TestSLTPMonitor_Tick_FiresSLWhenWSBidIsStale(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	// SL threshold = 0.10 * 0.70 = 0.07
+	store.seed(&database.SLTPArm{ID: 30, TelegramID: 9, TokenID: "L", AvgPrice: 0.10, SharesAtArm: 900, TPArmed: true, SLArmed: true})
+
+	feed := newFakeFeed()
+	// Stale WS bid would not have triggered SL (above threshold), but the
+	// fallback returns the live HTTP value below threshold.
+	feed.setBid("L", 0.10)
+	feed.setFallbackBid("L", 0.06, "http", true)
+
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m := fastTickMonitor(store, feed, exec, notif, nil)
+	defer m.Stop()
+	_ = m.Start()
+
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.fires) == 1
+	})
+
+	notif.mu.Lock()
+	defer notif.mu.Unlock()
+	if notif.fires[0].kind != "SL" {
+		t.Errorf("expected SL fire, got kind=%s", notif.fires[0].kind)
+	}
+	if notif.fires[0].bid != 0.06 {
+		t.Errorf("expected fire bid=0.06 (from HTTP), got %v", notif.fires[0].bid)
+	}
+}
+
+func TestSLTPMonitor_Tick_FiresTPWhenWSBidIsStale(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	// TP threshold = 0.10 * 2.0 = 0.20
+	store.seed(&database.SLTPArm{ID: 31, TelegramID: 11, TokenID: "M", AvgPrice: 0.10, SharesAtArm: 500, TPArmed: true, SLArmed: true})
+
+	feed := newFakeFeed()
+	feed.setBid("M", 0.15) // stale, below TP
+	feed.setFallbackBid("M", 0.25, "http", true)
+
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m := fastTickMonitor(store, feed, exec, notif, nil)
+	defer m.Stop()
+	_ = m.Start()
+
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.fires) == 1
+	})
+
+	notif.mu.Lock()
+	defer notif.mu.Unlock()
+	if notif.fires[0].kind != "TP" {
+		t.Errorf("expected TP fire, got kind=%s", notif.fires[0].kind)
+	}
+}
+
+func TestSLTPMonitor_Tick_NoFireBetweenThresholds(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	// TP=0.40, SL=0.14
+	store.seed(&database.SLTPArm{ID: 32, TelegramID: 12, TokenID: "N", AvgPrice: 0.20, SharesAtArm: 100, TPArmed: true, SLArmed: true})
+
+	feed := newFakeFeed()
+	feed.setFallbackBid("N", 0.25, "http", true) // safe band
+
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m := fastTickMonitor(store, feed, exec, notif, nil)
+	defer m.Stop()
+	_ = m.Start()
+
+	// Allow several ticks to fire.
+	time.Sleep(50 * time.Millisecond)
+
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	if len(exec.calls) != 0 {
+		t.Errorf("expected no fires for bid in safe band, got %d", len(exec.calls))
+	}
+	notif.mu.Lock()
+	defer notif.mu.Unlock()
+	if len(notif.fires) != 0 {
+		t.Errorf("expected no notifications, got %d", len(notif.fires))
+	}
+}
+
+func TestSLTPMonitor_Tick_NoFireWhenFallbackNotOK(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 33, TelegramID: 13, TokenID: "O", AvgPrice: 0.10, SharesAtArm: 100, TPArmed: false, SLArmed: true})
+
+	feed := newFakeFeed()
+	// HTTP fetcher errored: ok=false. Don't fire even though SL would otherwise trip.
+	feed.setFallbackBid("O", 0, "http", false)
+
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m := fastTickMonitor(store, feed, exec, notif, nil)
+	defer m.Stop()
+	_ = m.Start()
+
+	time.Sleep(50 * time.Millisecond)
+
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	if len(exec.calls) != 0 {
+		t.Errorf("expected no fires when fallback returns ok=false, got %d", len(exec.calls))
+	}
+}
+
+func TestSLTPMonitor_Tick_RespectsPauseWindow(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 34, TelegramID: 14, TokenID: "P", AvgPrice: 0.10, SharesAtArm: 100, TPArmed: true, SLArmed: true})
+
+	feed := newFakeFeed()
+	feed.setFallbackBid("P", 0.06, "http", true) // would trip SL
+
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	always := func(time.Time) bool { return true }
+	m := fastTickMonitor(store, feed, exec, notif, always)
+	defer m.Stop()
+	_ = m.Start()
+
+	// Pause notifier should be invoked at least once for this user.
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.paused) >= 1
+	})
+
+	// And the executor must NOT have been called.
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	if len(exec.calls) != 0 {
+		t.Errorf("expected no fires while paused, got %d", len(exec.calls))
+	}
+
+	// The pause notification should be deduped per user (at most one).
+	notif.mu.Lock()
+	defer notif.mu.Unlock()
+	count := 0
+	for _, id := range notif.paused {
+		if id == 14 {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected exactly 1 pause notice for user 14, got %d", count)
+	}
+}
+
+func TestSLTPMonitor_Tick_StopsCleanlyOnContextCancel(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 35, TelegramID: 15, TokenID: "Q", AvgPrice: 0.10, SharesAtArm: 100, TPArmed: true, SLArmed: true})
+
+	feed := newFakeFeed()
+	feed.setFallbackBid("Q", 0.15, "http", true) // safe band, no fire
+
+	exec := &fakeExecutor{}
+	m := fastTickMonitor(store, feed, exec, &fakeNotifier{}, nil)
+	_ = m.Start()
+	// Let a few ticks happen, then Stop. If tickLoop leaks, race detector / -count
+	// runs would catch it.
+	time.Sleep(20 * time.Millisecond)
+	m.Stop()
+	// Sleep past several would-be tick deadlines; nothing should panic or race.
+	time.Sleep(20 * time.Millisecond)
 }

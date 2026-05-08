@@ -49,6 +49,11 @@ type PriceFeedManager struct {
 	listeners      []PriceUpdateListener
 	lastMsgAt      time.Time
 	disconnectedAt time.Time
+	// lastUpdateAt tracks the wall time of the most recent book or price_change
+	// applied for each subscribed tokenID. Used to detect a per-token silent feed
+	// (the connection-level lastMsgAt is kept fresh by PONGs even when no book
+	// events flow for a specific token).
+	lastUpdateAt map[string]time.Time
 }
 
 // NewPriceFeedManager creates a manager using the production CLOB market WS URL.
@@ -60,12 +65,13 @@ func NewPriceFeedManager(fetcher orderBookFetcher) *PriceFeedManager {
 func newPriceFeedManagerWithURL(fetcher orderBookFetcher, wsURL string) *PriceFeedManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &PriceFeedManager{
-		ctx:      ctx,
-		cancel:   cancel,
-		fetcher:  fetcher,
-		wsURL:    wsURL,
-		subCount: make(map[string]int),
-		books:    make(map[string]*bookState),
+		ctx:          ctx,
+		cancel:       cancel,
+		fetcher:      fetcher,
+		wsURL:        wsURL,
+		subCount:     make(map[string]int),
+		books:        make(map[string]*bookState),
+		lastUpdateAt: make(map[string]time.Time),
 	}
 }
 
@@ -116,6 +122,7 @@ func (m *PriceFeedManager) Unsubscribe(tokenID string) {
 	if zero {
 		delete(m.subCount, tokenID)
 		delete(m.books, tokenID)
+		delete(m.lastUpdateAt, tokenID)
 	}
 	m.mu.Unlock()
 
@@ -142,6 +149,32 @@ func (m *PriceFeedManager) BestBid(tokenID string) (float64, bool) {
 		return 0, false
 	}
 	return book.BestBid()
+}
+
+// BidWithFallback returns the best bid for tokenID with an HTTP backstop:
+//   - if the WS-cached book has a positive bid AND the per-token last update is
+//     within maxAge, returns that bid with source "ws"
+//   - otherwise issues an HTTP fetch and returns its bid with source "http"
+//
+// This is the read path for the SL/TP monitor's periodic tick: a per-token
+// staleness check is needed because connection-level health (lastMsgAt) is
+// kept fresh by PONGs even when one specific token's WS subscription goes
+// silent.
+func (m *PriceFeedManager) BidWithFallback(tokenID string, maxAge time.Duration) (float64, string, bool) {
+	m.mu.RLock()
+	book := m.books[tokenID]
+	lastUpd := m.lastUpdateAt[tokenID]
+	m.mu.RUnlock()
+
+	if book != nil && !lastUpd.IsZero() && time.Since(lastUpd) <= maxAge {
+		if bid, ok := book.BestBid(); ok && bid > 0 {
+			return bid, "ws", true
+		}
+	}
+	if bid, ok := m.httpBestBid(tokenID); ok {
+		return bid, "http", true
+	}
+	return 0, "http", false
 }
 
 // OnUpdate registers a listener invoked after each book snapshot or price_change
@@ -446,11 +479,19 @@ func parseWireChanges(changes []wirePriceChange) []PriceChange {
 func (m *PriceFeedManager) applyBookSnapshot(tokenID string, bids, asks []BookLevel) {
 	b := m.ensureBook(tokenID)
 	b.ApplyBook(bids, asks)
+	m.stampUpdate(tokenID)
 }
 
 func (m *PriceFeedManager) applyPriceChanges(tokenID string, changes []PriceChange) {
 	b := m.ensureBook(tokenID)
 	b.ApplyPriceChange(changes)
+	m.stampUpdate(tokenID)
+}
+
+func (m *PriceFeedManager) stampUpdate(tokenID string) {
+	m.mu.Lock()
+	m.lastUpdateAt[tokenID] = time.Now()
+	m.mu.Unlock()
 }
 
 func (m *PriceFeedManager) ensureBook(tokenID string) *bookState {

@@ -217,6 +217,134 @@ func TestPriceFeed_HTTPFallbackAfterDisconnect(t *testing.T) {
 	}
 }
 
+// TestPriceFeed_BidWithFallback_UsesWSWhenFresh verifies that a recent WS book
+// is used and no HTTP fetch is made.
+func TestPriceFeed_BidWithFallback_UsesWSWhenFresh(t *testing.T) {
+	t.Parallel()
+	f := newStubFetcher()
+	f.set("tokenF", &polymarket.OrderBook{
+		Bids: []polymarket.OrderBookEntry{{Price: 0.30, Size: 100}},
+	})
+	m := newPriceFeedManagerWithURL(f, "ws://unused")
+	defer m.Stop()
+
+	m.Subscribe("tokenF") // seeds book + stamps lastUpdateAt
+
+	// 1 fetch for the seed.
+	seedCalls := atomic.LoadInt32(&f.callCount)
+	bid, src, ok := m.BidWithFallback("tokenF", 1*time.Second)
+	if !ok || bid != 0.30 || src != "ws" {
+		t.Errorf("got bid=%v src=%s ok=%v, want 0.30 ws true", bid, src, ok)
+	}
+	if got := atomic.LoadInt32(&f.callCount); got != seedCalls {
+		t.Errorf("expected no extra HTTP fetch, got %d (seed=%d)", got, seedCalls)
+	}
+}
+
+// TestPriceFeed_BidWithFallback_FallsBackToHTTPWhenStale verifies that an
+// older-than-maxAge update triggers an HTTP fetch and returns its bid.
+func TestPriceFeed_BidWithFallback_FallsBackToHTTPWhenStale(t *testing.T) {
+	t.Parallel()
+	f := newStubFetcher()
+	f.set("tokenG", &polymarket.OrderBook{
+		Bids: []polymarket.OrderBookEntry{{Price: 0.07, Size: 50}},
+	})
+	m := newPriceFeedManagerWithURL(f, "ws://unused")
+	defer m.Stop()
+
+	m.Subscribe("tokenG") // initial seed at t=now
+
+	// Backdate the per-token timestamp to force stale path.
+	m.mu.Lock()
+	m.lastUpdateAt["tokenG"] = time.Now().Add(-1 * time.Hour)
+	m.mu.Unlock()
+
+	bid, src, ok := m.BidWithFallback("tokenG", 30*time.Second)
+	if !ok || bid != 0.07 || src != "http" {
+		t.Errorf("got bid=%v src=%s ok=%v, want 0.07 http true", bid, src, ok)
+	}
+	// 1 seed + 1 fallback.
+	if got := atomic.LoadInt32(&f.callCount); got < 2 {
+		t.Errorf("expected >=2 fetches (seed + fallback), got %d", got)
+	}
+}
+
+// TestPriceFeed_BidWithFallback_HTTPErrorReturnsNotOK verifies the not-ok
+// branch when the HTTP fetcher fails.
+func TestPriceFeed_BidWithFallback_HTTPErrorReturnsNotOK(t *testing.T) {
+	t.Parallel()
+	f := newStubFetcher()
+	m := newPriceFeedManagerWithURL(f, "ws://unused")
+	defer m.Stop()
+
+	// Don't seed; lastUpdateAt is zero so stale path runs immediately.
+	// Now make the fetcher error.
+	f.err = http.ErrServerClosed
+
+	bid, _, ok := m.BidWithFallback("tokenH", 30*time.Second)
+	if ok || bid != 0 {
+		t.Errorf("expected not-ok zero bid on HTTP error, got bid=%v ok=%v", bid, ok)
+	}
+}
+
+// TestPriceFeed_LastUpdateAt_StampedOnPriceChange verifies that the per-token
+// freshness timer is updated when a price_change applies, even with no book event.
+func TestPriceFeed_LastUpdateAt_StampedOnPriceChange(t *testing.T) {
+	t.Parallel()
+	f := newStubFetcher()
+	m := newPriceFeedManagerWithURL(f, "ws://unused")
+	defer m.Stop()
+
+	// Seed via subscribe.
+	f.set("tokenI", &polymarket.OrderBook{
+		Bids: []polymarket.OrderBookEntry{{Price: 0.10, Size: 100}},
+	})
+	m.Subscribe("tokenI")
+
+	// Backdate the seed stamp, then apply a price_change.
+	m.mu.Lock()
+	old := time.Now().Add(-1 * time.Hour)
+	m.lastUpdateAt["tokenI"] = old
+	m.mu.Unlock()
+
+	m.applyPriceChanges("tokenI", []PriceChange{{Price: 0.12, Size: 200, Side: "BUY"}})
+
+	m.mu.RLock()
+	stamped := m.lastUpdateAt["tokenI"]
+	m.mu.RUnlock()
+	if !stamped.After(old) {
+		t.Errorf("price_change should refresh lastUpdateAt; got %v vs %v", stamped, old)
+	}
+}
+
+// TestPriceFeed_LastUpdateAt_DroppedOnUnsubscribe verifies that token state is
+// fully dropped when the ref count reaches zero.
+func TestPriceFeed_LastUpdateAt_DroppedOnUnsubscribe(t *testing.T) {
+	t.Parallel()
+	f := newStubFetcher()
+	f.set("tokenJ", &polymarket.OrderBook{
+		Bids: []polymarket.OrderBookEntry{{Price: 0.20, Size: 50}},
+	})
+	m := newPriceFeedManagerWithURL(f, "ws://unused")
+	defer m.Stop()
+
+	m.Subscribe("tokenJ")
+	m.mu.RLock()
+	_, hadStamp := m.lastUpdateAt["tokenJ"]
+	m.mu.RUnlock()
+	if !hadStamp {
+		t.Fatal("expected lastUpdateAt to be stamped after Subscribe")
+	}
+
+	m.Unsubscribe("tokenJ")
+	m.mu.RLock()
+	_, stillThere := m.lastUpdateAt["tokenJ"]
+	m.mu.RUnlock()
+	if stillThere {
+		t.Error("expected lastUpdateAt to be cleared after final Unsubscribe")
+	}
+}
+
 // startMockWSServer spins up an httptest server that upgrades to WebSocket and
 // hands the connection to the provided handler.
 func startMockWSServer(t *testing.T, handler func(*websocket.Conn)) (*httptest.Server, string) {
