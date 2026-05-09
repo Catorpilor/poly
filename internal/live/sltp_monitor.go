@@ -218,8 +218,15 @@ func (m *SLTPMonitor) tickEvaluateAll() {
 	}
 }
 
-// evaluateArm checks TP then SL. At most one fires per call.
+// evaluateArm checks ceiling-TP, then 2× TP, then SL. At most one fires per
+// call. Ceiling check goes first so it supersedes the 50%-sell standard TP for
+// arms where both thresholds are close (e.g., avg_price ≈ 0.475 makes 2× ≈
+// 0.95 = ceiling).
 func (m *SLTPMonitor) evaluateArm(arm *database.SLTPArm, bid float64) {
+	if bid >= database.CeilingTPPrice {
+		m.fireCeilingTP(arm, bid)
+		return
+	}
 	if arm.TPArmed && bid >= arm.TPTriggerPrice() {
 		m.fireTP(arm, bid)
 		return
@@ -301,6 +308,38 @@ func (m *SLTPMonitor) fireSL(arm *database.SLTPArm, bid float64) {
 	m.notifier.NotifySLTPFired(arm.TelegramID, "SL", arm, bid, result)
 
 	// If no other users are armed on this token, drop the feed subscription.
+	rest, err := m.store.ListArmedByToken(m.ctx, arm.TokenID)
+	if err == nil && len(rest) == 0 {
+		m.feed.Unsubscribe(arm.TokenID)
+	}
+}
+
+// fireCeilingTP sells all remaining shares when the bid reaches CeilingTPPrice.
+// Behaviour mirrors fireSL (full disarm, sell remainder, drop feed sub) — the
+// difference is intent: SL is a downside exit, ceiling-TP is an upside exit
+// when there's no meaningful upside left to chase.
+func (m *SLTPMonitor) fireCeilingTP(arm *database.SLTPArm, bid float64) {
+	if err := m.store.Disarm(m.ctx, arm.TelegramID, arm.TokenID); err != nil {
+		if !errors.Is(err, repositories.ErrSLTPArmNotFound) {
+			log.Printf("SLTPMonitor: ceiling disarm for %d/%s: %v", arm.TelegramID, arm.TokenID, err)
+		}
+		return
+	}
+
+	remaining := arm.SharesAtArm
+	if !arm.TPArmed {
+		remaining = arm.SharesAtArm * (1 - database.TPSellFraction)
+	}
+	sharesRaw := int64(remaining * 1e6)
+	if sharesRaw <= 0 {
+		return
+	}
+
+	log.Printf("SLTPMonitor: TP-ceiling fire user=%d token=%s bid=%.4f sharesRaw=%d",
+		arm.TelegramID, arm.TokenID, bid, sharesRaw)
+	result := m.executor.ExecuteSell(m.ctx, arm, sharesRaw)
+	m.notifier.NotifySLTPFired(arm.TelegramID, "TP-ceiling", arm, bid, result)
+
 	rest, err := m.store.ListArmedByToken(m.ctx, arm.TokenID)
 	if err == nil && len(rest) == 0 {
 		m.feed.Unsubscribe(arm.TokenID)

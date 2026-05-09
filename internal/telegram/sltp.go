@@ -316,6 +316,13 @@ func (b *Bot) NotifySLTPFired(telegramID int64, kind string, arm *database.SLTPA
 					"SL (≤ $%.4f) still watching remainder.",
 				bid, database.TPSellFraction*100, arm.Outcome, arm.SLTriggerPrice(),
 			)
+		case "TP-ceiling":
+			text = fmt.Sprintf(
+				"🏁 *TP ceiling hit* at $%.4f (≥ $%.2f)\n\n"+
+					"Sold remaining %s shares — locking in upside, no point holding for the last few cents.\n"+
+					"Position fully disarmed.",
+				bid, database.CeilingTPPrice, arm.Outcome,
+			)
 		case "SL":
 			text = fmt.Sprintf(
 				"🛑 *SL hit* at $%.4f\n\n"+

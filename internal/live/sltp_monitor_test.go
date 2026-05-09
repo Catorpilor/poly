@@ -723,3 +723,147 @@ func TestSLTPMonitor_Tick_StopsCleanlyOnContextCancel(t *testing.T) {
 	// Sleep past several would-be tick deadlines; nothing should panic or race.
 	time.Sleep(20 * time.Millisecond)
 }
+
+// --- ceiling-TP tests ---
+
+// TestSLTPMonitor_CeilingTP_FullSnapshotWhenTPNotYetFired verifies that when
+// the bid hits CeilingTPPrice before standard TP has triggered, ALL of the
+// snapshot shares are sold and the arm is fully disarmed.
+func TestSLTPMonitor_CeilingTP_FullSnapshotWhenTPNotYetFired(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	// avg=0.30, so 2x TP would be 0.60 (well below ceiling).
+	arm := &database.SLTPArm{
+		ID: 40, TelegramID: 21, TokenID: "C1", AvgPrice: 0.30, SharesAtArm: 200,
+		TPArmed: true, SLArmed: true,
+	}
+	store.seed(arm)
+
+	feed := newFakeFeed()
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	_ = m.Start()
+
+	feed.setBid("C1", database.CeilingTPPrice)
+	feed.emit("C1")
+
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.fires) == 1
+	})
+
+	exec.mu.Lock()
+	shares := exec.calls[0].sharesRaw
+	exec.mu.Unlock()
+	if shares != int64(200*1e6) {
+		t.Errorf("expected ceiling sell 200e6 shares (full snapshot), got %d", shares)
+	}
+
+	notif.mu.Lock()
+	kind := notif.fires[0].kind
+	notif.mu.Unlock()
+	if kind != "TP-ceiling" {
+		t.Errorf("expected TP-ceiling notification kind, got %q", kind)
+	}
+
+	store.mu.Lock()
+	disarms := store.disarmCalls
+	clears := store.clearTPCalls
+	store.mu.Unlock()
+	if disarms != 1 {
+		t.Errorf("expected 1 disarm (ceiling fires full Disarm), got %d", disarms)
+	}
+	if clears != 0 {
+		t.Errorf("expected 0 ClearTP (ceiling supersedes 2x TP), got %d", clears)
+	}
+}
+
+// TestSLTPMonitor_CeilingTP_RemainingHalfWhenTPAlreadyFired verifies that when
+// standard TP already fired (TPArmed=false), the ceiling sells the remaining
+// 50% of the original snapshot.
+func TestSLTPMonitor_CeilingTP_RemainingHalfWhenTPAlreadyFired(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	// avg=0.20, so 2x TP would have already fired at 0.40 (well below ceiling).
+	// TPArmed=false reflects post-TP state; SL still watching the remainder.
+	arm := &database.SLTPArm{
+		ID: 41, TelegramID: 22, TokenID: "C2", AvgPrice: 0.20, SharesAtArm: 300,
+		TPArmed: false, SLArmed: true,
+	}
+	store.seed(arm)
+
+	feed := newFakeFeed()
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	_ = m.Start()
+
+	feed.setBid("C2", 0.97)
+	feed.emit("C2")
+
+	waitFor(t, func() bool {
+		exec.mu.Lock()
+		defer exec.mu.Unlock()
+		return len(exec.calls) == 1
+	})
+
+	exec.mu.Lock()
+	shares := exec.calls[0].sharesRaw
+	exec.mu.Unlock()
+	if shares != int64(300*0.50*1e6) {
+		t.Errorf("expected ceiling sell 150e6 shares (remaining half), got %d", shares)
+	}
+
+	notif.mu.Lock()
+	kind := notif.fires[0].kind
+	notif.mu.Unlock()
+	if kind != "TP-ceiling" {
+		t.Errorf("expected TP-ceiling notification kind, got %q", kind)
+	}
+}
+
+// TestSLTPMonitor_CeilingTP_DoesNotFireBelowThreshold verifies that bids
+// strictly less than CeilingTPPrice don't trigger the ceiling — only the 2x
+// rule applies in that range.
+func TestSLTPMonitor_CeilingTP_DoesNotFireBelowThreshold(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	arm := &database.SLTPArm{
+		ID: 42, TelegramID: 23, TokenID: "C3", AvgPrice: 0.30, SharesAtArm: 100,
+		TPArmed: true, SLArmed: true,
+	}
+	store.seed(arm)
+
+	feed := newFakeFeed()
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	_ = m.Start()
+
+	// Just below ceiling (0.9499 < 0.95). 2x TP threshold is 0.60, so standard
+	// TP fires here (50% sale), not the ceiling.
+	feed.setBid("C3", 0.9499)
+	feed.emit("C3")
+
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.fires) == 1
+	})
+
+	notif.mu.Lock()
+	kind := notif.fires[0].kind
+	notif.mu.Unlock()
+	if kind != "TP" {
+		t.Errorf("expected standard TP fire just below ceiling, got %q", kind)
+	}
+
+	exec.mu.Lock()
+	shares := exec.calls[0].sharesRaw
+	exec.mu.Unlock()
+	if shares != int64(100*database.TPSellFraction*1e6) {
+		t.Errorf("expected standard TP half-sell 50e6 shares, got %d", shares)
+	}
+}

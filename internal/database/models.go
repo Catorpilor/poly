@@ -160,6 +160,11 @@ const SLMultiplier = 0.70
 // TPSellFraction is the fraction of current shares sold on a TP fire.
 const TPSellFraction = 0.50
 
+// CeilingTPPrice is the bid threshold at which the monitor sells ALL remaining
+// shares regardless of avg_price. At this level the upside (resolve = $1.00)
+// is capped at ~5%, which isn't worth the resolution-day risk.
+const CeilingTPPrice = 0.95
+
 // TPTriggerPrice returns the bid threshold for TP on this arm, capped at 0.99.
 func (a *SLTPArm) TPTriggerPrice() float64 {
 	p := a.AvgPrice * TPMultiplier
