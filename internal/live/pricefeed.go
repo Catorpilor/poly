@@ -323,6 +323,7 @@ func (m *PriceFeedManager) resubscribeAll() {
 		log.Printf("PriceFeedManager: marshal subscribe: %v", err)
 		return
 	}
+	log.Printf("[WS-DIAG] subscribe send (%d ids): %s", len(ids), string(b))
 	if err := conn.WriteMessage(websocket.TextMessage, b); err != nil {
 		log.Printf("PriceFeedManager: write subscribe: %v", err)
 	}
@@ -413,7 +414,15 @@ func (m *PriceFeedManager) dispatchMessage(data []byte) {
 	case '{':
 		m.dispatchEvent(data)
 	default:
-		// PONG or other non-JSON - ignore
+		// PONG or other non-JSON. Log non-PONG frames so we can spot
+		// subscription rejection / ack messages from the server.
+		s := strings.TrimSpace(string(data))
+		if !strings.EqualFold(s, "PONG") {
+			if len(s) > 256 {
+				s = s[:256] + "...(truncated)"
+			}
+			log.Printf("[WS-DIAG] non-JSON frame (%d bytes): %q", len(data), s)
+		}
 	}
 }
 
@@ -452,7 +461,14 @@ func (m *PriceFeedManager) dispatchEvent(raw json.RawMessage) {
 		m.applyPriceChanges(peek.AssetID, parseWireChanges(msg.Changes))
 		m.notify(peek.AssetID)
 	default:
-		// tick_size_change, last_trade_price, unknown — ignore in v1
+		// tick_size_change, last_trade_price, unknown — ignore in v1.
+		// Log so we can see what event types the server actually pushes.
+		raw := string(raw)
+		if len(raw) > 256 {
+			raw = raw[:256] + "...(truncated)"
+		}
+		log.Printf("[WS-DIAG] unhandled event_type=%q asset=%s raw=%s",
+			peek.EventType, peek.AssetID, raw)
 	}
 }
 
