@@ -345,6 +345,204 @@ func TestPriceFeed_LastUpdateAt_DroppedOnUnsubscribe(t *testing.T) {
 	}
 }
 
+// TestPriceFeed_LastTradePrice_SELL_UpdatesBid verifies that a SELL-side
+// last_trade_price overrides the HTTP-seeded book bid (since SELL trades hit
+// the best bid, the trade price is a direct bid observation).
+func TestPriceFeed_LastTradePrice_SELL_UpdatesBid(t *testing.T) {
+	t.Parallel()
+	f := newStubFetcher()
+	f.set("tokenLT1", &polymarket.OrderBook{
+		Bids: []polymarket.OrderBookEntry{{Price: 0.36, Size: 100}},
+	})
+	m := newPriceFeedManagerWithURL(f, "ws://unused")
+	defer m.Stop()
+
+	m.Subscribe("tokenLT1") // seeds book at 0.36
+
+	if got, ok := m.BestBid("tokenLT1"); !ok || got != 0.36 {
+		t.Fatalf("post-seed BestBid = %v ok=%v, want 0.36 true", got, ok)
+	}
+
+	m.applyLastTradePrice("tokenLT1", "0.20", "SELL")
+	if got, ok := m.BestBid("tokenLT1"); !ok || got != 0.20 {
+		t.Errorf("after SELL trade: BestBid = %v ok=%v, want 0.20 true", got, ok)
+	}
+}
+
+// TestPriceFeed_LastTradePrice_BUY_DoesNotChangeBid verifies that a BUY-side
+// last_trade_price (which hits the ask, not the bid) does NOT change the
+// returned bid value.
+func TestPriceFeed_LastTradePrice_BUY_DoesNotChangeBid(t *testing.T) {
+	t.Parallel()
+	f := newStubFetcher()
+	f.set("tokenLT2", &polymarket.OrderBook{
+		Bids: []polymarket.OrderBookEntry{{Price: 0.36, Size: 100}},
+	})
+	m := newPriceFeedManagerWithURL(f, "ws://unused")
+	defer m.Stop()
+
+	m.Subscribe("tokenLT2")
+
+	m.applyLastTradePrice("tokenLT2", "0.40", "BUY")
+	if got, ok := m.BestBid("tokenLT2"); !ok || got != 0.36 {
+		t.Errorf("after BUY trade: BestBid = %v ok=%v, want 0.36 true (BUY hits ask, not bid)", got, ok)
+	}
+}
+
+// TestPriceFeed_LastTradePrice_StampsLastUpdate verifies that both BUY and
+// SELL last_trade_price events advance the per-token freshness timestamp so
+// BidWithFallback's staleness check is satisfied.
+func TestPriceFeed_LastTradePrice_StampsLastUpdate(t *testing.T) {
+	t.Parallel()
+	for _, side := range []string{"SELL", "BUY"} {
+		side := side
+		t.Run(side, func(t *testing.T) {
+			t.Parallel()
+			f := newStubFetcher()
+			m := newPriceFeedManagerWithURL(f, "ws://unused")
+			defer m.Stop()
+
+			m.Subscribe("tok-" + side)
+			// Backdate to simulate an aged seed.
+			m.mu.Lock()
+			m.lastUpdateAt["tok-"+side] = time.Now().Add(-1 * time.Hour)
+			m.mu.Unlock()
+
+			m.applyLastTradePrice("tok-"+side, "0.50", side)
+
+			m.mu.RLock()
+			stamp := m.lastUpdateAt["tok-"+side]
+			m.mu.RUnlock()
+			if time.Since(stamp) > 5*time.Second {
+				t.Errorf("%s side did not refresh lastUpdateAt; got %v ago", side, time.Since(stamp))
+			}
+		})
+	}
+}
+
+// TestPriceFeed_LastTradePrice_NotifiesListeners verifies that listeners fire
+// on a last_trade_price event so the SLTPMonitor evaluates immediately.
+func TestPriceFeed_LastTradePrice_NotifiesListeners(t *testing.T) {
+	t.Parallel()
+	f := newStubFetcher()
+	m := newPriceFeedManagerWithURL(f, "ws://unused")
+	defer m.Stop()
+
+	m.Subscribe("tokenLT3")
+	var calls int32
+	m.OnUpdate(func(id string) {
+		if id == "tokenLT3" {
+			atomic.AddInt32(&calls, 1)
+		}
+	})
+
+	// Use the wire-format dispatch path to exercise the parser too.
+	raw := []byte(`{"event_type":"last_trade_price","asset_id":"tokenLT3","price":"0.30","side":"SELL"}`)
+	m.dispatchEvent(raw)
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("expected 1 listener call, got %d", got)
+	}
+	if got, ok := m.BestBid("tokenLT3"); !ok || got != 0.30 {
+		t.Errorf("expected BestBid=0.30 after parsing SELL trade; got %v ok=%v", got, ok)
+	}
+}
+
+// TestPriceFeed_BidWithFallback_PrefersTradeOverSeed confirms that when both
+// trade-derived and seed bids are present and fresh, BidWithFallback returns
+// the trade-derived value with source "ws".
+func TestPriceFeed_BidWithFallback_PrefersTradeOverSeed(t *testing.T) {
+	t.Parallel()
+	f := newStubFetcher()
+	f.set("tokenLT4", &polymarket.OrderBook{
+		Bids: []polymarket.OrderBookEntry{{Price: 0.36, Size: 100}},
+	})
+	m := newPriceFeedManagerWithURL(f, "ws://unused")
+	defer m.Stop()
+
+	m.Subscribe("tokenLT4")
+	m.applyLastTradePrice("tokenLT4", "0.20", "SELL")
+
+	bid, src, ok := m.BidWithFallback("tokenLT4", 30*time.Second)
+	if !ok || bid != 0.20 || src != "ws" {
+		t.Errorf("got bid=%v src=%s ok=%v, want 0.20 ws true", bid, src, ok)
+	}
+}
+
+// TestPriceFeed_DeferredConnect_NoSubsNoDial verifies that connectionLoop does
+// not dial the WS while subCount is empty (which would otherwise produce a
+// reconnect loop because Polymarket closes empty connections).
+func TestPriceFeed_DeferredConnect_NoSubsNoDial(t *testing.T) {
+	t.Parallel()
+	f := newStubFetcher()
+	// Point at an httptest server that records dial attempts but never
+	// upgrades — any dial would hang or fail and we'd see calls.
+	var dialAttempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&dialAttempts, 1)
+	}))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	m := newPriceFeedManagerWithURL(f, wsURL)
+	defer m.Stop()
+	m.Start()
+
+	// Wait long enough that, if the loop were dialing, we'd see attempts.
+	time.Sleep(150 * time.Millisecond)
+
+	if got := atomic.LoadInt32(&dialAttempts); got != 0 {
+		t.Errorf("expected 0 dial attempts with no subs, got %d", got)
+	}
+}
+
+// TestPriceFeed_DeferredConnect_ConnectsAfterSubscribe verifies that the
+// subscribe signal wakes connectionLoop and triggers a dial.
+func TestPriceFeed_DeferredConnect_ConnectsAfterSubscribe(t *testing.T) {
+	t.Parallel()
+	f := newStubFetcher()
+	f.set("tokenDC", &polymarket.OrderBook{})
+
+	srv, wsURL := startMockWSServer(t, func(c *websocket.Conn) {
+		// Echo subscribe receipt and hold the connection open.
+		_, _, _ = c.ReadMessage()
+		for {
+			if _, _, err := c.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer srv.Close()
+
+	m := newPriceFeedManagerWithURL(f, wsURL)
+	defer m.Stop()
+	m.Start()
+
+	// No dial yet.
+	time.Sleep(50 * time.Millisecond)
+	m.mu.RLock()
+	connectedBefore := m.connected
+	m.mu.RUnlock()
+	if connectedBefore {
+		t.Fatal("connection should not be established before any subscribe")
+	}
+
+	// Subscribe wakes the loop.
+	m.Subscribe("tokenDC")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		m.mu.RLock()
+		c := m.connected
+		m.mu.RUnlock()
+		if c {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("expected connection after Subscribe, never got connected")
+}
+
 // startMockWSServer spins up an httptest server that upgrades to WebSocket and
 // hands the connection to the provided handler.
 func startMockWSServer(t *testing.T, handler func(*websocket.Conn)) (*httptest.Server, string) {

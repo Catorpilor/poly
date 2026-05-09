@@ -49,11 +49,21 @@ type PriceFeedManager struct {
 	listeners      []PriceUpdateListener
 	lastMsgAt      time.Time
 	disconnectedAt time.Time
-	// lastUpdateAt tracks the wall time of the most recent book or price_change
-	// applied for each subscribed tokenID. Used to detect a per-token silent feed
-	// (the connection-level lastMsgAt is kept fresh by PONGs even when no book
-	// events flow for a specific token).
+	// lastUpdateAt tracks the wall time of the most recent WS event applied for
+	// each subscribed tokenID (book / price_change / last_trade_price). Used to
+	// detect a per-token silent feed — the connection-level lastMsgAt is kept
+	// fresh by PONGs even when no events flow for a specific token.
 	lastUpdateAt map[string]time.Time
+	// tradeBids holds the most recent SELL-side trade price observed via
+	// last_trade_price events. A SELL trade hits the best bid, so this is a
+	// fresh proxy for the live best-bid level — typically more accurate than
+	// the static HTTP seed in book once trading begins.
+	tradeBids map[string]float64
+	// subscribeSignal wakes connectionLoop the moment the first subscribe
+	// arrives. Polymarket's market WS forcibly closes connections that don't
+	// send a subscribe within a few seconds, so we don't dial until we have
+	// something to send.
+	subscribeSignal chan struct{}
 }
 
 // NewPriceFeedManager creates a manager using the production CLOB market WS URL.
@@ -65,13 +75,15 @@ func NewPriceFeedManager(fetcher orderBookFetcher) *PriceFeedManager {
 func newPriceFeedManagerWithURL(fetcher orderBookFetcher, wsURL string) *PriceFeedManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &PriceFeedManager{
-		ctx:          ctx,
-		cancel:       cancel,
-		fetcher:      fetcher,
-		wsURL:        wsURL,
-		subCount:     make(map[string]int),
-		books:        make(map[string]*bookState),
-		lastUpdateAt: make(map[string]time.Time),
+		ctx:             ctx,
+		cancel:          cancel,
+		fetcher:         fetcher,
+		wsURL:           wsURL,
+		subCount:        make(map[string]int),
+		books:           make(map[string]*bookState),
+		lastUpdateAt:    make(map[string]time.Time),
+		tradeBids:       make(map[string]float64),
+		subscribeSignal: make(chan struct{}, 1),
 	}
 }
 
@@ -107,6 +119,12 @@ func (m *PriceFeedManager) Subscribe(tokenID string) {
 		if err := m.seedBook(tokenID); err != nil {
 			log.Printf("PriceFeedManager: HTTP seed failed for %s: %v", tokenID, err)
 		}
+		// Wake the connection loop in case it's idle waiting for the first
+		// subscription. Non-blocking — buffered chan with cap 1.
+		select {
+		case m.subscribeSignal <- struct{}{}:
+		default:
+		}
 		m.resubscribeAll()
 	}
 }
@@ -123,6 +141,7 @@ func (m *PriceFeedManager) Unsubscribe(tokenID string) {
 		delete(m.subCount, tokenID)
 		delete(m.books, tokenID)
 		delete(m.lastUpdateAt, tokenID)
+		delete(m.tradeBids, tokenID)
 	}
 	m.mu.Unlock()
 
@@ -133,9 +152,16 @@ func (m *PriceFeedManager) Unsubscribe(tokenID string) {
 
 // BestBid returns the current best bid from local state. If the WS has been
 // disconnected longer than priceFeedFallbackThreshold, falls back to an HTTP fetch.
+//
+// Precedence (within local state): a SELL last_trade_price observation wins
+// over the static HTTP-seeded book. The market WS pushes last_trade_price
+// frames continuously; our book snapshot is only refreshed at subscribe time
+// (Polymarket rarely sends `book`/`price_change` on the market channel), so
+// the trade-derived bid is almost always the freshest signal.
 func (m *PriceFeedManager) BestBid(tokenID string) (float64, bool) {
 	m.mu.RLock()
 	book := m.books[tokenID]
+	tradeBid, hasTrade := m.tradeBids[tokenID]
 	connected := m.connected
 	discAt := m.disconnectedAt
 	m.mu.RUnlock()
@@ -144,6 +170,9 @@ func (m *PriceFeedManager) BestBid(tokenID string) (float64, bool) {
 		if price, ok := m.httpBestBid(tokenID); ok {
 			return price, true
 		}
+	}
+	if hasTrade && tradeBid > 0 {
+		return tradeBid, true
 	}
 	if book == nil {
 		return 0, false
@@ -163,12 +192,19 @@ func (m *PriceFeedManager) BestBid(tokenID string) (float64, bool) {
 func (m *PriceFeedManager) BidWithFallback(tokenID string, maxAge time.Duration) (float64, string, bool) {
 	m.mu.RLock()
 	book := m.books[tokenID]
+	tradeBid, hasTrade := m.tradeBids[tokenID]
 	lastUpd := m.lastUpdateAt[tokenID]
 	m.mu.RUnlock()
 
-	if book != nil && !lastUpd.IsZero() && time.Since(lastUpd) <= maxAge {
-		if bid, ok := book.BestBid(); ok && bid > 0 {
-			return bid, "ws", true
+	if !lastUpd.IsZero() && time.Since(lastUpd) <= maxAge {
+		// Trade-derived bid wins (see BestBid for rationale).
+		if hasTrade && tradeBid > 0 {
+			return tradeBid, "ws", true
+		}
+		if book != nil {
+			if bid, ok := book.BestBid(); ok && bid > 0 {
+				return bid, "ws", true
+			}
 		}
 	}
 	if bid, ok := m.httpBestBid(tokenID); ok {
@@ -233,6 +269,22 @@ func (m *PriceFeedManager) connectionLoop() {
 		case <-m.ctx.Done():
 			return
 		default:
+		}
+
+		// Don't dial until we have at least one subscription. Polymarket's
+		// market WS forcibly closes connections that don't send a subscribe
+		// frame within a few seconds — without this gate, an empty bot enters
+		// a tight reconnect loop.
+		m.mu.RLock()
+		hasSubs := len(m.subCount) > 0
+		m.mu.RUnlock()
+		if !hasSubs {
+			select {
+			case <-m.ctx.Done():
+				return
+			case <-m.subscribeSignal:
+			}
+			continue
 		}
 
 		if err := m.connect(); err != nil {
@@ -460,8 +512,22 @@ func (m *PriceFeedManager) dispatchEvent(raw json.RawMessage) {
 		}
 		m.applyPriceChanges(peek.AssetID, parseWireChanges(msg.Changes))
 		m.notify(peek.AssetID)
+	case "last_trade_price":
+		// A SELL trade hit the bid; the trade price is a fresh observation of
+		// the best-bid level. A BUY trade hit the ask and tells us nothing
+		// directly about the bid — stamp freshness only.
+		var msg struct {
+			Price string `json:"price"`
+			Side  string `json:"side"`
+		}
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			log.Printf("PriceFeedManager: parse last_trade_price: %v", err)
+			return
+		}
+		m.applyLastTradePrice(peek.AssetID, msg.Price, msg.Side)
+		m.notify(peek.AssetID)
 	default:
-		// tick_size_change, last_trade_price, unknown — ignore in v1.
+		// tick_size_change, unknown — ignore in v1.
 		// Log so we can see what event types the server actually pushes.
 		raw := string(raw)
 		if len(raw) > 256 {
@@ -470,6 +536,25 @@ func (m *PriceFeedManager) dispatchEvent(raw json.RawMessage) {
 		log.Printf("[WS-DIAG] unhandled event_type=%q asset=%s raw=%s",
 			peek.EventType, peek.AssetID, raw)
 	}
+}
+
+// applyLastTradePrice updates per-token state from a last_trade_price event.
+// Both sides stamp lastUpdateAt (heartbeat for the staleness check). Only SELL
+// trades update tradeBids — those are direct observations of the best bid.
+func (m *PriceFeedManager) applyLastTradePrice(tokenID, priceStr, side string) {
+	price, err := strconv.ParseFloat(priceStr, 64)
+	if err != nil || price <= 0 {
+		// Garbage price — still stamp freshness so the staleness check
+		// passes, but don't pollute tradeBids.
+		m.stampUpdate(tokenID)
+		return
+	}
+	m.mu.Lock()
+	if strings.EqualFold(side, "SELL") {
+		m.tradeBids[tokenID] = price
+	}
+	m.lastUpdateAt[tokenID] = time.Now()
+	m.mu.Unlock()
 }
 
 func parseWireLevels(levels []wireBookLevel) []BookLevel {
