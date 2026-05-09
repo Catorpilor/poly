@@ -37,6 +37,10 @@ type SLTPArmRepository interface {
 	// ListArmedTokenIDs returns the distinct token IDs with any armed row.
 	// Used by the monitor to seed WebSocket subscriptions on startup.
 	ListArmedTokenIDs(ctx context.Context) ([]string, error)
+
+	// SetLotteryTicket flips the lottery_ticket_armed flag for an existing
+	// arm. Returns ErrSLTPArmNotFound if no arm exists for the user/token.
+	SetLotteryTicket(ctx context.Context, telegramID int64, tokenID string, on bool) error
 }
 
 type sltpArmRepo struct {
@@ -49,13 +53,15 @@ func NewSLTPArmRepository(db *database.DB) SLTPArmRepository {
 }
 
 const sltpArmColumns = `id, telegram_id, token_id, condition_id, market_id, outcome,
-		avg_price, shares_at_arm, tp_armed, sl_armed, neg_risk, created_at, updated_at`
+		avg_price, shares_at_arm, tp_armed, sl_armed, neg_risk, lottery_ticket_armed,
+		created_at, updated_at`
 
 func scanArm(row pgx.Row) (*database.SLTPArm, error) {
 	a := &database.SLTPArm{}
 	if err := row.Scan(
 		&a.ID, &a.TelegramID, &a.TokenID, &a.ConditionID, &a.MarketID, &a.Outcome,
-		&a.AvgPrice, &a.SharesAtArm, &a.TPArmed, &a.SLArmed, &a.NegRisk, &a.CreatedAt, &a.UpdatedAt,
+		&a.AvgPrice, &a.SharesAtArm, &a.TPArmed, &a.SLArmed, &a.NegRisk, &a.LotteryTicketArmed,
+		&a.CreatedAt, &a.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -143,6 +149,19 @@ func (r *sltpArmRepo) ListArmed(ctx context.Context) ([]*database.SLTPArm, error
 func (r *sltpArmRepo) ListArmedByToken(ctx context.Context, tokenID string) ([]*database.SLTPArm, error) {
 	query := `SELECT ` + sltpArmColumns + ` FROM sltp_arms WHERE token_id = $1 AND (tp_armed OR sl_armed) ORDER BY id`
 	return r.queryList(ctx, query, tokenID)
+}
+
+func (r *sltpArmRepo) SetLotteryTicket(ctx context.Context, telegramID int64, tokenID string, on bool) error {
+	query := `UPDATE sltp_arms SET lottery_ticket_armed = $3
+		WHERE telegram_id = $1 AND token_id = $2`
+	tag, err := r.db.Pool.Exec(ctx, query, telegramID, tokenID, on)
+	if err != nil {
+		return fmt.Errorf("failed to set lottery_ticket_armed: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrSLTPArmNotFound
+	}
+	return nil
 }
 
 func (r *sltpArmRepo) ListArmedTokenIDs(ctx context.Context) ([]string, error) {

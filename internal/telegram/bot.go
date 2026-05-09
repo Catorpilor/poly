@@ -1013,6 +1013,9 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, update *tgbotapi.Update) 
 	case strings.HasPrefix(data, "sltp:off:"):
 		b.handleSLTPDisarmCallback(ctx, update)
 
+	case strings.HasPrefix(data, "sltp:lot:"):
+		b.handleSLTPLotteryCallback(ctx, update)
+
 	default:
 		log.Printf("Unknown callback data: %s", data)
 	}

@@ -136,19 +136,23 @@ type PriceAlert struct {
 // avg_price and shares_at_arm are snapshotted at arm time so threshold evaluation is
 // deterministic and independent of later Data API drift.
 type SLTPArm struct {
-	ID           int       `json:"id" db:"id"`
-	TelegramID   int64     `json:"telegram_id" db:"telegram_id"`
-	TokenID      string    `json:"token_id" db:"token_id"`
-	ConditionID  string    `json:"condition_id" db:"condition_id"`
-	MarketID     *string   `json:"market_id" db:"market_id"`
-	Outcome      Outcome   `json:"outcome" db:"outcome"`
-	AvgPrice     float64   `json:"avg_price" db:"avg_price"`
-	SharesAtArm  float64   `json:"shares_at_arm" db:"shares_at_arm"`
-	TPArmed      bool      `json:"tp_armed" db:"tp_armed"`
-	SLArmed      bool      `json:"sl_armed" db:"sl_armed"`
-	NegRisk      bool      `json:"neg_risk" db:"neg_risk"`
-	CreatedAt    time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
+	ID                 int       `json:"id" db:"id"`
+	TelegramID         int64     `json:"telegram_id" db:"telegram_id"`
+	TokenID            string    `json:"token_id" db:"token_id"`
+	ConditionID        string    `json:"condition_id" db:"condition_id"`
+	MarketID           *string   `json:"market_id" db:"market_id"`
+	Outcome            Outcome   `json:"outcome" db:"outcome"`
+	AvgPrice           float64   `json:"avg_price" db:"avg_price"`
+	SharesAtArm        float64   `json:"shares_at_arm" db:"shares_at_arm"`
+	TPArmed            bool      `json:"tp_armed" db:"tp_armed"`
+	SLArmed            bool      `json:"sl_armed" db:"sl_armed"`
+	NegRisk            bool      `json:"neg_risk" db:"neg_risk"`
+	// LotteryTicketArmed: when the ceiling-TP fires, optionally also attempt a
+	// FOK BUY of the OPPOSITE token at <= LotteryMaxPrice with up to
+	// LotteryMaxSpend USDC. Cheap "what if it flips" insurance.
+	LotteryTicketArmed bool      `json:"lottery_ticket_armed" db:"lottery_ticket_armed"`
+	CreatedAt          time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // TPMultiplier is the fixed v1 take-profit multiplier: trigger when bid >= avg_price * TPMultiplier.
@@ -164,6 +168,14 @@ const TPSellFraction = 0.50
 // shares regardless of avg_price. At this level the upside (resolve = $1.00)
 // is capped at ~5%, which isn't worth the resolution-day risk.
 const CeilingTPPrice = 0.95
+
+// LotteryMaxPrice is the highest ask we'll pay for a lottery-ticket BUY on the
+// opposite token after a ceiling-TP fire.
+const LotteryMaxPrice = 0.05
+
+// LotteryMaxSpend is the absolute USDC cap for a single lottery-ticket BUY.
+// At LotteryMaxPrice this implies a 100-share max take.
+const LotteryMaxSpend = 5.0
 
 // TPTriggerPrice returns the bid threshold for TP on this arm, capped at 0.99.
 func (a *SLTPArm) TPTriggerPrice() float64 {

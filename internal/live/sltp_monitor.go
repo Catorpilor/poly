@@ -3,6 +3,7 @@ package live
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -29,6 +30,9 @@ type PriceFeedSubscriber interface {
 	Subscribe(tokenID string)
 	Unsubscribe(tokenID string)
 	BestBid(tokenID string) (float64, bool)
+	// BestAsk returns the lowest live ask for tokenID. Used by the lottery
+	// flow to gate a BUY of the opposite token.
+	BestAsk(tokenID string) (float64, bool)
 	// BidWithFallback returns the freshest available bid: WS if the per-token
 	// last update is within maxAge, else an HTTP fetch. Used by the periodic
 	// tick to backstop a silent WS subscription.
@@ -36,11 +40,31 @@ type PriceFeedSubscriber interface {
 	OnUpdate(PriceUpdateListener)
 }
 
-// TradeExecutor performs a SELL on behalf of a user. Implementations resolve
-// wallet, proxy address, API credentials, and fee parameters from the arm.
+// TradeExecutor performs SELL / lottery-BUY on behalf of a user.
+// Implementations resolve wallet, proxy address, API credentials, and fee
+// parameters from the arm.
 type TradeExecutor interface {
 	ExecuteSell(ctx context.Context, arm *database.SLTPArm, sharesRaw int64) *polymarket.TradeResult
+
+	// ExecuteLotteryBuy attempts a FOK BUY of otherTokenID at price <=
+	// maxPrice for at most maxSpend USDC. Used by the ceiling-TP fire path
+	// when the user has lottery_ticket_armed = true. The arm is passed for
+	// context (telegramID, market resolution) but otherTokenID is the actual
+	// token being purchased — NOT arm.TokenID.
+	ExecuteLotteryBuy(ctx context.Context, arm *database.SLTPArm,
+		otherTokenID string, otherOutcome string,
+		maxSpend float64, maxPrice float64) *polymarket.TradeResult
+
+	// ResolveOtherToken returns the second CTF token for the binary market
+	// containing arm.TokenID, plus its outcome name. Returns ErrMultiOutcome
+	// when the market has != 2 outcomes (the lottery feature only applies to
+	// binary markets).
+	ResolveOtherToken(ctx context.Context, arm *database.SLTPArm) (otherTokenID, otherOutcome string, err error)
 }
+
+// ErrMultiOutcome signals that lottery-ticket BUY isn't supported for this
+// market because there's no single "other side".
+var ErrMultiOutcome = errors.New("multi-outcome market: no single other side")
 
 // Notifier sends SL/TP fire and pause notifications to users.
 type Notifier interface {
@@ -48,7 +72,14 @@ type Notifier interface {
 	// NotifySLTPPaused is sent at most once per user while the pause window is
 	// active, so users understand why their arms aren't firing.
 	NotifySLTPPaused(telegramID int64, arm *database.SLTPArm)
+	// NotifyLottery describes the outcome of a lottery-ticket attempt:
+	//   - reason="filled" with non-nil result: success
+	//   - reason="ask-too-high" / "multi-outcome" / etc. with detail: skipped
+	//   - reason="failed" with non-nil result: order rejected by exchange
+	NotifyLottery(telegramID int64, arm *database.SLTPArm, otherOutcome string,
+		reason string, detail string, result *polymarket.TradeResult)
 }
+
 
 // PauseWindow returns true when the monitor must skip evaluation (e.g., V2 cutover).
 type PauseWindow func(now time.Time) bool
@@ -340,8 +371,68 @@ func (m *SLTPMonitor) fireCeilingTP(arm *database.SLTPArm, bid float64) {
 	result := m.executor.ExecuteSell(m.ctx, arm, sharesRaw)
 	m.notifier.NotifySLTPFired(arm.TelegramID, "TP-ceiling", arm, bid, result)
 
+	// Lottery ticket: cheap insurance on the losing side. Only attempt when
+	// the SELL succeeded (otherwise the user might think we doubled down on a
+	// failed exit).
+	if arm.LotteryTicketArmed && result != nil && result.Success {
+		m.tryLotteryBuy(arm)
+	}
+
 	rest, err := m.store.ListArmedByToken(m.ctx, arm.TokenID)
 	if err == nil && len(rest) == 0 {
 		m.feed.Unsubscribe(arm.TokenID)
 	}
+}
+
+// tryLotteryBuy is invoked after a successful ceiling-TP SELL. Resolves the
+// opposite token, checks its ask is below LotteryMaxPrice, and attempts a FOK
+// BUY for up to LotteryMaxSpend USDC. Every outcome (success, skip, failure)
+// is reported via NotifyLottery — never silent.
+func (m *SLTPMonitor) tryLotteryBuy(arm *database.SLTPArm) {
+	otherTokenID, otherOutcome, err := m.executor.ResolveOtherToken(m.ctx, arm)
+	if err != nil {
+		if errors.Is(err, ErrMultiOutcome) {
+			m.notifier.NotifyLottery(arm.TelegramID, arm, "",
+				"multi-outcome", "market has more than 2 outcomes", nil)
+			return
+		}
+		log.Printf("SLTPMonitor: lottery resolve other token for arm %d: %v", arm.ID, err)
+		m.notifier.NotifyLottery(arm.TelegramID, arm, "",
+			"resolve-failed", err.Error(), nil)
+		return
+	}
+
+	ask, ok := m.feed.BestAsk(otherTokenID)
+	if !ok {
+		m.notifier.NotifyLottery(arm.TelegramID, arm, otherOutcome,
+			"no-liquidity", "no ask available for other token", nil)
+		return
+	}
+	if ask > database.LotteryMaxPrice {
+		m.notifier.NotifyLottery(arm.TelegramID, arm, otherOutcome,
+			"ask-too-high", fmt.Sprintf("best ask $%.4f > $%.2f cap", ask, database.LotteryMaxPrice), nil)
+		return
+	}
+
+	log.Printf("SLTPMonitor: lottery BUY attempt user=%d arm=%d otherToken=%s ask=%.4f",
+		arm.TelegramID, arm.ID, otherTokenID, ask)
+	result := m.executor.ExecuteLotteryBuy(m.ctx, arm, otherTokenID, otherOutcome,
+		database.LotteryMaxSpend, database.LotteryMaxPrice)
+	if result != nil && result.Success {
+		m.notifier.NotifyLottery(arm.TelegramID, arm, otherOutcome,
+			"filled", "", result)
+	} else {
+		m.notifier.NotifyLottery(arm.TelegramID, arm, otherOutcome,
+			"failed", lotteryErrMsg(result), result)
+	}
+}
+
+func lotteryErrMsg(result *polymarket.TradeResult) string {
+	if result == nil {
+		return "executor returned no result"
+	}
+	if result.ErrorMsg != "" {
+		return result.ErrorMsg
+	}
+	return "rejected by exchange"
 }

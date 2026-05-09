@@ -180,6 +180,55 @@ func (m *PriceFeedManager) BestBid(tokenID string) (float64, bool) {
 	return book.BestBid()
 }
 
+// BestAsk returns the lowest live ask for tokenID. If the WS book has been
+// recently updated, uses the in-memory book; otherwise falls back to an HTTP
+// fetch. Used by the lottery-ticket flow to decide whether the opposite token
+// is cheap enough to buy.
+func (m *PriceFeedManager) BestAsk(tokenID string) (float64, bool) {
+	m.mu.RLock()
+	book := m.books[tokenID]
+	lastUpd := m.lastUpdateAt[tokenID]
+	m.mu.RUnlock()
+
+	// Trust the WS book when recently updated. Note: last_trade_price events
+	// don't update the asks side of the book (they're trade prints), so the
+	// HTTP fallback below is the more common path here.
+	if book != nil && !lastUpd.IsZero() && time.Since(lastUpd) <= sltpAskFreshness {
+		if ask, ok := book.BestAsk(); ok && ask > 0 {
+			return ask, true
+		}
+	}
+	return m.httpBestAsk(tokenID)
+}
+
+// httpBestAsk fetches the orderbook via HTTP and returns the lowest ask price
+// with positive size.
+func (m *PriceFeedManager) httpBestAsk(tokenID string) (float64, bool) {
+	ctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
+	defer cancel()
+	ob, err := m.fetcher.GetOrderBook(ctx, tokenID)
+	if err != nil {
+		log.Printf("PriceFeedManager: HTTP best-ask fetch for %s: %v", tokenID, err)
+		return 0, false
+	}
+	var best float64
+	found := false
+	for _, lvl := range ob.Asks {
+		if lvl.Size <= 0 {
+			continue
+		}
+		if !found || lvl.Price < best {
+			best = lvl.Price
+			found = true
+		}
+	}
+	return best, found
+}
+
+// sltpAskFreshness is how recent a WS update for a token must be before
+// BestAsk trusts the cached book over an HTTP refetch.
+const sltpAskFreshness = 30 * time.Second
+
 // BidWithFallback returns the best bid for tokenID with an HTTP backstop:
 //   - if the WS-cached book has a positive bid AND the per-token last update is
 //     within maxAge, returns that bid with source "ws"

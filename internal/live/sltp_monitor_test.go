@@ -2,6 +2,7 @@ package live
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -91,6 +92,7 @@ func (s *fakeStore) Disarm(_ context.Context, telegramID int64, tokenID string) 
 type fakeFeed struct {
 	mu            sync.Mutex
 	bids          map[string]float64
+	asks          map[string]float64
 	// fallbackBids overrides the value returned by BidWithFallback when set.
 	// The string is the source returned ("ws"/"http"); empty means "use bids".
 	fallbackBids   map[string]float64
@@ -105,6 +107,7 @@ type fakeFeed struct {
 func newFakeFeed() *fakeFeed {
 	return &fakeFeed{
 		bids:           make(map[string]float64),
+		asks:           make(map[string]float64),
 		fallbackBids:   make(map[string]float64),
 		fallbackSource: make(map[string]string),
 		fallbackOK:     make(map[string]bool),
@@ -127,6 +130,13 @@ func (f *fakeFeed) BestBid(tokenID string) (float64, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p, ok := f.bids[tokenID]
+	return p, ok
+}
+
+func (f *fakeFeed) BestAsk(tokenID string) (float64, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.asks[tokenID]
 	return p, ok
 }
 
@@ -164,6 +174,12 @@ func (f *fakeFeed) setBid(tokenID string, price float64) {
 	f.mu.Unlock()
 }
 
+func (f *fakeFeed) setAsk(tokenID string, price float64) {
+	f.mu.Lock()
+	f.asks[tokenID] = price
+	f.mu.Unlock()
+}
+
 // setFallbackBid forces BidWithFallback to return (price, source, ok) for
 // tokenID regardless of the WS-cached bid. Used in ticker tests to simulate a
 // silent WS where BestBid is stale but the HTTP fallback returns a fresh value.
@@ -189,11 +205,27 @@ type fakeExecutor struct {
 	mu    sync.Mutex
 	calls []executorCall
 	ret   *polymarket.TradeResult
+
+	// Lottery-related fields. When unset, ResolveOtherToken returns the
+	// configured "<armToken>-other" stub and ExecuteLotteryBuy succeeds.
+	otherTokenID    string
+	otherOutcome    string
+	resolveErr      error
+	lotteryRet      *polymarket.TradeResult
+	lotteryCalls    []lotteryCall
 }
 
 type executorCall struct {
 	armID     int
 	sharesRaw int64
+}
+
+type lotteryCall struct {
+	armID        int
+	otherTokenID string
+	otherOutcome string
+	maxSpend     float64
+	maxPrice     float64
 }
 
 func (e *fakeExecutor) ExecuteSell(_ context.Context, arm *database.SLTPArm, sharesRaw int64) *polymarket.TradeResult {
@@ -206,10 +238,54 @@ func (e *fakeExecutor) ExecuteSell(_ context.Context, arm *database.SLTPArm, sha
 	return &polymarket.TradeResult{Success: true, OrderID: "ord-stub"}
 }
 
+func (e *fakeExecutor) ResolveOtherToken(_ context.Context, arm *database.SLTPArm) (string, string, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.resolveErr != nil {
+		return "", "", e.resolveErr
+	}
+	other := e.otherTokenID
+	if other == "" {
+		other = arm.TokenID + "-other"
+	}
+	outcome := e.otherOutcome
+	if outcome == "" {
+		outcome = "OTHER"
+	}
+	return other, outcome, nil
+}
+
+func (e *fakeExecutor) ExecuteLotteryBuy(_ context.Context, arm *database.SLTPArm,
+	otherTokenID, otherOutcome string, maxSpend, maxPrice float64) *polymarket.TradeResult {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.lotteryCalls = append(e.lotteryCalls, lotteryCall{
+		armID:        arm.ID,
+		otherTokenID: otherTokenID,
+		otherOutcome: otherOutcome,
+		maxSpend:     maxSpend,
+		maxPrice:     maxPrice,
+	})
+	if e.lotteryRet != nil {
+		return e.lotteryRet
+	}
+	return &polymarket.TradeResult{Success: true, OrderID: "lot-stub", FilledSize: 100, AveragePrice: 0.04}
+}
+
 type fakeNotifier struct {
-	mu     sync.Mutex
-	fires  []fireNotice
-	paused []int64 // telegramIDs notified of pause
+	mu       sync.Mutex
+	fires    []fireNotice
+	paused   []int64 // telegramIDs notified of pause
+	lotteries []lotteryNotice
+}
+
+type lotteryNotice struct {
+	telegramID    int64
+	otherOutcome  string
+	reason        string
+	detail        string
+	hasResult     bool
+	resultSuccess bool
 }
 
 type fireNotice struct {
@@ -229,6 +305,23 @@ func (n *fakeNotifier) NotifySLTPPaused(telegramID int64, _ *database.SLTPArm) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.paused = append(n.paused, telegramID)
+}
+
+func (n *fakeNotifier) NotifyLottery(telegramID int64, _ *database.SLTPArm, otherOutcome,
+	reason, detail string, result *polymarket.TradeResult) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	notice := lotteryNotice{
+		telegramID:   telegramID,
+		otherOutcome: otherOutcome,
+		reason:       reason,
+		detail:       detail,
+	}
+	if result != nil {
+		notice.hasResult = true
+		notice.resultSuccess = result.Success
+	}
+	n.lotteries = append(n.lotteries, notice)
 }
 
 // waitFor polls cond until true or timeout; fails the test otherwise.
@@ -865,5 +958,260 @@ func TestSLTPMonitor_CeilingTP_DoesNotFireBelowThreshold(t *testing.T) {
 	exec.mu.Unlock()
 	if shares != int64(100*database.TPSellFraction*1e6) {
 		t.Errorf("expected standard TP half-sell 50e6 shares, got %d", shares)
+	}
+}
+
+// --- lottery-ticket tests ---
+
+// TestSLTPMonitor_Lottery_FiresAfterCeilingWhenAskCheap verifies the happy path:
+// ceiling-TP fires, lottery flag is on, ask is below cap → lottery BUY succeeds
+// and the user is notified.
+func TestSLTPMonitor_Lottery_FiresAfterCeilingWhenAskCheap(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{
+		ID: 50, TelegramID: 31, TokenID: "L1", AvgPrice: 0.30, SharesAtArm: 200,
+		TPArmed: true, SLArmed: true, LotteryTicketArmed: true,
+	})
+
+	feed := newFakeFeed()
+	feed.setAsk("L1-other", 0.04) // below LotteryMaxPrice of 0.05
+
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	_ = m.Start()
+
+	feed.setBid("L1", database.CeilingTPPrice)
+	feed.emit("L1")
+
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.lotteries) == 1
+	})
+
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	if len(exec.lotteryCalls) != 1 {
+		t.Fatalf("expected 1 lottery call, got %d", len(exec.lotteryCalls))
+	}
+	got := exec.lotteryCalls[0]
+	if got.otherTokenID != "L1-other" {
+		t.Errorf("expected otherTokenID=L1-other, got %s", got.otherTokenID)
+	}
+	if got.maxPrice != database.LotteryMaxPrice {
+		t.Errorf("expected maxPrice=%v, got %v", database.LotteryMaxPrice, got.maxPrice)
+	}
+	if got.maxSpend != database.LotteryMaxSpend {
+		t.Errorf("expected maxSpend=%v, got %v", database.LotteryMaxSpend, got.maxSpend)
+	}
+
+	notif.mu.Lock()
+	defer notif.mu.Unlock()
+	if notif.lotteries[0].reason != "filled" {
+		t.Errorf("expected lottery notice reason=filled, got %q", notif.lotteries[0].reason)
+	}
+}
+
+// TestSLTPMonitor_Lottery_NotArmedSkips verifies that when the user hasn't
+// opted into lottery, the ceiling-TP fires without any lottery call.
+func TestSLTPMonitor_Lottery_NotArmedSkips(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{
+		ID: 51, TelegramID: 32, TokenID: "L2", AvgPrice: 0.30, SharesAtArm: 100,
+		TPArmed: true, SLArmed: true, LotteryTicketArmed: false,
+	})
+
+	feed := newFakeFeed()
+	feed.setAsk("L2-other", 0.03) // would be cheap enough if lottery were armed
+
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	_ = m.Start()
+
+	feed.setBid("L2", 0.96)
+	feed.emit("L2")
+
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.fires) == 1 // ceiling-TP fired
+	})
+
+	// Sanity: give any errant lottery goroutine a moment to run.
+	time.Sleep(50 * time.Millisecond)
+
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	if len(exec.lotteryCalls) != 0 {
+		t.Errorf("expected no lottery call when not armed, got %d", len(exec.lotteryCalls))
+	}
+	notif.mu.Lock()
+	defer notif.mu.Unlock()
+	if len(notif.lotteries) != 0 {
+		t.Errorf("expected no lottery notification, got %d", len(notif.lotteries))
+	}
+}
+
+// TestSLTPMonitor_Lottery_AskTooHighSkips verifies that when the other side's
+// ask is above LotteryMaxPrice, the lottery is skipped and the user is told
+// why — no BUY is attempted.
+func TestSLTPMonitor_Lottery_AskTooHighSkips(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{
+		ID: 52, TelegramID: 33, TokenID: "L3", AvgPrice: 0.30, SharesAtArm: 100,
+		TPArmed: true, SLArmed: true, LotteryTicketArmed: true,
+	})
+
+	feed := newFakeFeed()
+	feed.setAsk("L3-other", 0.07) // above 0.05 cap
+
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	_ = m.Start()
+
+	feed.setBid("L3", 0.96)
+	feed.emit("L3")
+
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.lotteries) == 1
+	})
+
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	if len(exec.lotteryCalls) != 0 {
+		t.Errorf("expected no lottery call when ask above cap, got %d", len(exec.lotteryCalls))
+	}
+	notif.mu.Lock()
+	defer notif.mu.Unlock()
+	if notif.lotteries[0].reason != "ask-too-high" {
+		t.Errorf("expected lottery reason=ask-too-high, got %q", notif.lotteries[0].reason)
+	}
+}
+
+// TestSLTPMonitor_Lottery_MultiOutcomeSkips verifies that when ResolveOtherToken
+// returns ErrMultiOutcome, the lottery is skipped with a clear notice.
+func TestSLTPMonitor_Lottery_MultiOutcomeSkips(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{
+		ID: 53, TelegramID: 34, TokenID: "L4", AvgPrice: 0.30, SharesAtArm: 100,
+		TPArmed: true, SLArmed: true, LotteryTicketArmed: true,
+	})
+
+	feed := newFakeFeed()
+	exec := &fakeExecutor{resolveErr: ErrMultiOutcome}
+	notif := &fakeNotifier{}
+	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	_ = m.Start()
+
+	feed.setBid("L4", 0.96)
+	feed.emit("L4")
+
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.lotteries) == 1
+	})
+
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	if len(exec.lotteryCalls) != 0 {
+		t.Errorf("expected no lottery call for multi-outcome market, got %d", len(exec.lotteryCalls))
+	}
+	notif.mu.Lock()
+	defer notif.mu.Unlock()
+	if notif.lotteries[0].reason != "multi-outcome" {
+		t.Errorf("expected lottery reason=multi-outcome, got %q", notif.lotteries[0].reason)
+	}
+}
+
+// TestSLTPMonitor_Lottery_BuyFailureNotified verifies that a failed lottery
+// BUY (e.g., FOK rejected) still produces a notification with the failure
+// detail — never silent.
+func TestSLTPMonitor_Lottery_BuyFailureNotified(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{
+		ID: 54, TelegramID: 35, TokenID: "L5", AvgPrice: 0.30, SharesAtArm: 100,
+		TPArmed: true, SLArmed: true, LotteryTicketArmed: true,
+	})
+
+	feed := newFakeFeed()
+	feed.setAsk("L5-other", 0.04)
+
+	exec := &fakeExecutor{
+		lotteryRet: &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: "FOK rejected: insufficient depth",
+		},
+	}
+	notif := &fakeNotifier{}
+	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	_ = m.Start()
+
+	feed.setBid("L5", 0.96)
+	feed.emit("L5")
+
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.lotteries) == 1
+	})
+
+	notif.mu.Lock()
+	defer notif.mu.Unlock()
+	if notif.lotteries[0].reason != "failed" {
+		t.Errorf("expected lottery reason=failed, got %q", notif.lotteries[0].reason)
+	}
+	if !strings.Contains(notif.lotteries[0].detail, "FOK rejected") {
+		t.Errorf("expected detail to mention FOK rejection, got %q", notif.lotteries[0].detail)
+	}
+}
+
+// TestSLTPMonitor_Lottery_NotFiredIfSellFailed verifies that when the
+// ceiling-TP SELL itself fails, we don't attempt the lottery — would be
+// silly to add a position when we couldn't exit the original.
+func TestSLTPMonitor_Lottery_NotFiredIfSellFailed(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{
+		ID: 55, TelegramID: 36, TokenID: "L6", AvgPrice: 0.30, SharesAtArm: 100,
+		TPArmed: true, SLArmed: true, LotteryTicketArmed: true,
+	})
+
+	feed := newFakeFeed()
+	feed.setAsk("L6-other", 0.04)
+
+	exec := &fakeExecutor{
+		ret: &polymarket.TradeResult{Success: false, ErrorMsg: "sell failed"},
+	}
+	notif := &fakeNotifier{}
+	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	_ = m.Start()
+
+	feed.setBid("L6", 0.96)
+	feed.emit("L6")
+
+	// SELL was attempted (and reported as fired-with-failure via NotifySLTPFired).
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.fires) == 1
+	})
+
+	time.Sleep(50 * time.Millisecond)
+
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	if len(exec.lotteryCalls) != 0 {
+		t.Errorf("expected no lottery call after failed SELL, got %d", len(exec.lotteryCalls))
 	}
 }

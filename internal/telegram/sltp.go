@@ -15,6 +15,7 @@ import (
 
 	"github.com/Catorpilor/poly/internal/database"
 	"github.com/Catorpilor/poly/internal/database/repositories"
+	"github.com/Catorpilor/poly/internal/live"
 	"github.com/Catorpilor/poly/internal/polymarket"
 )
 
@@ -87,6 +88,10 @@ func (b *Bot) handleSLTPList(ctx context.Context, update *tgbotapi.Update) {
 			break
 		}
 		rows = append(rows, sltpRowForPosition(i, pos, armed[pos.TokenID]))
+		// If armed, expose the lottery-ticket toggle on a second row.
+		if armed[pos.TokenID] != nil {
+			rows = append(rows, sltpLotteryRow(i, armed[pos.TokenID]))
+		}
 	}
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
 		tgbotapi.NewInlineKeyboardButtonData("← Back to Positions", "back_to_positions"),
@@ -121,6 +126,68 @@ func sltpRowForPosition(i int, pos *polymarket.Position, existing *database.SLTP
 	return tgbotapi.NewInlineKeyboardRow(
 		tgbotapi.NewInlineKeyboardButtonData(truncateUTF8(label, 60), fmt.Sprintf("sltp:arm:%d", i)),
 	)
+}
+
+// sltpLotteryRow renders the per-arm lottery toggle. Tapping it flips the
+// lottery_ticket_armed flag in the DB. Visible only for armed positions.
+func sltpLotteryRow(i int, arm *database.SLTPArm) []tgbotapi.InlineKeyboardButton {
+	state := "OFF"
+	if arm.LotteryTicketArmed {
+		state = "ON ✓"
+	}
+	label := fmt.Sprintf("🎫 Lottery (other side @ ≤$%.2f): %s", database.LotteryMaxPrice, state)
+	return tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData(truncateUTF8(label, 60), fmt.Sprintf("sltp:lot:%d", i)),
+	)
+}
+
+// handleSLTPLotteryCallback flips the lottery_ticket_armed flag for the
+// selected armed position and re-renders the list so the toggle reflects new
+// state. Invoked from the `sltp:lot:<idx>` callback.
+func (b *Bot) handleSLTPLotteryCallback(ctx context.Context, update *tgbotapi.Update) {
+	userID := update.CallbackQuery.From.ID
+	chatID := update.CallbackQuery.Message.Chat.ID
+	messageID := update.CallbackQuery.Message.MessageID
+
+	pos, ok := b.resolveSLTPPosition(update)
+	if !ok {
+		b.editMessage(chatID, messageID, "❌ Session expired. Tap 🎯 SL/TP again.")
+		return
+	}
+
+	current, err := b.sltpArmRepo.GetByUserAndToken(ctx, userID, pos.TokenID)
+	if err != nil {
+		log.Printf("SLTP lottery: lookup for %d/%s: %v", userID, pos.TokenID, err)
+		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Lottery toggle failed: %v", err))
+		return
+	}
+	if current == nil {
+		b.editMessage(chatID, messageID, "❌ Position is not armed. Arm it first.")
+		return
+	}
+
+	target := !current.LotteryTicketArmed
+	if err := b.sltpArmRepo.SetLotteryTicket(ctx, userID, pos.TokenID, target); err != nil {
+		if errors.Is(err, repositories.ErrSLTPArmNotFound) {
+			b.editMessage(chatID, messageID, "❌ Position is not armed. Arm it first.")
+			return
+		}
+		log.Printf("SLTP lottery: set for %d/%s: %v", userID, pos.TokenID, err)
+		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Lottery toggle failed: %v", err))
+		return
+	}
+
+	state := "OFF"
+	if target {
+		state = "ON"
+	}
+	b.sendMessage(chatID, fmt.Sprintf(
+		"🎫 *Lottery ticket: %s* for %s\n\n"+
+			"When the ceiling-TP fires (bid ≥ $%.2f), the bot will FOK-buy the other side at ≤ $%.2f, capped at $%.2f.",
+		state, pos.MarketTitle, database.CeilingTPPrice, database.LotteryMaxPrice, database.LotteryMaxSpend,
+	))
+
+	b.handleSLTPList(ctx, update)
 }
 
 // handleSLTPArmCallback arms TP+SL for the selected position.
@@ -342,6 +409,146 @@ func (b *Bot) NotifySLTPFired(telegramID int64, kind string, arm *database.SLTPA
 				"Position remains unsold. Check /positions.",
 			kind, bid, errMsg,
 		)
+	}
+	b.sendMessage(telegramID, text)
+}
+
+// ResolveOtherToken implements live.TradeExecutor. Returns the second CTF
+// token in the binary market that contains arm.TokenID. For markets with
+// != 2 outcomes (multi-outcome / neg-risk), returns live.ErrMultiOutcome.
+func (b *Bot) ResolveOtherToken(ctx context.Context, arm *database.SLTPArm) (string, string, error) {
+	market, err := b.tradingClient.GetMarketInfo(ctx, arm.TokenID)
+	if err != nil {
+		return "", "", fmt.Errorf("get market info: %w", err)
+	}
+	if len(market.Tokens) != 2 {
+		return "", "", live.ErrMultiOutcome
+	}
+	for _, tok := range market.Tokens {
+		if tok.TokenID != arm.TokenID {
+			return tok.TokenID, tok.Outcome, nil
+		}
+	}
+	// Both tokens equal to arm.TokenID would be a server-side data bug.
+	return "", "", fmt.Errorf("market has no token differing from arm token %s", arm.TokenID)
+}
+
+// ExecuteLotteryBuy implements live.TradeExecutor. Submits a FOK BUY of
+// otherTokenID at price <= maxPrice for at most maxSpend USDC.
+func (b *Bot) ExecuteLotteryBuy(ctx context.Context, arm *database.SLTPArm,
+	otherTokenID, otherOutcome string, maxSpend, maxPrice float64) *polymarket.TradeResult {
+
+	user, err := b.userRepo.GetByTelegramID(ctx, arm.TelegramID)
+	if err != nil || user == nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("user not found: %v", err),
+		}
+	}
+
+	userWallet, err := b.walletManager.DecryptPrivateKey(user.EncryptedKey)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("wallet decrypt: %v", err),
+		}
+	}
+
+	creds, err := b.tradingClient.GetOrCreateAPICredentials(ctx, userWallet.PrivateKey)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("get api creds: %v", err),
+		}
+	}
+
+	proxyAddress := common.HexToAddress(user.ProxyAddress)
+
+	orderFeeBps := 0
+	if feeRate, err := b.tradingClient.GetFeeRate(ctx, otherTokenID); err == nil {
+		orderFeeBps = feeRate
+	}
+
+	tradeReq := &polymarket.TradeRequest{
+		// MarketID isn't strictly required for the FOK BUY since the order
+		// payload is built from TokenID + price; leave empty for simplicity.
+		TokenID:      otherTokenID,
+		Side:         "BUY",
+		Outcome:      otherOutcome,
+		Amount:       maxSpend,
+		Price:        maxPrice,
+		OrderType:    polymarket.OrderTypeFOK,
+		NegativeRisk: arm.NegRisk, // same condition → same neg-risk
+		TakerFeeBps:  orderFeeBps,
+		CalcFeeBps:   0,
+	}
+
+	log.Printf("Lottery BUY: user=%d arm=%d otherToken=%s outcome=%s spend<=%.2f price<=%.4f",
+		arm.TelegramID, arm.ID, otherTokenID, otherOutcome, maxSpend, maxPrice)
+
+	result, err := b.tradingClient.ExecuteTrade(ctx, userWallet.PrivateKey, proxyAddress, creds, tradeReq)
+	if err != nil {
+		return &polymarket.TradeResult{
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("execute trade: %v", err),
+		}
+	}
+	return result
+}
+
+// NotifyLottery implements live.Notifier. Always notifies — success, skip
+// (with reason), or failure — so the user knows what happened on the lottery
+// side after a ceiling-TP fire.
+func (b *Bot) NotifyLottery(telegramID int64, arm *database.SLTPArm, otherOutcome string,
+	reason string, detail string, result *polymarket.TradeResult) {
+
+	var text string
+	switch reason {
+	case "filled":
+		// result.AveragePrice may not be populated by the executor; fall back
+		// to FilledSize description.
+		shares := 0.0
+		spent := 0.0
+		if result != nil {
+			shares = result.FilledSize
+			if result.AveragePrice > 0 {
+				spent = shares * result.AveragePrice
+			}
+		}
+		if spent > 0 {
+			text = fmt.Sprintf(
+				"🎫 *Lottery filled* — bought %.2f %s shares @ $%.4f avg ($%.2f total).\n\n"+
+					"If the improbable lands, this 5%% turns into 100%%.",
+				shares, otherOutcome, result.AveragePrice, spent,
+			)
+		} else {
+			text = fmt.Sprintf(
+				"🎫 *Lottery filled* — bought %s side.\nOrder: `%s`",
+				otherOutcome, result.OrderID,
+			)
+		}
+	case "ask-too-high":
+		text = fmt.Sprintf(
+			"🎫 *Lottery skipped* — %s\n\n"+
+				"The other side (%s) isn't cheap enough to be a fair lottery ticket.",
+			detail, otherOutcome,
+		)
+	case "no-liquidity":
+		text = fmt.Sprintf(
+			"🎫 *Lottery skipped* — %s side has no live ask.",
+			otherOutcome,
+		)
+	case "multi-outcome":
+		text = "🎫 *Lottery skipped* — multi-outcome market, no single \"other side\" to buy."
+	case "resolve-failed":
+		text = fmt.Sprintf("🎫 *Lottery skipped* — couldn't resolve other token: %s", detail)
+	case "failed":
+		text = fmt.Sprintf(
+			"🎫 *Lottery failed* — order rejected:\n`%s`",
+			detail,
+		)
+	default:
+		text = fmt.Sprintf("🎫 Lottery: %s — %s", reason, detail)
 	}
 	b.sendMessage(telegramID, text)
 }
