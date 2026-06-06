@@ -90,7 +90,7 @@ func (b *Bot) handleSLTPList(ctx context.Context, update *tgbotapi.Update) {
 		rows = append(rows, sltpRowForPosition(i, pos, armed[pos.TokenID]))
 		// If armed, expose the lottery-ticket toggle on a second row.
 		if armed[pos.TokenID] != nil {
-			rows = append(rows, sltpLotteryRow(i, armed[pos.TokenID]))
+			rows = append(rows, sltpLotteryRow(armed[pos.TokenID]))
 		}
 	}
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
@@ -117,8 +117,13 @@ func sltpRowForPosition(i int, pos *polymarket.Position, existing *database.SLTP
 			prefix = "⏹ Disarm (SL only)"
 		}
 		label := fmt.Sprintf("%s: %s - %s %s", prefix, title, sharesStr, pos.Outcome)
+		// Key the disarm button on the arm's stable DB ID, not the position
+		// index. The index is meaningless once the cached position list expires
+		// (10 min TTL) or a buffered tap arrives late — which silently dropped
+		// disarms into "Session expired". The arm ID resolves from the DB
+		// regardless of UI state, so disarm always hits the right row.
 		return tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData(truncateUTF8(label, 60), fmt.Sprintf("sltp:off:%d", i)),
+			tgbotapi.NewInlineKeyboardButtonData(truncateUTF8(label, 60), fmt.Sprintf("sltp:off:%d", existing.ID)),
 		)
 	}
 
@@ -130,14 +135,16 @@ func sltpRowForPosition(i int, pos *polymarket.Position, existing *database.SLTP
 
 // sltpLotteryRow renders the per-arm lottery toggle. Tapping it flips the
 // lottery_ticket_armed flag in the DB. Visible only for armed positions.
-func sltpLotteryRow(i int, arm *database.SLTPArm) []tgbotapi.InlineKeyboardButton {
+// Keyed on the arm's stable DB ID (not the position index) for the same
+// reason as the disarm button — see sltpRowForPosition.
+func sltpLotteryRow(arm *database.SLTPArm) []tgbotapi.InlineKeyboardButton {
 	state := "OFF"
 	if arm.LotteryTicketArmed {
 		state = "ON ✓"
 	}
 	label := fmt.Sprintf("🎫 Lottery (other side @ ≤$%.2f): %s", database.LotteryMaxPrice, state)
 	return tgbotapi.NewInlineKeyboardRow(
-		tgbotapi.NewInlineKeyboardButtonData(truncateUTF8(label, 60), fmt.Sprintf("sltp:lot:%d", i)),
+		tgbotapi.NewInlineKeyboardButtonData(truncateUTF8(label, 60), fmt.Sprintf("sltp:lot:%d", arm.ID)),
 	)
 }
 
@@ -149,30 +156,24 @@ func (b *Bot) handleSLTPLotteryCallback(ctx context.Context, update *tgbotapi.Up
 	chatID := update.CallbackQuery.Message.Chat.ID
 	messageID := update.CallbackQuery.Message.MessageID
 
-	pos, ok := b.resolveSLTPPosition(update)
-	if !ok {
-		b.editMessage(chatID, messageID, "❌ Session expired. Tap 🎯 SL/TP again.")
-		return
-	}
-
-	current, err := b.sltpArmRepo.GetByUserAndToken(ctx, userID, pos.TokenID)
+	arm, err := b.resolveSLTPArm(ctx, update)
 	if err != nil {
-		log.Printf("SLTP lottery: lookup for %d/%s: %v", userID, pos.TokenID, err)
-		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Lottery toggle failed: %v", err))
+		log.Printf("SLTP lottery: resolve arm for %d: %v", userID, err)
+		b.editMessage(chatID, messageID, "❌ Lottery toggle failed. Tap 🎯 SL/TP again.")
 		return
 	}
-	if current == nil {
+	if arm == nil {
 		b.editMessage(chatID, messageID, "❌ Position is not armed. Arm it first.")
 		return
 	}
 
-	target := !current.LotteryTicketArmed
-	if err := b.sltpArmRepo.SetLotteryTicket(ctx, userID, pos.TokenID, target); err != nil {
+	target := !arm.LotteryTicketArmed
+	if err := b.sltpArmRepo.SetLotteryTicket(ctx, userID, arm.TokenID, target); err != nil {
 		if errors.Is(err, repositories.ErrSLTPArmNotFound) {
 			b.editMessage(chatID, messageID, "❌ Position is not armed. Arm it first.")
 			return
 		}
-		log.Printf("SLTP lottery: set for %d/%s: %v", userID, pos.TokenID, err)
+		log.Printf("SLTP lottery: set for %d/%s: %v", userID, arm.TokenID, err)
 		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Lottery toggle failed: %v", err))
 		return
 	}
@@ -184,7 +185,7 @@ func (b *Bot) handleSLTPLotteryCallback(ctx context.Context, update *tgbotapi.Up
 	b.sendMessage(chatID, fmt.Sprintf(
 		"🎫 *Lottery ticket: %s* for %s\n\n"+
 			"When the ceiling-TP fires (bid ≥ $%.2f), the bot will FOK-buy the other side at ≤ $%.2f, capped at $%.2f.",
-		state, pos.MarketTitle, database.CeilingTPPrice, database.LotteryMaxPrice, database.LotteryMaxSpend,
+		state, b.sltpArmDisplay(userID, arm), database.CeilingTPPrice, database.LotteryMaxPrice, database.LotteryMaxSpend,
 	))
 
 	b.handleSLTPList(ctx, update)
@@ -257,31 +258,79 @@ func (b *Bot) handleSLTPArmCallback(ctx context.Context, update *tgbotapi.Update
 	b.handleSLTPList(ctx, update)
 }
 
-// handleSLTPDisarmCallback clears a user's arm for the selected position.
+// handleSLTPDisarmCallback clears a user's arm for the selected position. It
+// resolves the arm from its stable DB ID (carried in the callback data), so a
+// disarm reliably takes effect even when the cached position list has expired
+// or the tap was buffered by Telegram and delivered late — the failure mode
+// that previously dropped disarms into a silent "Session expired" while the
+// position stayed armed and auto-sold.
 func (b *Bot) handleSLTPDisarmCallback(ctx context.Context, update *tgbotapi.Update) {
 	userID := update.CallbackQuery.From.ID
 	chatID := update.CallbackQuery.Message.Chat.ID
 	messageID := update.CallbackQuery.Message.MessageID
 
-	pos, ok := b.resolveSLTPPosition(update)
-	if !ok {
-		b.editMessage(chatID, messageID, "❌ Session expired. Tap 🎯 SL/TP again.")
+	arm, err := b.resolveSLTPArm(ctx, update)
+	if err != nil {
+		log.Printf("SLTP disarm: resolve arm for %d: %v", userID, err)
+		b.editMessage(chatID, messageID, "❌ Disarm failed: couldn't identify the position. Tap 🎯 SL/TP again.")
+		return
+	}
+	if arm == nil {
+		// No armed row for this ID/user — already disarmed (e.g. a double-tap, or
+		// the arm fired and cleared in the meantime). Treat as idempotent success
+		// rather than a scary error.
+		b.sendMessage(chatID, "⏹ *Already disarmed* — this position is no longer being auto-watched.")
+		b.handleSLTPList(ctx, update)
 		return
 	}
 
-	err := b.sltpArmRepo.Disarm(ctx, userID, pos.TokenID)
-	if err != nil && !errors.Is(err, repositories.ErrSLTPArmNotFound) {
-		log.Printf("SLTP disarm: %d/%s: %v", userID, pos.TokenID, err)
+	if err := b.sltpArmRepo.Disarm(ctx, userID, arm.TokenID); err != nil &&
+		!errors.Is(err, repositories.ErrSLTPArmNotFound) {
+		log.Printf("SLTP disarm: %d/%s: %v", userID, arm.TokenID, err)
 		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Disarm failed: %v", err))
 		return
 	}
 
 	if b.sltpMonitor != nil {
-		b.sltpMonitor.UnsubscribeFor(pos.TokenID)
+		b.sltpMonitor.UnsubscribeFor(arm.TokenID)
 	}
 
-	b.sendMessage(chatID, fmt.Sprintf("⏹ *Disarmed* %s %s", pos.MarketTitle, pos.Outcome))
+	b.sendMessage(chatID, fmt.Sprintf("⏹ *Disarmed* %s", b.sltpArmDisplay(userID, arm)))
 	b.handleSLTPList(ctx, update)
+}
+
+// resolveSLTPArm parses the arm DB ID from callback data (sltp:off:<id> or
+// sltp:lot:<id>) and loads the arm directly from the DB, scoped to the calling
+// user. Unlike resolveSLTPPosition it does NOT depend on the cached position
+// list, so it works even after the UI state has expired or a tap is delivered
+// late. Returns (nil, nil) when no matching armed row exists (already disarmed).
+func (b *Bot) resolveSLTPArm(ctx context.Context, update *tgbotapi.Update) (*database.SLTPArm, error) {
+	userID := update.CallbackQuery.From.ID
+	parts := strings.Split(update.CallbackQuery.Data, ":")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("malformed sltp callback %q", update.CallbackQuery.Data)
+	}
+	id, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("bad arm id %q: %w", parts[2], err)
+	}
+	return b.sltpArmRepo.GetByID(ctx, userID, id)
+}
+
+// sltpArmDisplay returns a human label for an arm. It prefers the market title
+// from the cached position list for nicer UX, but falls back to the outcome
+// alone so confirmations never depend on that cache being present.
+func (b *Bot) sltpArmDisplay(userID int64, arm *database.SLTPArm) string {
+	if st, ok := b.stateManager.GetState(userID); ok {
+		if positions, ok := st.Data["positions"].([]*polymarket.Position); ok {
+			for _, p := range positions {
+				if p.TokenID == arm.TokenID {
+					return fmt.Sprintf("%s %s", p.MarketTitle, p.Outcome)
+				}
+			}
+		}
+	}
+	return string(arm.Outcome)
 }
 
 // resolveSLTPPosition parses the callback data for a position index and pulls the

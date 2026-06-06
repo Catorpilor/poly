@@ -28,6 +28,13 @@ type SLTPArmRepository interface {
 	// GetByUserAndToken returns the arm row or nil if not found.
 	GetByUserAndToken(ctx context.Context, telegramID int64, tokenID string) (*database.SLTPArm, error)
 
+	// GetByID returns the arm with the given primary key, scoped to telegramID,
+	// or nil if no such arm exists for that user. Scoping by user prevents one
+	// user from acting on another user's arm via a crafted callback. Used by the
+	// disarm/lottery callbacks so they resolve from a stable identifier rather
+	// than a transient UI position index.
+	GetByID(ctx context.Context, telegramID int64, id int) (*database.SLTPArm, error)
+
 	// ListArmed returns all arms where tp_armed OR sl_armed is true.
 	ListArmed(ctx context.Context) ([]*database.SLTPArm, error)
 
@@ -137,6 +144,19 @@ func (r *sltpArmRepo) GetByUserAndToken(ctx context.Context, telegramID int64, t
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to get sltp arm: %w", err)
+	}
+	return arm, nil
+}
+
+func (r *sltpArmRepo) GetByID(ctx context.Context, telegramID int64, id int) (*database.SLTPArm, error) {
+	query := `SELECT ` + sltpArmColumns + ` FROM sltp_arms WHERE id = $1 AND telegram_id = $2`
+	row := r.db.Pool.QueryRow(ctx, query, id, telegramID)
+	arm, err := scanArm(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get sltp arm by id: %w", err)
 	}
 	return arm, nil
 }

@@ -1,13 +1,88 @@
 package telegram
 
 import (
+	"context"
 	"math/big"
 	"strings"
 	"testing"
 
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+
 	"github.com/Catorpilor/poly/internal/database"
+	"github.com/Catorpilor/poly/internal/database/repositories"
 	"github.com/Catorpilor/poly/internal/polymarket"
 )
+
+// fakeArmRepo satisfies repositories.SLTPArmRepository via an embedded nil
+// interface; only GetByID is exercised here, so the rest stay unimplemented.
+type fakeArmRepo struct {
+	repositories.SLTPArmRepository
+	wantUser int64
+	wantID   int
+	arm      *database.SLTPArm
+	err      error
+}
+
+func (f *fakeArmRepo) GetByID(_ context.Context, telegramID int64, id int) (*database.SLTPArm, error) {
+	f.wantUser, f.wantID = telegramID, id
+	return f.arm, f.err
+}
+
+func cbUpdate(userID int64, data string) *tgbotapi.Update {
+	return &tgbotapi.Update{
+		CallbackQuery: &tgbotapi.CallbackQuery{
+			From: &tgbotapi.User{ID: userID},
+			Data: data,
+		},
+	}
+}
+
+// TestResolveSLTPArm proves disarm/lottery resolution keys off the stable arm
+// DB ID carried in the callback and loads straight from the repo — with no
+// dependency on the cached position list. This is the fix for disarms silently
+// failing as "Session expired" when the UI state had expired or the tap arrived
+// late.
+func TestResolveSLTPArm(t *testing.T) {
+	t.Parallel()
+
+	t.Run("valid id loads arm from repo, ignoring UI state", func(t *testing.T) {
+		t.Parallel()
+		want := &database.SLTPArm{ID: 42, TelegramID: 7, TokenID: "tokZ", Outcome: "YES"}
+		repo := &fakeArmRepo{arm: want}
+		b := &Bot{sltpArmRepo: repo}
+
+		got, err := b.resolveSLTPArm(context.Background(), cbUpdate(7, "sltp:off:42"))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != want {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+		if repo.wantUser != 7 || repo.wantID != 42 {
+			t.Errorf("repo queried with user=%d id=%d, want user=7 id=42", repo.wantUser, repo.wantID)
+		}
+	})
+
+	t.Run("already disarmed returns nil,nil", func(t *testing.T) {
+		t.Parallel()
+		b := &Bot{sltpArmRepo: &fakeArmRepo{arm: nil}}
+		got, err := b.resolveSLTPArm(context.Background(), cbUpdate(7, "sltp:off:99"))
+		if err != nil || got != nil {
+			t.Fatalf("got (%v, %v), want (nil, nil)", got, err)
+		}
+	})
+
+	for _, bad := range []string{"sltp:off", "sltp:off:abc", "sltp:off:1:2"} {
+		bad := bad
+		t.Run("malformed callback "+bad, func(t *testing.T) {
+			t.Parallel()
+			b := &Bot{sltpArmRepo: &fakeArmRepo{}}
+			if _, err := b.resolveSLTPArm(context.Background(), cbUpdate(7, bad)); err == nil {
+				t.Errorf("expected error for %q, got nil", bad)
+			}
+		})
+	}
+}
 
 func TestSharesBigIntToFloat(t *testing.T) {
 	t.Parallel()
@@ -41,13 +116,15 @@ func TestSLTPRowForPosition_ArmedShowsDisarm(t *testing.T) {
 		Outcome:     "YES",
 		Shares:      big.NewInt(10_000_000),
 	}
-	arm := &database.SLTPArm{TPArmed: true, SLArmed: true}
+	// ID deliberately differs from the position index (2) to prove the disarm
+	// button is keyed on the stable arm DB ID, not the volatile UI index.
+	arm := &database.SLTPArm{ID: 42, TPArmed: true, SLArmed: true}
 	row := sltpRowForPosition(2, pos, arm)
 	if len(row) != 1 {
 		t.Fatalf("expected 1 button, got %d", len(row))
 	}
-	if row[0].CallbackData == nil || *row[0].CallbackData != "sltp:off:2" {
-		t.Errorf("expected callback sltp:off:2, got %v", row[0].CallbackData)
+	if row[0].CallbackData == nil || *row[0].CallbackData != "sltp:off:42" {
+		t.Errorf("expected callback sltp:off:42, got %v", row[0].CallbackData)
 	}
 	if !strings.Contains(row[0].Text, "Disarm") {
 		t.Errorf("expected button text to mention Disarm, got %q", row[0].Text)
