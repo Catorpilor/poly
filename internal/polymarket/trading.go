@@ -772,25 +772,24 @@ func (tc *TradingClient) ExecuteTrade(
 	return tc.submitOrder(ctx, creds, eoaAddress, signedOrder, trade.OrderType)
 }
 
-// submitOrder submits a signed order to the CLOB
-func (tc *TradingClient) submitOrder(
-	ctx context.Context,
-	creds *APICredentials,
-	address common.Address,
-	signedOrder *orderv2.SignedOrder,
-	orderType OrderType,
-) (*TradeResult, error) {
+// buildOrderPayloadV2 constructs the JSON map sent to POST /order.
+// Mirrors orderToJsonV2 in @polymarket/clob-client-v2.
+// V2 drops nonce/feeRateBps/taker; adds timestamp/metadata/builder.
+// `expiration` ships in JSON but is NOT in the signed EIP-712 message.
+//
+// Salt is emitted as an unquoted JSON number via big.Int.MarshalJSON. Earlier
+// versions used Salt.Int64() which silently overflowed to a negative integer
+// for values ≥ 2^63 (defaultSalt() draws from [0, 2^64)) — the CLOB then
+// rejected the order with `abi: negatively-signed value cannot be packed into
+// uint parameter`. Sending the bare *big.Int is safe up to 2^256.
+func buildOrderPayloadV2(signedOrder *orderv2.SignedOrder, owner string, orderType OrderType) map[string]any {
 	sideStr := "BUY"
 	if signedOrder.Side == orderv2.SELL {
 		sideStr = "SELL"
 	}
-
-	// V2 API JSON shape — mirrors orderToJsonV2 in @polymarket/clob-client-v2.
-	// Drops nonce/feeRateBps/taker; adds timestamp/metadata/builder.
-	// `expiration` ships in JSON but is NOT in the signed EIP-712 message.
-	orderPayload := map[string]any{
+	return map[string]any{
 		"order": map[string]any{
-			"salt":          signedOrder.Salt.Int64(), // integer, not string
+			"salt":          signedOrder.Salt,
 			"maker":         signedOrder.Maker.Hex(),
 			"signer":        signedOrder.Signer.Hex(),
 			"tokenId":       signedOrder.TokenId.String(),
@@ -804,9 +803,20 @@ func (tc *TradingClient) submitOrder(
 			"builder":       signedOrder.Builder.Hex(),
 			"signature":     "0x" + hex.EncodeToString(signedOrder.Signature),
 		},
-		"owner":     creds.APIKey,
+		"owner":     owner,
 		"orderType": string(orderType),
 	}
+}
+
+// submitOrder submits a signed order to the CLOB
+func (tc *TradingClient) submitOrder(
+	ctx context.Context,
+	creds *APICredentials,
+	address common.Address,
+	signedOrder *orderv2.SignedOrder,
+	orderType OrderType,
+) (*TradeResult, error) {
+	orderPayload := buildOrderPayloadV2(signedOrder, creds.APIKey, orderType)
 
 	body, err := json.Marshal(orderPayload)
 	if err != nil {
