@@ -64,6 +64,9 @@ type TradeRequest struct {
 	NegativeRisk bool  // Whether this is a negative risk market
 	TakerFeeBps  int   // Fee rate for CLOB order submission (what the exchange accepts)
 	CalcFeeBps   int   // Fee rate for share/cost calculation (from Gamma feeSchedule, dynamic)
+	// AccountType is the maker's account architecture (legacy_proxy | safe |
+	// deposit_wallet). Selects the signature type; empty = legacy behavior.
+	AccountType string
 }
 
 // TradeResult represents the result of a trade
@@ -721,25 +724,19 @@ func (tc *TradingClient) ExecuteTrade(
 			makerAmount, shares, sharesRounded, takerAmount, float64(takerAmountRaw)/float64(sharesRounded))
 	}
 
-	// Determine signature type based on whether we're using a proxy
-	sigType := orderv2.EOA
+	// Determine maker / signer / signature-type from the account architecture.
+	// Deposit wallets (ERC-1271) sign as the contract itself (maker == signer);
+	// legacy proxy / Safe accounts keep maker = proxy, signer = EOA.
 	eoaAddress := crypto.PubkeyToAddress(privateKey.PublicKey)
-	maker := eoaAddress.Hex()
-
-	if proxyAddress != (common.Address{}) && proxyAddress != eoaAddress {
-		// POLY_GNOSIS_SAFE (2) is for browser wallet proxies (most common)
-		// POLY_PROXY (1) is for email/Magic wallet proxies
-		// Most users connecting via browser wallets use Gnosis Safe
-		sigType = orderv2.POLY_GNOSIS_SAFE
-		maker = proxyAddress.Hex()
-		log.Printf("ExecuteTrade: Using proxy wallet, sigType=POLY_GNOSIS_SAFE(2)")
-	}
+	maker, signerAddr, sigType := resolveOrderSigner(eoaAddress, proxyAddress, trade.AccountType)
+	log.Printf("ExecuteTrade: account=%q maker=%s signer=%s sigType=%d",
+		trade.AccountType, maker.Hex(), signerAddr.Hex(), sigType)
 
 	// Build order data. V2 dropped feeRateBps/nonce/taker — fees are
 	// computed at protocol match-time and signed timestamp replaces nonce.
 	orderData := &orderv2.OrderData{
-		Maker:         maker,
-		Signer:        eoaAddress.Hex(),
+		Maker:         maker.Hex(),
+		Signer:        signerAddr.Hex(),
 		TokenId:       trade.TokenID,
 		MakerAmount:   makerAmount,
 		TakerAmount:   takerAmount,

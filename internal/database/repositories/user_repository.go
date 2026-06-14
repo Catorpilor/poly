@@ -8,6 +8,19 @@ import (
 	"github.com/Catorpilor/poly/internal/database"
 )
 
+// defaultAccountType is the historical account architecture; used when a user
+// row has no explicit account_type. Mirrors migrations/006_account_type.sql.
+const defaultAccountType = "legacy_proxy"
+
+// accountTypeOrDefault coalesces an empty account type to the legacy default so
+// the NOT NULL column always gets a valid value.
+func accountTypeOrDefault(t string) string {
+	if t == "" {
+		return defaultAccountType
+	}
+	return t
+}
+
 // UserRepository defines the interface for user data operations
 type UserRepository interface {
 	Create(ctx context.Context, user *database.User) error
@@ -38,8 +51,8 @@ func (r *userRepo) Create(ctx context.Context, user *database.User) error {
 	query := `
 		INSERT INTO users (
 			telegram_id, username, eoa_address, proxy_address,
-			encrypted_key, settings, is_active
-		) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			encrypted_key, settings, is_active, account_type
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING created_at, updated_at
 	`
 
@@ -51,6 +64,7 @@ func (r *userRepo) Create(ctx context.Context, user *database.User) error {
 		user.EncryptedKey,
 		user.Settings,
 		user.IsActive,
+		accountTypeOrDefault(user.AccountType),
 	).Scan(&user.CreatedAt, &user.UpdatedAt)
 
 	if err != nil {
@@ -65,7 +79,7 @@ func (r *userRepo) GetByTelegramID(ctx context.Context, telegramID int64) (*data
 	query := `
 		SELECT
 			telegram_id, username, eoa_address, proxy_address,
-			encrypted_key, settings, is_active, created_at, updated_at
+			encrypted_key, settings, is_active, account_type, created_at, updated_at
 		FROM users
 		WHERE telegram_id = $1
 	`
@@ -79,6 +93,7 @@ func (r *userRepo) GetByTelegramID(ctx context.Context, telegramID int64) (*data
 		&user.EncryptedKey,
 		&user.Settings,
 		&user.IsActive,
+		&user.AccountType,
 		&user.CreatedAt,
 		&user.UpdatedAt,
 	)
@@ -98,7 +113,7 @@ func (r *userRepo) GetByEOAAddress(ctx context.Context, address string) (*databa
 	query := `
 		SELECT
 			telegram_id, username, eoa_address, proxy_address,
-			encrypted_key, settings, is_active, created_at, updated_at
+			encrypted_key, settings, is_active, account_type, created_at, updated_at
 		FROM users
 		WHERE LOWER(eoa_address) = LOWER($1)
 	`
@@ -112,6 +127,7 @@ func (r *userRepo) GetByEOAAddress(ctx context.Context, address string) (*databa
 		&user.EncryptedKey,
 		&user.Settings,
 		&user.IsActive,
+		&user.AccountType,
 		&user.CreatedAt,
 		&user.UpdatedAt,
 	)
@@ -131,7 +147,7 @@ func (r *userRepo) GetByProxyAddress(ctx context.Context, address string) (*data
 	query := `
 		SELECT
 			telegram_id, username, eoa_address, proxy_address,
-			encrypted_key, settings, is_active, created_at, updated_at
+			encrypted_key, settings, is_active, account_type, created_at, updated_at
 		FROM users
 		WHERE LOWER(proxy_address) = LOWER($1)
 	`
@@ -145,6 +161,7 @@ func (r *userRepo) GetByProxyAddress(ctx context.Context, address string) (*data
 		&user.EncryptedKey,
 		&user.Settings,
 		&user.IsActive,
+		&user.AccountType,
 		&user.CreatedAt,
 		&user.UpdatedAt,
 	)
@@ -169,6 +186,7 @@ func (r *userRepo) Update(ctx context.Context, user *database.User) error {
 			encrypted_key = $5,
 			settings = $6,
 			is_active = $7,
+			account_type = $8,
 			updated_at = NOW()
 		WHERE telegram_id = $1
 		RETURNING updated_at
@@ -182,6 +200,7 @@ func (r *userRepo) Update(ctx context.Context, user *database.User) error {
 		user.EncryptedKey,
 		user.Settings,
 		user.IsActive,
+		accountTypeOrDefault(user.AccountType),
 	).Scan(&user.UpdatedAt)
 
 	if err != nil {
@@ -278,7 +297,7 @@ func (r *userRepo) List(ctx context.Context, offset, limit int) ([]*database.Use
 	query := `
 		SELECT
 			telegram_id, username, eoa_address, proxy_address,
-			encrypted_key, settings, is_active, created_at, updated_at
+			encrypted_key, settings, is_active, account_type, created_at, updated_at
 		FROM users
 		ORDER BY created_at DESC
 		LIMIT $1 OFFSET $2

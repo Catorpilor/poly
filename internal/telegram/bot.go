@@ -2316,6 +2316,7 @@ func (b *Bot) executeBuyOrder(ctx context.Context, user *database.User, market *
 		NegativeRisk: market.NegRisk,          // Use negRisk exchange if market is negRisk
 		TakerFeeBps:  orderFeeBps,
 		CalcFeeBps:   calcFeeBps,
+		AccountType:  user.AccountType,
 	}
 
 	log.Printf("Trade request: negRisk=%v, market.NegRisk=%v, orderFeeBps=%d, calcFeeBps=%d", tradeReq.NegativeRisk, market.NegRisk, orderFeeBps, calcFeeBps)
@@ -2405,6 +2406,7 @@ func (b *Bot) executeBuyOrderByIndex(ctx context.Context, user *database.User, m
 		NegativeRisk: market.NegRisk,
 		TakerFeeBps:  orderFeeBps,
 		CalcFeeBps:   calcFeeBps,
+		AccountType:  user.AccountType,
 	}
 
 	log.Printf("Trade request (by index): outcomeIndex=%d, outcomeName=%s, tokenID=%s, negRisk=%v, limitPrice=%.2f, orderFeeBps=%d, calcFeeBps=%d",
@@ -2480,6 +2482,7 @@ func (b *Bot) executeSellOrder(ctx context.Context, user *database.User, market 
 		NegativeRisk: market.NegRisk, // Use negRisk exchange if market is negRisk
 		TakerFeeBps:  orderFeeBps,
 		CalcFeeBps:   calcFeeBps,
+		AccountType:  user.AccountType,
 	}
 
 	log.Printf("Trade request (SELL): outcome=%s, tokenID=%s, negRisk=%v, orderFeeBps=%d, calcFeeBps=%d",
@@ -2555,6 +2558,7 @@ func (b *Bot) executeSellOrderFromPosition(ctx context.Context, user *database.U
 		NegativeRisk: pos.NegativeRisk,
 		TakerFeeBps:  orderFeeBps,
 		CalcFeeBps:   calcFeeBps,
+		AccountType:  user.AccountType,
 	}
 
 	log.Printf("Sell trade request: tokenID=%s, negRisk=%v, conditionID=%s, amount=$%.2f, posShares=%s, posValue=$%.2f, limitPrice=%.2f, orderFeeBps=%d, calcFeeBps=%d",
