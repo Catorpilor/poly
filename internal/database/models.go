@@ -43,6 +43,10 @@ type User struct {
 	Username     string    `json:"username" db:"username"`
 	EOAAddress   string    `json:"eoa_address" db:"eoa_address"`
 	ProxyAddress string    `json:"proxy_address" db:"proxy_address"`
+	// AccountType classifies the trading account architecture
+	// (legacy_proxy | safe | deposit_wallet) so the order signer can pick the
+	// right signature type. Empty is treated as legacy_proxy by the repository.
+	AccountType  string    `json:"account_type" db:"account_type"`
 	EncryptedKey string    `json:"-" db:"encrypted_key"` // Never expose in JSON
 	Settings     JSONB     `json:"settings" db:"settings"`
 	IsActive     bool      `json:"is_active" db:"is_active"`

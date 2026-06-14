@@ -1039,12 +1039,26 @@ func (b *Bot) handlePrivateKeyInput(ctx context.Context, update *tgbotapi.Update
 		log.Printf("No proxy found. Expected proxy address would be: %s", expectedProxy.Hex())
 	}
 
+	// Classify the trading account so the order signer can pick the right
+	// signature type later (legacy proxy / Safe / deposit wallet). Best-effort:
+	// if the proxy isn't deployed or classification fails, leave it empty and
+	// the repository defaults to legacy_proxy.
+	accountType := ""
+	if proxyAddress != "" && b.blockchain != nil {
+		classifier := polymarket.NewAccountClassifier(b.blockchain.GetClient())
+		if at, err := classifier.Classify(ctx, common.HexToAddress(proxyAddress)); err == nil && at != polymarket.AccountUnknown {
+			accountType = string(at)
+			log.Printf("Classified account %s as %s for EOA %s", proxyAddress, accountType, userWallet.EOAAddress.Hex())
+		}
+	}
+
 	// Create user in database
 	newUser := &database.User{
 		TelegramID:   userID,
 		Username:     username,
 		EOAAddress:   userWallet.EOAAddress.Hex(),
 		ProxyAddress: proxyAddress, // Set the proxy if found
+		AccountType:  accountType,  // empty -> repo defaults to legacy_proxy
 		EncryptedKey: encryptedKey,
 		Settings:     database.JSONB{},
 		IsActive:     true,

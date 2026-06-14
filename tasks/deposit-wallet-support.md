@@ -61,15 +61,18 @@ Reverse-engineered from real SDK source (npm pack + git clone of clob-client-v2 
       - resolve collateral token for V2 (USDC.e `0xC011…` vs pUSD/Polymarket USD) for approvals;
       - confirm delegate/impl `0xe6Cae8…555B` vs beacon/impl; one real end-to-end live order.
 
-## MILESTONE 1 — Account-type detection + storage
-- [ ] `migrations/00X_account_type.sql` (+ down): add `users.account_type`
-      (`legacy_proxy` | `safe` | `deposit_wallet`), default `legacy_proxy`, backfill existing rows.
-- [ ] Detector (on-chain, reuses RPC): inspect proxy/account code —
-      EIP-7702 prefix `0xef0100`, new-factory clone, or Safe `getOwners()` — to classify.
-      Fall back to a Polymarket lookup if needed.
-- [ ] Set `account_type` at `/import`; expose for routing. TDD with recorded bytecode fixtures.
-- [ ] FIX existing bug: signer-type heuristic assumes proxy ⇒ Safe(2); make it derive from
-      `account_type`/on-chain type instead (`0x4b2f` is a clone, not a Safe).
+## MILESTONE 1 — Account-type detection + storage (DONE)
+- [x] `migrations/006_account_type.sql` (+ down): `users.account_type`
+      (`legacy_proxy` | `safe` | `deposit_wallet`), NOT NULL default `legacy_proxy`. Applied to dev DB.
+- [x] `polymarket/account_type.go`: `AccountClassifier.Classify` (on-chain) —
+      `factory()==depositWalletFactory` ⇒ deposit_wallet; `getOwners()` answers ⇒ safe; else
+      legacy_proxy; empty code ⇒ unknown (caller defaults). `AccountType.SignatureType()` mapping.
+- [x] Unit tests (`account_type_test.go`) with a mock eth client — all branches + mapping.
+- [x] Model `User.AccountType` + repo Create/Update/3×SELECT plumbing (`accountTypeOrDefault`).
+- [x] Wired into `/import` finalize (best-effort classify of resolved proxy).
+- [x] Verified row fix: lastsaga set to `deposit_wallet` (proxy `0x4b2f…`); full suite + build green.
+- [ ] DEFERRED to M3: the signer-type heuristic fix (proxy ⇒ Safe(2)) — belongs with the trading
+      wiring that threads `account_type` into `ExecuteTrade`.
 
 ## MILESTONE 2 — Signer (DONE)
 - [x] `orderv2/deposit_wallet.go`: `BuildSignedDepositWalletOrder` + ERC-7739 helpers
