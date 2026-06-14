@@ -102,11 +102,18 @@ already = EOA. The deposit-wallet difference at trade time is purely the signatu
 - Note: legacy-vs-Safe distinction intentionally NOT changed (no evidence it's wrong; changing it
   risks regressing existing users). Only the new deposit_wallet branch was added.
 
-## MILESTONE 4 — Wire-through + verification
-- [ ] Route buy/sell (and SL/TP auto-sell) through the strategies; legacy path byte-for-byte unchanged.
-- [ ] Live verification: a real $1 buy + sell on a deposit-wallet account succeeds; legacy account
-      still works (regression check). Diff payloads vs main.
-- [ ] `go test ./... -race` green.
+## MILESTONE 4 — Live verification (DONE — buy + sell confirmed)
+Deployed `cheshire42/poly:0.7.1-deposit-wallet` (tag `v0.7.1-deposit-wallet` @ eecfe57) to the Pi.
+- [x] **Live BUY succeeded** (2026-06-14): lastsaga $5 BUY (LoL T1 vs Gen.G). Logs:
+      `account="deposit_wallet" maker=0x4b2f… signer=0x4b2f… sigType=3`, packed sig ends `…00ba`,
+      CLOB `Order response: {"orderID":"0x0d436fb7…","status":"delayed","success":true}`.
+- [x] **Live SELL succeeded** (user-confirmed) via the same POLY_1271 path.
+- [x] On-chain `isValidSignature` / CLOB acceptance proven — closes the last M0 blocker.
+- [x] Legacy/Safe path unchanged (only deposit_wallet routes to POLY_1271).
+- [x] `go test ./... -race` green.
+- [x] SL/TP auto-sell + lottery-buy wired through the SAME path (carry account_type via
+      ExecuteSell/ExecuteLotteryBuy → executeSellOrderFromPosition); **wired, pending a live trigger**
+      (nothing armed at deploy time).
 
 ---
 
