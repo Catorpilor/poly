@@ -51,6 +51,26 @@ func (t AccountType) SignatureType() orderv2.SignatureType {
 	}
 }
 
+// resolveOrderSigner picks the order maker, signer, and signature type for a
+// trade from the controlling EOA, the (optional) proxy/contract account, and
+// the stored account type:
+//
+//   - no proxy (or proxy == EOA): bare EOA order (maker == signer == EOA).
+//   - deposit_wallet: ERC-1271 — maker == signer == the deposit-wallet contract;
+//     the EOA only produces the inner signature (POLY_1271).
+//   - any other proxy account: legacy behavior — maker = proxy, signer = EOA,
+//     POLY_GNOSIS_SAFE. Legacy/Safe routing is intentionally left unchanged to
+//     avoid regressing existing users (see docs/deposit-wallet-flow.md).
+func resolveOrderSigner(eoa, proxy common.Address, accountType string) (maker, signer common.Address, sigType orderv2.SignatureType) {
+	if proxy == (common.Address{}) || proxy == eoa {
+		return eoa, eoa, orderv2.EOA
+	}
+	if accountType == string(AccountDepositWallet) {
+		return proxy, proxy, orderv2.POLY_1271
+	}
+	return proxy, eoa, orderv2.POLY_GNOSIS_SAFE
+}
+
 // accountCodeCaller is the read-only on-chain surface the classifier needs.
 // *ethclient.Client satisfies it.
 type accountCodeCaller interface {

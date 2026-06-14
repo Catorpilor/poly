@@ -129,6 +129,37 @@ func TestAccountTypeSignatureType(t *testing.T) {
 	}
 }
 
+func TestResolveOrderSigner(t *testing.T) {
+	eoa := common.HexToAddress("0xf6C73cB22eEA470d479a3e40a1BaD1292f318B01")
+	proxy := common.HexToAddress("0x4b2f0b7B91319419d52f01cAf7D73D453770318b")
+	zero := common.Address{}
+
+	tests := []struct {
+		name        string
+		proxy       common.Address
+		accountType string
+		wantMaker   common.Address
+		wantSigner  common.Address
+		wantSig     orderv2.SignatureType
+	}{
+		{"no proxy -> EOA order", zero, "", eoa, eoa, orderv2.EOA},
+		{"proxy == eoa -> EOA order", eoa, "legacy_proxy", eoa, eoa, orderv2.EOA},
+		{"deposit wallet -> 1271, maker==signer==proxy", proxy, "deposit_wallet", proxy, proxy, orderv2.POLY_1271},
+		{"legacy proxy -> safe sig, signer=EOA", proxy, "legacy_proxy", proxy, eoa, orderv2.POLY_GNOSIS_SAFE},
+		{"safe -> safe sig, signer=EOA", proxy, "safe", proxy, eoa, orderv2.POLY_GNOSIS_SAFE},
+		{"unknown/empty -> legacy default (safe)", proxy, "", proxy, eoa, orderv2.POLY_GNOSIS_SAFE},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			maker, signer, sig := resolveOrderSigner(eoa, tt.proxy, tt.accountType)
+			if maker != tt.wantMaker || signer != tt.wantSigner || sig != tt.wantSig {
+				t.Errorf("resolveOrderSigner = (%s, %s, %d), want (%s, %s, %d)",
+					maker.Hex(), signer.Hex(), sig, tt.wantMaker.Hex(), tt.wantSigner.Hex(), tt.wantSig)
+			}
+		})
+	}
+}
+
 func leftPad32(n *big.Int) []byte {
 	w := make([]byte, 32)
 	b := n.Bytes()

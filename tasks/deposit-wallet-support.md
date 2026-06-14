@@ -86,15 +86,21 @@ Reverse-engineered from real SDK source (npm pack + git clone of clob-client-v2 
 - Note: signer strategy kept as a Builder method + dispatch (simpler than a separate interface);
   revisit interface extraction only if a second submitter path is needed (it isn't — same /order).
 
-## MILESTONE 3 — Submission + approvals + fix proxy derivation
-NOTE (from M0): order submission is the SAME `POST /order` for all sig types — no submitter split needed.
-The deposit-wallet difference is (a) the signature (M2) and (b) one-time setup via relayer-v2.
-- [ ] One-time deposit-wallet setup: ensure wallet deployed (relayer-v2 WALLET-CREATE) + approvals
-      (7 ERC-20 + 9 ERC-1155, bundled gasless via relayer-v2) before first order.
-- [ ] `POLY_ADDRESS` auth header = EOA (not the wallet); reuse existing L2 HMAC creds.
-- [ ] Resolve proxy correctly for new-factory accounts (close [[project_new_proxy_factory]]):
-      on-chain `owner()` reverse-check or Polymarket signer→proxy lookup; store on user.
-- [ ] `ExecuteTrade` becomes a thin orchestrator: pick Signer + Submitter by `account_type`.
+## MILESTONE 3 — Wire signer into trading (DONE for signing path)
+NOTE (from M0): order submission is the SAME `POST /order` for all sig types; `POLY_ADDRESS` header
+already = EOA. The deposit-wallet difference at trade time is purely the signature.
+- [x] `resolveOrderSigner(eoa, proxy, accountType)` → (maker, signer, sigType): deposit_wallet ⇒
+      maker==signer==proxy + POLY_1271 (routes to the M2 signer); legacy/Safe unchanged
+      (maker=proxy, signer=EOA, POLY_GNOSIS_SAFE); no proxy ⇒ EOA. Unit-tested (6 cases).
+- [x] `TradeRequest.AccountType` threaded into all 6 trade sites (buy/sell/sltp/webserver).
+- [x] `ExecuteTrade` uses `resolveOrderSigner` instead of the proxy⇒Safe heuristic.
+- [x] Minimal-impact: ONLY deposit_wallet gets new routing; legacy/Safe byte-identical to before.
+- [x] Full suite + build green.
+- [ ] GAP (only for a FRESH deposit wallet): one-time deploy (relayer-v2 WALLET-CREATE) + approvals
+      (7 ERC-20 + 9 ERC-1155). lastsaga's wallet is already deployed+approved (traded on web), so M4
+      can test without this. Implement before supporting brand-new deposit wallets.
+- Note: legacy-vs-Safe distinction intentionally NOT changed (no evidence it's wrong; changing it
+  risks regressing existing users). Only the new deposit_wallet branch was added.
 
 ## MILESTONE 4 — Wire-through + verification
 - [ ] Route buy/sell (and SL/TP auto-sell) through the strategies; legacy path byte-for-byte unchanged.

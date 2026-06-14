@@ -530,6 +530,7 @@ func (b *Bot) ExecuteLotteryBuy(ctx context.Context, arm *database.SLTPArm,
 		NegativeRisk: arm.NegRisk, // same condition → same neg-risk
 		TakerFeeBps:  orderFeeBps,
 		CalcFeeBps:   0,
+		AccountType:  user.AccountType,
 	}
 
 	log.Printf("Lottery BUY: user=%d arm=%d otherToken=%s outcome=%s spend<=%.2f price<=%.4f",

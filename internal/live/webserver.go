@@ -736,6 +736,7 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 		TakerFeeBps:  orderFeeBps,
 		CalcFeeBps:   calcFeeBps,
 		NegativeRisk: negRisk,
+		AccountType:  user.AccountType,
 	}
 
 	// Execute the trade
