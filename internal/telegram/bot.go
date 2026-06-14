@@ -145,6 +145,7 @@ func (b *Bot) registerHandlers() {
 	b.handlers["/orders"] = b.handleOrders
 	b.handlers["/cancel"] = b.handleCancel
 	b.handlers["/positions"] = b.handlePositions
+	b.handlers["/combos"] = b.handleCombos
 	b.handlers["/pnl"] = b.handlePNL
 	b.handlers["/history"] = b.handleHistory
 	b.handlers["/settings"] = b.handleSettings
@@ -179,6 +180,7 @@ func (b *Bot) Start(ctx context.Context) error {
 		{Command: "sell", Description: "Sell YES or NO tokens"},
 		{Command: "orders", Description: "Show open orders"},
 		{Command: "positions", Description: "Show all positions"},
+		{Command: "combos", Description: "Show combo (multi-leg) positions"},
 		{Command: "pnl", Description: "Calculate unrealized P&L"},
 		{Command: "redeem", Description: "Claim all resolved positions"},
 		{Command: "help", Description: "Show help message"},
@@ -973,6 +975,9 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, update *tgbotapi.Update) 
 
 	case data == "refresh_positions":
 		b.handleRefreshPositions(ctx, update)
+
+	case data == "refresh_combos":
+		b.handleRefreshCombos(ctx, update)
 
 	case data == "sell_positions":
 		b.handleSellPositions(ctx, update)
