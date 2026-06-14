@@ -298,10 +298,10 @@ The signing/submission/approval mechanics are CONFIRMED from two independent SDK
 - The "lastsaga" example addresses (`0xf6C73cB2…`, `0x4b2f…`, `0xB8bd…`, `0xe6Cae8…555B`). Only the factory `…Cc07` cross-checks. **Must be confirmed on-chain before use.**
 
 ### UNKNOWNS that still BLOCK implementation
-1. **`contentsType` length trailer conflict** (`0x0105` vs `0x00f8`). Load-bearing. Compute at runtime; resolve via a golden vector. **(blocker for signature correctness)**
+1. ✅ **RESOLVED — `contentsType` trailer**: the canonical `ORDER_TYPE_STRING` is **186 bytes → `0x00ba`** (both discovery agents were wrong). Verified by an independent Go re-implementation reproducing the SDK golden vector byte-for-byte (see §7). Still compute at runtime, but the expected value is known.
 2. **On-chain verifier** (`isValidSignature`, magic `0x1626ba7e`, Solady ERC-1271 impl) is NOT in any acquired source. Needed to confirm exact reconstruction & the trailer encoding the contract reads. **Source from on-chain bytecode / contracts repo.** **(blocker for verification confidence)**
 3. **Deposit-wallet address derivation** — exact CREATE2 init-code hash + salt and the beacon-vs-direct (`it()`/`st()`) choice were not decoded from the minified bundle. **(blocker if Go must derive the wallet address itself)**
-4. **TS↔Python digest equivalence proof** — both are claimed identical, but the exact equivalence (TS passes the DepositWallet domain to viem while Python signs the Exchange-separated digest) should be proven against a known-good vector. **(verify, not necessarily a blocker)**
+4. ✅ **RESOLVED — digest reproducibility**: an independent Go implementation (go-ethereum `crypto.Sign`) reproduces the Python test's `EXPECTED_POLY_1271_SIGNATURE` exactly — identical `appDomainSep`, `contentsHash`, and final packed blob. The §3 algorithm is confirmed end-to-end (see §7 verified vector).
 5. **Collateral token post-migration** — beta source still uses USDC.e `0xC011…`; whether this is re-pointed to pUSD / Polymarket USD, or pUSD needs separate approvals, is unknown. (See MEMORY: V2 Exchange Migration, USDC.e→Polymarket USD.) **(blocker for approvals correctness post-migration)**
 6. **Live exchange version** — v2 vs v3 for deposit-wallet orders is server-driven; client must handle version-mismatch retry.
 7. **Order acceptance precondition** — whether `/order` requires the wallet already deployed, and whether any extra `deferExec`/gasless flag is needed for deposit-wallet orders.
@@ -311,7 +311,31 @@ The signing/submission/approval mechanics are CONFIRMED from two independent SDK
 
 ## 7. Suggested golden-vector tests for the Go signer
 
-Build these as table-driven tests; mock all network. The first priority is a **known-good signature vector** to resolve the trailer-length conflict (§3) and the TS/Python equivalence (§6).
+Build these as table-driven tests; mock all network.
+
+### ✅ VERIFIED golden vector (master fixture — reproduced in Go from the SDK's `EXPECTED_POLY_1271_SIGNATURE`)
+
+Source: `gh-py-clob-client-v2/tests/order_utils/test_exchange_order_builder_v2.py`. An independent
+Go re-implementation of §3 (go-ethereum `crypto.Sign`, `v += 27`) produces the packed signature
+below **byte-for-byte**. Use this as the canonical Go signer test.
+
+Inputs:
+- privKey `0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80` (anvil #0) → EOA `0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266`
+- chainId `80002`; exchange (appDomain `verifyingContract`) `0xE111180000d2663C0091e4f400237545B87B996B`; domain name `"Polymarket CTF Exchange"`, version `"2"`
+- order: salt `479249096354`, maker = signer = `0x1111111111111111111111111111111111111111`, tokenId `1234`, makerAmount `100000000`, takerAmount `50000000`, side `BUY` (0), signatureType `3`, timestamp `1710000000000`, metadata `0x00..00`, builder `0x00..00`, expiration `"0"`
+
+Intermediates (assert each):
+- `appDomainSep` = `0xa440cbd865bc0c6243d7a8df9a8bf48a8827b0a4abbb61c30e96d305423af148`
+- `contentsHash` = `0xd23d42d3ad94e65d78258cecaf8dcbaddac0f73dc085040f2c12bb595dd83804`
+- `digest`       = `0xc31d535831b64decf4687570628e5765c218fc3c4a7b582c7bd3105525f76a8c`
+- `contentsType` len = `186` → trailer `0x00ba`
+
+Expected packed `order.signature`:
+```
+0xa3a093c83b6c20c83355c16ce94c92e6e9fcbdeb840618cc74f6c57a42ad145b2b98db73d2c73cbf1f2b6af288566ae81960ddbc3a13921027358a8bff3be6ff1ca440cbd865bc0c6243d7a8df9a8bf48a8827b0a4abbb61c30e96d305423af148d23d42d3ad94e65d78258cecaf8dcbaddac0f73dc085040f2c12bb595dd838044f726465722875696e743235362073616c742c61646472657373206d616b65722c61646472657373207369676e65722c75696e7432353620746f6b656e49642c75696e74323536206d616b6572416d6f756e742c75696e743235362074616b6572416d6f756e742c75696e743820736964652c75696e7438207369676e6174757265547970652c75696e743235362074696d657374616d702c62797465733332206d657461646174612c62797465733332206275696c6465722900ba
+```
+
+### Additional table-driven tests
 
 1. **`ORDER_TYPE_STRING` canonical bytes** — assert the exact string and that `len()` matches whatever the on-chain verifier expects. Emit both candidate trailers (`0x0105`, `0x00f8`) and FAIL loudly until reconciled with a real vector. (Resolves blocker #1.)
 2. **`ORDER_TYPE_HASH` / `DOMAIN_TYPE_HASH` / `SOLADY_TYPE_HASH`** — assert each keccak256 against hashes captured from running the TS/Python SDK on the same inputs.
@@ -327,4 +351,4 @@ Build these as table-driven tests; mock all network. The first priority is a **k
 12. **Approvals diff** — given mocked `allowance`/`isApprovedForAll` responses, assert exactly the missing approvals are emitted, with `owner = deposit-wallet`, and that the deposit-wallet path bundles them into one gasless call.
 13. **(Once verifier is sourced)** Negative test: a blob with the wrong trailer length / wrong `contentsType` must be rejected by a local re-implementation of `isValidSignature`.
 
-> The single most valuable artifact is **one real, known-good `(order, signature)` pair** produced by the TS or Python SDK with a fixed key. Capture it before writing the Go signer; it collapses blockers #1 and #4 immediately.
+> ✅ Done — the known-good `(order, signature)` pair is captured and reproduced in Go above; blockers #1 and #4 are closed.

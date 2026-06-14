@@ -52,11 +52,14 @@ Reverse-engineered from real SDK source (npm pack + git clone of clob-client-v2 
 - [x] **ORDER_TYPE_STRING resolved**: 186 bytes → trailer `0x00ba` (measured from source; both agents wrong).
 - [x] Verifying contract = CTF Exchange V2/V3 (NOT the deposit wallet).
 - [x] Output written: `docs/deposit-wallet-flow.md`.
-- [ ] REMAINING BLOCKERS before build (overall confidence MEDIUM):
-      - capture ONE known-good (order, signature) golden vector from TS/Python SDK with a fixed key;
-      - confirm on-chain `isValidSignature` reconstruction (Solady 1271 verifier not in source);
-      - resolve collateral token for V2 (USDC.e `0xC011…` vs pUSD/Polymarket USD);
-      - confirm delegate/impl `0xe6Cae8…555B` vs beacon/impl; verify lastsaga digest end-to-end.
+- [x] **Golden vector captured + reproduced in Go** — independent go-ethereum impl matches the SDK's
+      EXPECTED_POLY_1271_SIGNATURE byte-for-byte (appDomainSep/contentsHash/digest all match). §3
+      algorithm confirmed end-to-end; trailer = 186/0x00ba. Vector recorded in docs §7.
+- [ ] REMAINING BLOCKERS before build (confidence now MEDIUM-HIGH):
+      - confirm on-chain `isValidSignature` reconstruction (Solady 1271 verifier not in source) — the
+        signer is proven, but acceptance by the live wallet contract is still unverified;
+      - resolve collateral token for V2 (USDC.e `0xC011…` vs pUSD/Polymarket USD) for approvals;
+      - confirm delegate/impl `0xe6Cae8…555B` vs beacon/impl; one real end-to-end live order.
 
 ## MILESTONE 1 — Account-type detection + storage
 - [ ] `migrations/00X_account_type.sql` (+ down): add `users.account_type`
