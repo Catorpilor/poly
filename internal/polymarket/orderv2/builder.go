@@ -111,7 +111,15 @@ func VerifyingContractAddress(c VerifyingContract) (common.Address, error) {
 
 // BuildSignedOrder builds a V2 order, hashes it, signs it, and verifies the
 // signature recovers to the signer address.
+//
+// POLY_1271 (deposit-wallet) orders are routed to the ERC-7739 signing path,
+// which produces a packed smart-contract-wallet signature instead of a plain
+// 65-byte ECDSA signature. All other signature types use the legacy ECDSA path.
 func (b *Builder) BuildSignedOrder(privateKey *ecdsa.PrivateKey, data *OrderData, contract VerifyingContract) (*SignedOrder, error) {
+	if data != nil && data.SignatureType == POLY_1271 {
+		return b.BuildSignedDepositWalletOrder(privateKey, data, contract)
+	}
+
 	order, err := b.BuildOrder(data)
 	if err != nil {
 		return nil, err

@@ -71,12 +71,17 @@ Reverse-engineered from real SDK source (npm pack + git clone of clob-client-v2 
 - [ ] FIX existing bug: signer-type heuristic assumes proxy ⇒ Safe(2); make it derive from
       `account_type`/on-chain type instead (`0x4b2f` is a clone, not a Safe).
 
-## MILESTONE 2 — Signer strategy interface
-- [ ] Define `OrderSigner` interface; implementations:
-      - `LegacySigner` (current ECDSA over EIP-712, types 0/1/2) — extract from `orderv2`/`trading.go`,
-        behavior-preserving.
-      - `DepositWalletSigner` (ERC-7739-wrapped ERC-1271, type 3).
-- [ ] Table-driven tests: golden signature vectors captured from the TS SDK in Milestone 0.
+## MILESTONE 2 — Signer (DONE)
+- [x] `orderv2/deposit_wallet.go`: `BuildSignedDepositWalletOrder` + ERC-7739 helpers
+      (exchangeDomainSeparator / orderStructHash / typedDataSignStructHash); produces the packed
+      `innerSig(65)‖appDomainSep(32)‖contentsHash(32)‖contentsType‖uint16` blob.
+- [x] Coexistence: `BuildSignedOrder` dispatches POLY_1271 → deposit-wallet path; legacy 0/1/2
+      ECDSA path unchanged (regression test `TestLegacyPathUnchangedForEOA`).
+- [x] Golden test `deposit_wallet_test.go`: full packed sig + intermediates (appDomainSep,
+      contentsHash) match the SDK vector byte-for-byte; trailer/maker==signer invariants.
+- [x] `go test -race ./internal/polymarket/orderv2/` green; full suite green; build clean.
+- Note: signer strategy kept as a Builder method + dispatch (simpler than a separate interface);
+  revisit interface extraction only if a second submitter path is needed (it isn't — same /order).
 
 ## MILESTONE 3 — Submission + approvals + fix proxy derivation
 NOTE (from M0): order submission is the SAME `POST /order` for all sig types — no submitter split needed.
