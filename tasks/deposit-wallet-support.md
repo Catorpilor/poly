@@ -39,16 +39,24 @@ so the discovery spike and the type-3 signer are shared with [[tasks/todo.md]] (
 
 ---
 
-## MILESTONE 0 — Discovery spike (HARD GATE; shared with combos)
-The docs don't specify the wire format; reverse-engineer it.
-- [ ] Read `@polymarket/client@beta` (npm/TS) — extract exactly:
-      - ERC-7739 wrapping (TypedDataSign nesting: contents hash, app domain separator, suffix).
-      - signatureType=3 payload shape; what goes in `signature` for ERC-1271.
-      - which address is `maker` for deposit wallets (the `0x4b2f` proxy vs `0xB8bd` 7702 wallet).
-      - submission endpoint + exchange/relayer-v2 contracts for the deposit-wallet flow.
-      - required token approvals (setupTradingApprovals equivalent).
-- [ ] Verify one signed order is ACCEPTED end-to-end on a tiny live trade.
-- [ ] Output: `docs/deposit-wallet-flow.md` (authoritative spec). Until this passes, do not build below.
+## MILESTONE 0 — Discovery spike (MOSTLY DONE; see docs/deposit-wallet-flow.md)
+Reverse-engineered from real SDK source (npm pack + git clone of clob-client-v2 / py-clob-client-v2).
+- [x] ERC-7739 wrapping — full 5-step `TypedDataSign` algorithm captured (field order, sub-domain folding).
+- [x] signatureType=3 (POLY_1271) payload — packed `signature` = innerSig(65)‖appDomainSep(32)‖
+      contentsHash(32)‖contentsType‖uint16 len. `maker == signer == deposit-wallet contract`.
+- [x] **maker resolved**: `0x4b2f` IS the deposit wallet (deployed by `depositWalletFactory 0x…Cc07`,
+      `owner()`=EOA, holds positions). `0xB8bd` (EIP-7702) is a separate funding address.
+- [x] **Submission CORRECTED**: same `POST /order` CLOB endpoint for ALL sig types — NOT a relayer.
+      relayer-v2 is only wallet-deploy + gasless approvals.
+- [x] Approvals: 7 ERC-20 max + 9 ERC-1155 setApprovalForAll; non-EOA bundles via relayer.
+- [x] **ORDER_TYPE_STRING resolved**: 186 bytes → trailer `0x00ba` (measured from source; both agents wrong).
+- [x] Verifying contract = CTF Exchange V2/V3 (NOT the deposit wallet).
+- [x] Output written: `docs/deposit-wallet-flow.md`.
+- [ ] REMAINING BLOCKERS before build (overall confidence MEDIUM):
+      - capture ONE known-good (order, signature) golden vector from TS/Python SDK with a fixed key;
+      - confirm on-chain `isValidSignature` reconstruction (Solady 1271 verifier not in source);
+      - resolve collateral token for V2 (USDC.e `0xC011…` vs pUSD/Polymarket USD);
+      - confirm delegate/impl `0xe6Cae8…555B` vs beacon/impl; verify lastsaga digest end-to-end.
 
 ## MILESTONE 1 — Account-type detection + storage
 - [ ] `migrations/00X_account_type.sql` (+ down): add `users.account_type`
@@ -67,9 +75,12 @@ The docs don't specify the wire format; reverse-engineer it.
       - `DepositWalletSigner` (ERC-7739-wrapped ERC-1271, type 3).
 - [ ] Table-driven tests: golden signature vectors captured from the TS SDK in Milestone 0.
 
-## MILESTONE 3 — Submitter strategy + fix proxy derivation
-- [ ] Define `OrderSubmitter` interface: `LegacyCLOBSubmitter` (`POST /order`) vs
-      `DepositWalletSubmitter` (relayer-v2 / new endpoint + approvals).
+## MILESTONE 3 — Submission + approvals + fix proxy derivation
+NOTE (from M0): order submission is the SAME `POST /order` for all sig types — no submitter split needed.
+The deposit-wallet difference is (a) the signature (M2) and (b) one-time setup via relayer-v2.
+- [ ] One-time deposit-wallet setup: ensure wallet deployed (relayer-v2 WALLET-CREATE) + approvals
+      (7 ERC-20 + 9 ERC-1155, bundled gasless via relayer-v2) before first order.
+- [ ] `POLY_ADDRESS` auth header = EOA (not the wallet); reuse existing L2 HMAC creds.
 - [ ] Resolve proxy correctly for new-factory accounts (close [[project_new_proxy_factory]]):
       on-chain `owner()` reverse-check or Polymarket signer→proxy lookup; store on user.
 - [ ] `ExecuteTrade` becomes a thin orchestrator: pick Signer + Submitter by `account_type`.
