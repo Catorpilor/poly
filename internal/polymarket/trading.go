@@ -661,68 +661,19 @@ func (tc *TradingClient) ExecuteTrade(
 	price = roundToTick(price, tick)
 	log.Printf("ExecuteTrade: Price rounded to tick=%g → %.4f", tick, price)
 
-	// Calculate order amounts
-	// For BUY: makerAmount = USDC spent, takerAmount = shares received
-	// For SELL: makerAmount = shares sold, takerAmount = USDC received
-	//
-	// Polymarket decimal precision requirements:
-	// - BUY orders: makerAmount (USDC) max 4 decimals, takerAmount (shares) max 2 decimals
-	// - SELL orders: makerAmount (shares) max 2 decimals, takerAmount (USDC) max 4 decimals
-	// With 6 decimal representation:
-	// - 4 decimals = must be divisible by 100
-	// - 2 decimals = must be divisible by 10000
-	var makerAmount, takerAmount string
-	var side orderv2.Side
-
-	if strings.ToUpper(trade.Side) == "BUY" {
-		side = orderv2.BUY
-		// BUY: spending USDC to get shares
-		// Step 1: Calculate shares from USDC amount, accounting for taker fee
-		// Dynamic fee formula: fee = C × feeRate × p × (1 - p)
-		// Total cost = C × p + C × feeRate × p × (1-p) = C × p × (1 + feeRate × (1-p))
-		// So: shares = amount / (price * (1 + feeRate * (1 - price)))
-		// Use CalcFeeBps (Gamma dynamic rate) for share estimation, TakerFeeBps for the order
-		// takerAmount (shares): max 2 decimals -> round down to nearest 10000
-		calcFeeDecimal := float64(trade.CalcFeeBps) / 10000.0
-		effectivePrice := price * (1 + calcFeeDecimal*(1-price))
-		shares := int64((trade.Amount / effectivePrice) * 1e6)
-		sharesRounded := (shares / 10000) * 10000
-		takerAmount = strconv.FormatInt(sharesRounded, 10)
-		// Step 2: Calculate makerAmount FROM shares * price to ensure consistency
-		// This is critical: Polymarket validates makerAmount == takerAmount * price
-		// makerAmount (USDC): max 4 decimals -> round to nearest 100
-		// Note: makerAmount is the base cost, fee is added separately by exchange
-		// Use math.Round to avoid floating-point truncation errors (e.g., 75*0.69 = 51.7499...)
-		makerAmountRaw := int64(math.Round(float64(sharesRounded) * price))
-		makerAmountRaw = ((makerAmountRaw + 50) / 100) * 100
-		makerAmount = strconv.FormatInt(makerAmountRaw, 10)
-		log.Printf("ExecuteTrade BUY: makerAmount=%s USDC, takerAmount=%s shares (raw=%d), price=%.6f, effectivePrice=%.6f (calcFeeBps=%d, orderFeeBps=%d), originalUSDC=%.2f",
-			makerAmount, takerAmount, shares, price, effectivePrice, trade.CalcFeeBps, trade.TakerFeeBps, trade.Amount)
-	} else {
-		side = orderv2.SELL
-		// SELL: selling shares to get USDC
-		// makerAmount (shares): max 2 decimals -> round to nearest 10000
-		var shares int64
-		if trade.SharesRaw > 0 {
-			// Use exact shares from position (preferred for selling existing positions)
-			shares = trade.SharesRaw
-			log.Printf("ExecuteTrade SELL: Using exact SharesRaw=%d from position", shares)
-		} else {
-			// Calculate from USD amount (fallback)
-			shares = int64((trade.Amount / price) * 1e6)
-			log.Printf("ExecuteTrade SELL: Calculated shares=%d from Amount=%.2f / price=%.6f", shares, trade.Amount, price)
-		}
-		sharesRounded := (shares / 10000) * 10000
-		makerAmount = strconv.FormatInt(sharesRounded, 10)
-		// takerAmount (USDC): calculated from shares * price, max 4 decimals -> round to nearest 100
-		// We calculate from shares to ensure amounts are consistent
-		// Use math.Round to avoid floating-point truncation errors (e.g., 75*0.69 = 51.7499...)
-		takerAmountRaw := int64(math.Round(float64(sharesRounded) * price))
-		takerAmountRaw = ((takerAmountRaw + 50) / 100) * 100
-		takerAmount = strconv.FormatInt(takerAmountRaw, 10)
-		log.Printf("ExecuteTrade SELL: makerAmount=%s shares (raw=%d, rounded=%d), takerAmount=%s USDC (calculated from shares*price), impliedPrice=%.6f",
-			makerAmount, shares, sharesRounded, takerAmount, float64(takerAmountRaw)/float64(sharesRounded))
+	// Calculate order amounts from the tick-rounded price. The CLOB derives
+	// the implied price from the amount ratio, so the dependent amount must
+	// stay exactly on the tick grid — see calcOrderAmounts.
+	makerAmount, takerAmount, amtErr := calcOrderAmounts(trade.Side, trade.Amount, trade.SharesRaw, price, tick, trade.CalcFeeBps)
+	if amtErr != nil {
+		return &TradeResult{Success: false, ErrorMsg: fmt.Sprintf("Cannot build order: %v", amtErr)}, nil
 	}
+	side := orderv2.BUY
+	if strings.ToUpper(trade.Side) != "BUY" {
+		side = orderv2.SELL
+	}
+	log.Printf("ExecuteTrade %s: makerAmount=%s, takerAmount=%s, price=%.6f, tick=%g (calcFeeBps=%d, orderFeeBps=%d), amount=%.2f, sharesRaw=%d",
+		strings.ToUpper(trade.Side), makerAmount, takerAmount, price, tick, trade.CalcFeeBps, trade.TakerFeeBps, trade.Amount, trade.SharesRaw)
 
 	// Determine maker / signer / signature-type from the account architecture.
 	// Deposit wallets (ERC-1271) sign as the contract itself (maker == signer);

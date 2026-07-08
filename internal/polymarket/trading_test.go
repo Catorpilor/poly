@@ -171,37 +171,39 @@ func TestCalculateFee(t *testing.T) {
 func TestBuyShareCalculation(t *testing.T) {
 	t.Parallel()
 
+	// Drives the real order-amount seam (calcOrderAmounts) rather than a
+	// copy of the fee formula, so it fails if ExecuteTrade's math changes.
 	tests := []struct {
 		name       string
 		amount     float64 // USDC to spend
 		price      float64
 		feeRateBps int
-		wantShares float64 // expected shares (before rounding to 6 decimals)
-		tolerance  float64
+		wantShares string // taker amount, raw 1e6 units, floored to 2 decimals
+		wantUSDC   string // maker amount, raw 1e6 units, exact shares×price
 	}{
 		{
 			name:       "Clippers $60 at p=0.57, Sports 30 bps",
 			amount:     60.0,
 			price:      0.57,
 			feeRateBps: 30,
-			wantShares: 105.16, // ~60 / (0.57 * (1 + 0.003 * 0.43)) ≈ 105.16
-			tolerance:  0.5,
+			wantShares: "105120000", // ~60 / (0.57 * (1 + 0.003 * 0.43)) ≈ 105.12
+			wantUSDC:   "59918400",  // 105.12 × 0.57 exactly
 		},
 		{
 			name:       "Crypto $100 at p=0.50, 72 bps",
 			amount:     100.0,
 			price:      0.50,
 			feeRateBps: 72,
-			wantShares: 199.28, // ~100 / (0.50 * (1 + 0.0072 * 0.50)) ≈ 199.28
-			tolerance:  0.5,
+			wantShares: "199280000", // ~100 / (0.50 * (1 + 0.0072 * 0.50)) ≈ 199.28
+			wantUSDC:   "99640000",  // 199.28 × 0.50 exactly
 		},
 		{
 			name:       "Geopolitics $100 at p=0.50, 0 bps (free)",
 			amount:     100.0,
 			price:      0.50,
 			feeRateBps: 0,
-			wantShares: 200.0, // 100 / 0.50 exactly
-			tolerance:  0.01,
+			wantShares: "200000000", // 100 / 0.50 exactly
+			wantUSDC:   "100000000",
 		},
 	}
 
@@ -209,13 +211,13 @@ func TestBuyShareCalculation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			feeDecimal := float64(tt.feeRateBps) / 10000.0
-			effectivePrice := tt.price * (1 + feeDecimal*(1-tt.price))
-			shares := tt.amount / effectivePrice
-
-			if math.Abs(shares-tt.wantShares) > tt.tolerance {
-				t.Errorf("shares = %.4f, want ~%.2f (±%.1f), effectivePrice=%.6f",
-					shares, tt.wantShares, tt.tolerance, effectivePrice)
+			maker, taker, err := calcOrderAmounts("BUY", tt.amount, 0, tt.price, 0.01, tt.feeRateBps)
+			if err != nil {
+				t.Fatalf("calcOrderAmounts() unexpected error: %v", err)
+			}
+			if taker != tt.wantShares || maker != tt.wantUSDC {
+				t.Errorf("calcOrderAmounts() = (maker %s, taker %s), want (maker %s, taker %s)",
+					maker, taker, tt.wantUSDC, tt.wantShares)
 			}
 		})
 	}
