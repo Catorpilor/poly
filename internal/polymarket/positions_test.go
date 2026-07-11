@@ -24,7 +24,7 @@ func TestGetRedeemablePositions_Empty(t *testing.T) {
 	}))
 	defer server.Close()
 
-	pm := NewPositionManagerWithDataAPI(nil, "", server.URL)
+	pm := NewPositionManagerWithDataAPI(server.URL)
 	positions, err := pm.GetRedeemablePositions(context.Background(), common.HexToAddress("0x1234"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -57,7 +57,7 @@ func TestGetRedeemablePositions_StandardMarket(t *testing.T) {
 	}))
 	defer server.Close()
 
-	pm := NewPositionManagerWithDataAPI(nil, "", server.URL)
+	pm := NewPositionManagerWithDataAPI(server.URL)
 	positions, err := pm.GetRedeemablePositions(context.Background(), common.HexToAddress("0x1234"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -110,7 +110,7 @@ func TestGetRedeemablePositions_NegRiskMarket(t *testing.T) {
 	}))
 	defer server.Close()
 
-	pm := NewPositionManagerWithDataAPI(nil, "", server.URL)
+	pm := NewPositionManagerWithDataAPI(server.URL)
 	positions, err := pm.GetRedeemablePositions(context.Background(), common.HexToAddress("0x1234"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -150,7 +150,7 @@ func TestGetRedeemablePositions_FiltersZeroSize(t *testing.T) {
 	}))
 	defer server.Close()
 
-	pm := NewPositionManagerWithDataAPI(nil, "", server.URL)
+	pm := NewPositionManagerWithDataAPI(server.URL)
 	positions, err := pm.GetRedeemablePositions(context.Background(), common.HexToAddress("0x1234"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -188,7 +188,7 @@ func TestGetRedeemablePositions_FiltersLosingPositions(t *testing.T) {
 	}))
 	defer server.Close()
 
-	pm := NewPositionManagerWithDataAPI(nil, "", server.URL)
+	pm := NewPositionManagerWithDataAPI(server.URL)
 	positions, err := pm.GetRedeemablePositions(context.Background(), common.HexToAddress("0x1234"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -216,7 +216,7 @@ func TestGetRedeemablePositions_URLFormat(t *testing.T) {
 	}))
 	defer server.Close()
 
-	pm := NewPositionManagerWithDataAPI(nil, "", server.URL)
+	pm := NewPositionManagerWithDataAPI(server.URL)
 	pm.GetRedeemablePositions(context.Background(), proxyAddr)
 
 	if requestURL == "" {
@@ -250,7 +250,7 @@ func TestGetRedeemablePositions_HTTPError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	pm := NewPositionManagerWithDataAPI(nil, "", server.URL)
+	pm := NewPositionManagerWithDataAPI(server.URL)
 	_, err := pm.GetRedeemablePositions(context.Background(), common.HexToAddress("0x1234"))
 	if err == nil {
 		t.Fatal("expected error for HTTP 500")

@@ -708,7 +708,7 @@ func (b *Bot) handlePositions(ctx context.Context, bot *Bot, update *tgbotapi.Up
 
 	// Fetch positions using Polymarket Data API (no blockchain required)
 	proxyAddr := common.HexToAddress(user.ProxyAddress)
-	unifiedScanner := polymarket.NewUnifiedPositionScanner(nil)
+	unifiedScanner := polymarket.NewUnifiedPositionScanner()
 	summary, err := unifiedScanner.ScanAllStrategies(ctx, proxyAddr)
 	if err != nil {
 		log.Printf("Unified position scan error: %v", err)

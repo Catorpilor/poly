@@ -34,7 +34,7 @@ func (b *Bot) handleRedeem(ctx context.Context, bot *Bot, update *tgbotapi.Updat
 	loadingMsg := b.sendMessageAndReturn(update.Message.Chat.ID, "🎁 *Checking redeemable positions...*")
 
 	proxyAddr := common.HexToAddress(user.ProxyAddress)
-	scanner := polymarket.NewUnifiedPositionScanner(nil)
+	scanner := polymarket.NewUnifiedPositionScanner()
 	positions, err := scanner.GetRedeemablePositions(ctx, proxyAddr)
 	if err != nil {
 		b.editMessage(update.Message.Chat.ID, loadingMsg.MessageID, fmt.Sprintf("❌ Failed to fetch redeemable positions: %v", err))
@@ -76,7 +76,7 @@ func (b *Bot) handleRedeemPositions(ctx context.Context, update *tgbotapi.Update
 	b.editMessage(chatID, messageID, "🎁 *Checking redeemable positions...*")
 
 	proxyAddr := common.HexToAddress(user.ProxyAddress)
-	scanner := polymarket.NewUnifiedPositionScanner(nil)
+	scanner := polymarket.NewUnifiedPositionScanner()
 	positions, err := scanner.GetRedeemablePositions(ctx, proxyAddr)
 	if err != nil {
 		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Failed to fetch redeemable positions: %v", err))

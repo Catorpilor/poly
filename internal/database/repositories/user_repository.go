@@ -32,8 +32,6 @@ type UserRepository interface {
 	UpdateEncryptedKey(ctx context.Context, telegramID int64, encryptedKey string) error
 	UpdateSettings(ctx context.Context, telegramID int64, settings database.JSONB) error
 	SetActive(ctx context.Context, telegramID int64, isActive bool) error
-	List(ctx context.Context, offset, limit int) ([]*database.User, error)
-	Count(ctx context.Context) (int64, error)
 }
 
 // userRepo implements UserRepository interface
@@ -292,55 +290,3 @@ func (r *userRepo) SetActive(ctx context.Context, telegramID int64, isActive boo
 	return nil
 }
 
-// List lists users with pagination
-func (r *userRepo) List(ctx context.Context, offset, limit int) ([]*database.User, error) {
-	query := `
-		SELECT
-			telegram_id, username, eoa_address, proxy_address,
-			encrypted_key, settings, is_active, account_type, created_at, updated_at
-		FROM users
-		ORDER BY created_at DESC
-		LIMIT $1 OFFSET $2
-	`
-
-	rows, err := r.db.Pool.Query(ctx, query, limit, offset)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list users: %w", err)
-	}
-	defer rows.Close()
-
-	var users []*database.User
-	for rows.Next() {
-		user := &database.User{}
-		err := rows.Scan(
-			&user.TelegramID,
-			&user.Username,
-			&user.EOAAddress,
-			&user.ProxyAddress,
-			&user.EncryptedKey,
-			&user.Settings,
-			&user.IsActive,
-			&user.CreatedAt,
-			&user.UpdatedAt,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan user: %w", err)
-		}
-		users = append(users, user)
-	}
-
-	return users, nil
-}
-
-// Count counts total number of users
-func (r *userRepo) Count(ctx context.Context) (int64, error) {
-	query := `SELECT COUNT(*) FROM users`
-
-	var count int64
-	err := r.db.Pool.QueryRow(ctx, query).Scan(&count)
-	if err != nil {
-		return 0, fmt.Errorf("failed to count users: %w", err)
-	}
-
-	return count, nil
-}

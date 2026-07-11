@@ -40,7 +40,7 @@ func (b *Bot) handleSLTPList(ctx context.Context, update *tgbotapi.Update) {
 	b.editMessage(chatID, messageID, "🎯 *Loading SL/TP view...*")
 
 	proxyAddr := common.HexToAddress(user.ProxyAddress)
-	scanner := polymarket.NewUnifiedPositionScanner(nil)
+	scanner := polymarket.NewUnifiedPositionScanner()
 	positions, err := scanner.GetPositions(ctx, proxyAddr)
 	if err != nil {
 		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Failed to fetch positions: %v", err))

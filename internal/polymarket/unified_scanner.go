@@ -4,23 +4,19 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/ethclient"
 )
 
 // UnifiedPositionScanner uses Polymarket Data API for position queries
 type UnifiedPositionScanner struct {
-	client          *ethclient.Client
 	positionManager *PositionManager
 }
 
 // NewUnifiedPositionScanner creates a scanner that uses the Data API
-func NewUnifiedPositionScanner(client *ethclient.Client) *UnifiedPositionScanner {
+func NewUnifiedPositionScanner() *UnifiedPositionScanner {
 	return &UnifiedPositionScanner{
-		client:          client,
-		positionManager: NewPositionManager(client, "https://clob.polymarket.com"),
+		positionManager: NewPositionManager(),
 	}
 }
 
@@ -88,16 +84,4 @@ func (ups *UnifiedPositionScanner) formatPositionsFromAPI(positions []*Position)
 // GetRedeemablePositions fetches redeemable positions for the Claim All flow.
 func (ups *UnifiedPositionScanner) GetRedeemablePositions(ctx context.Context, proxyAddress common.Address) ([]*RedeemablePositionInfo, error) {
 	return ups.positionManager.GetRedeemablePositions(ctx, proxyAddress)
-}
-
-// GetPositionValue attempts to calculate the value of positions
-func (ups *UnifiedPositionScanner) GetPositionValue(ctx context.Context, proxyAddress common.Address) (*big.Int, error) {
-	// This would require:
-	// 1. Getting all position token IDs
-	// 2. Getting balances for each
-	// 3. Getting current prices from CLOB
-	// 4. Calculating total value
-
-	// For now, return a placeholder
-	return big.NewInt(0), fmt.Errorf("position value calculation not implemented")
 }
