@@ -968,7 +968,7 @@
             } else {
                 // 2-way market: direct trade buttons
                 tradeButtons = outcomeLabels.map((label, idx) => `
-                    <button onclick="executeTrade('${slug}', ${idx}, 'BUY')"
+                    <button onclick="executeTrade('${slug}', 0, ${idx})"
                             class="flex-1 px-3 py-2 bg-green-600 hover:bg-green-700 rounded text-sm font-medium transition-colors">
                         Buy ${label}
                     </button>
@@ -1268,16 +1268,14 @@
             }
         }
 
-        // Execute trade for 3-way market (yesNoIndex: 0=Yes, 1=No)
-        async function execute3WayTrade(eventSlug, yesNoIndex) {
+        // Execute trade for 3-way market (outcomeIndex: 0=Yes, 1=No within the selected market)
+        async function execute3WayTrade(eventSlug, outcomeIndex) {
             if (selected3WayMarket.slug !== eventSlug || selected3WayMarket.marketIndex === null) {
                 alert('Please select a market first');
                 return;
             }
 
-            // For 3-way, we send: marketIndex (which market) and yesNoIndex (Yes=0 or No=1)
-            // The backend handles this by selecting the right market and outcome
-            await executeTrade(eventSlug, selected3WayMarket.marketIndex, 'BUY', yesNoIndex);
+            await executeTrade(eventSlug, selected3WayMarket.marketIndex, outcomeIndex);
             hideAll3WayRows();
         }
 
@@ -1293,8 +1291,10 @@
             }
         });
 
-        // Execute a trade
-        async function executeTrade(eventSlug, outcomeIndex, side, yesNoIndex = null) {
+        // Execute a trade. marketIndex picks the ML market within the event
+        // (always 0 for 2-way events), outcomeIndex picks the side within it.
+        // The web UI is buy-only — selling lives in the Telegram bot.
+        async function executeTrade(eventSlug, marketIndex, outcomeIndex) {
             const session = getSession();
             if (!session?.telegramId) {
                 alert('Please login first');
@@ -1307,23 +1307,6 @@
             if (isNaN(amount) || amount <= 0) {
                 alert('Please enter a valid amount');
                 return;
-            }
-
-            // Get outcome name for confirmation
-            const eventData = subscriptions.get(eventSlug);
-            let outcomeName;
-            if (eventData?.outcomes && eventData.outcomes.length > outcomeIndex) {
-                // Use outcome name from market data (preferred)
-                outcomeName = eventData.outcomes[outcomeIndex];
-            } else {
-                // Fall back to team names from slug
-                const teams = eventGameData.get(eventSlug) || getTeamsFromSlug(eventSlug);
-                const parts = eventSlug.toLowerCase().split('-');
-                const league = parts[0] || '';
-                const isUSLeague = US_LEAGUES.includes(league);
-                const leftTeam = isUSLeague ? teams.away || teams.awayTeam : teams.home || teams.homeTeam;
-                const rightTeam = isUSLeague ? teams.home || teams.homeTeam : teams.away || teams.awayTeam;
-                outcomeName = outcomeIndex === 0 ? leftTeam : rightTeam;
             }
 
             // Show loading state
@@ -1346,9 +1329,9 @@
                         },
                         trade: {
                             eventSlug: eventSlug,
+                            marketIndex: marketIndex,
                             outcomeIndex: outcomeIndex,
-                            yesNoIndex: yesNoIndex,
-                            side: side,
+                            side: 'BUY',
                             amount: amount
                         }
                     })

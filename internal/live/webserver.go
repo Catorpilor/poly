@@ -562,11 +562,14 @@ type webTradeSession struct {
 	ProxyAddress  string `json:"proxyAddress"`
 }
 
+// webTradeData addresses one side of one Moneyline market: MarketIndex picks
+// the market within the event's ML list (0 for 2-way events, 0-2 for 3-way
+// soccer), OutcomeIndex picks the side within it (see CONTEXT.md: Market
+// Index vs Outcome Index).
 type webTradeData struct {
 	EventSlug    string  `json:"eventSlug"`
-	MarketID     string  `json:"marketId"`
+	MarketIndex  int     `json:"marketIndex"`
 	OutcomeIndex int     `json:"outcomeIndex"`
-	YesNoIndex   *int    `json:"yesNoIndex"` // For 3-way markets: 0=Yes, 1=No (nil for 2-way)
 	Side         string  `json:"side"`
 	Amount       float64 `json:"amount"`
 }
@@ -583,6 +586,59 @@ type webTradeResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
+// validateWebTrade checks the request-shape rules that need no market data.
+// The web endpoint is buy-only: selling is a "how much of my position at
+// what P&L" decision that belongs in the Telegram flow, which sells exact
+// share counts (SharesRaw) instead of back-solving them from a USD amount.
+func validateWebTrade(t webTradeData) error {
+	if t.EventSlug == "" {
+		return fmt.Errorf("eventSlug is required")
+	}
+	if side := strings.ToUpper(t.Side); side != "BUY" {
+		if side == "SELL" {
+			return fmt.Errorf("selling is not available on the web — use the Telegram bot")
+		}
+		return fmt.Errorf("side must be BUY")
+	}
+	if t.Amount <= 0 {
+		return fmt.Errorf("amount must be positive")
+	}
+	if t.MarketIndex < 0 {
+		return fmt.Errorf("marketIndex must be non-negative")
+	}
+	if t.OutcomeIndex < 0 || t.OutcomeIndex > 1 {
+		return fmt.Errorf("outcomeIndex must be 0 or 1")
+	}
+	return nil
+}
+
+// resolveWebTrade maps (marketIndex, outcomeIndex) onto a concrete market
+// and token. mlMarkets is the event's Moneyline market list in resolver
+// order — the same order the subscribe response presents outcomes in, so
+// the indexes the frontend sends line up positionally.
+func resolveWebTrade(mlMarkets []*MarketInfo, marketIndex, outcomeIndex int) (marketID, tokenID, outcome string, err error) {
+	if len(mlMarkets) == 0 {
+		return "", "", "", fmt.Errorf("event has no Moneyline markets")
+	}
+	if marketIndex < 0 || marketIndex >= len(mlMarkets) {
+		return "", "", "", fmt.Errorf("marketIndex %d out of range (event has %d markets)", marketIndex, len(mlMarkets))
+	}
+	market := mlMarkets[marketIndex]
+
+	tokenIDs := market.GetClobTokenIds()
+	if outcomeIndex < 0 || outcomeIndex >= len(tokenIDs) {
+		return "", "", "", fmt.Errorf("outcomeIndex %d out of range (market has %d outcomes)", outcomeIndex, len(tokenIDs))
+	}
+
+	// The outcome label is display metadata only — never identity.
+	outcomes := market.GetOutcomes()
+	if outcomeIndex < len(outcomes) {
+		outcome = outcomes[outcomeIndex]
+	}
+
+	return market.ID, tokenIDs[outcomeIndex], outcome, nil
+}
+
 // handleTrade handles trade execution from the web interface
 func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -591,6 +647,22 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Method not allowed"})
+		return
+	}
+
+	// Parse request body
+	var req webTradeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Invalid request body"})
+		return
+	}
+
+	// Validate trade data before dependency checks, so a malformed request
+	// never reads as "trading not configured"
+	if err := validateWebTrade(req.Trade); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: err.Error()})
 		return
 	}
 
@@ -608,44 +680,10 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse request body
-	var req webTradeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Invalid request body"})
-		return
-	}
-
 	// Validate session
 	if req.Session.TelegramID == 0 {
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Not authenticated"})
-		return
-	}
-
-	// Validate trade data
-	if req.Trade.EventSlug == "" && req.Trade.MarketID == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Event slug or market ID required"})
-		return
-	}
-
-	if req.Trade.Amount <= 0 {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Amount must be positive"})
-		return
-	}
-
-	side := strings.ToUpper(req.Trade.Side)
-	if side != "BUY" && side != "SELL" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Side must be BUY or SELL"})
-		return
-	}
-
-	if req.Trade.OutcomeIndex < 0 || req.Trade.OutcomeIndex > 1 {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Outcome index must be 0 or 1"})
 		return
 	}
 
@@ -690,89 +728,23 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve event to market and token ID
-	var tokenID string
-	var marketID string
-	var outcome string
-
-	if req.Trade.MarketID != "" {
-		// Direct market ID provided
-		marketID = req.Trade.MarketID
-		// Fetch market info to get token ID
-		eventInfo, err := ws.liveManager.resolver.GetEventInfo(r.Context(), req.Trade.EventSlug)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Event not found"})
-			return
-		}
-		for _, market := range eventInfo.Markets {
-			if market.ID == marketID {
-				tokenIDs := market.GetClobTokenIds()
-				if len(tokenIDs) > req.Trade.OutcomeIndex {
-					tokenID = tokenIDs[req.Trade.OutcomeIndex]
-				}
-				outcomes := market.GetOutcomes()
-				if len(outcomes) > req.Trade.OutcomeIndex {
-					outcome = outcomes[req.Trade.OutcomeIndex]
-				}
-				break
-			}
-		}
-	} else {
-		// Resolve from event slug - use ML market(s) from resolver
-		eventInfo, err := ws.liveManager.resolver.GetEventInfo(r.Context(), req.Trade.EventSlug)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Event not found"})
-			return
-		}
-
-		// Get all ML markets to detect 2-way vs 3-way
-		mlMarkets := ws.liveManager.resolver.GetAllMLMarkets(eventInfo)
-		if len(mlMarkets) >= 3 {
-			// 3-way market (soccer): outcomeIndex selects which market, yesNoIndex selects Yes/No
-			if req.Trade.OutcomeIndex < len(mlMarkets) {
-				selectedMarket := mlMarkets[req.Trade.OutcomeIndex]
-				marketID = selectedMarket.ID
-				tokenIDs := selectedMarket.GetClobTokenIds()
-				outcomes := selectedMarket.GetOutcomes()
-
-				// Use yesNoIndex if provided, default to 0 (Yes)
-				yesNoIdx := 0
-				if req.Trade.YesNoIndex != nil {
-					yesNoIdx = *req.Trade.YesNoIndex
-				}
-
-				if yesNoIdx < len(tokenIDs) {
-					tokenID = tokenIDs[yesNoIdx]
-				}
-				if yesNoIdx < len(outcomes) {
-					outcome = outcomes[yesNoIdx]
-				}
-				shortName := ExtractMarketShortName(selectedMarket.Question)
-				log.Printf("WebServer: 3-way market selected: %s (%s), yesNo=%d, question: %s", marketID, shortName, yesNoIdx, selectedMarket.Question)
-			}
-		} else if len(mlMarkets) > 0 {
-			// 2-way market (NBA, esports): outcomeIndex selects outcome within the market
-			primaryMarket := mlMarkets[0]
-			marketID = primaryMarket.ID
-			tokenIDs := primaryMarket.GetClobTokenIds()
-			outcomes := primaryMarket.GetOutcomes()
-			if req.Trade.OutcomeIndex < len(tokenIDs) {
-				tokenID = tokenIDs[req.Trade.OutcomeIndex]
-			}
-			if req.Trade.OutcomeIndex < len(outcomes) {
-				outcome = outcomes[req.Trade.OutcomeIndex]
-			}
-			log.Printf("WebServer: 2-way market selected: %s, question: %s, outcomes: %v", marketID, primaryMarket.Question, outcomes)
-		}
-	}
-
-	if tokenID == "" {
+	// Resolve the event's ML markets and map the indexes onto a token
+	eventInfo, err := ws.liveManager.resolver.GetEventInfo(r.Context(), req.Trade.EventSlug)
+	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Could not resolve market token ID"})
+		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Event not found"})
 		return
 	}
+
+	mlMarkets := ws.liveManager.resolver.GetAllMLMarkets(eventInfo)
+	marketID, tokenID, outcome, err := resolveWebTrade(mlMarkets, req.Trade.MarketIndex, req.Trade.OutcomeIndex)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: err.Error()})
+		return
+	}
+	log.Printf("WebServer: Trade resolved: event=%s market=%s (%d/%d) outcome=%s token=%s",
+		req.Trade.EventSlug, marketID, req.Trade.MarketIndex, len(mlMarkets), outcome, tokenID)
 
 	// Get fee rates and negRisk: Gamma feeSchedule for calculation, CLOB for order submission
 	var calcFeeBps, orderFeeBps int
@@ -795,7 +767,7 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 	tradeReq := &polymarket.TradeRequest{
 		MarketID:     marketID,
 		TokenID:      tokenID,
-		Side:         side,
+		Side:         "BUY", // validateWebTrade enforces buy-only
 		Outcome:      outcome,
 		Amount:       req.Trade.Amount,
 		Price:        0, // Market order - uses VWAP

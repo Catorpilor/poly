@@ -162,9 +162,12 @@ func TestAPIRequestGuard(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
+			// A shape-valid trade body, so accepted /api/trade requests get
+			// past validation to the dependency check (503 on nil deps)
+			// instead of failing with a 400 that would mask a guard bug.
 			var body *strings.Reader
 			if tt.method == http.MethodPost {
-				body = strings.NewReader("{}")
+				body = strings.NewReader(`{"trade":{"eventSlug":"e","marketIndex":0,"outcomeIndex":0,"side":"BUY","amount":10}}`)
 			} else {
 				body = strings.NewReader("")
 			}

@@ -29,13 +29,16 @@ Grilled decisions:
 - Note: prod .env has no LIVE_WEB_URL; browsing by IP/localhost works
   as-is, browsing by mDNS hostname would need LIVE_WEB_URL set
 
-## Phase 2 — Protocol & correctness (F2–F5)
-- [ ] TDD: table tests for pure resolveWebTrade() — 2-way, 3-way, bad
-      indexes, missing event
-- [ ] Wire protocol: {marketIndex, outcomeIndex}; delete yesNoIndex
-      (server + index.html together)
-- [ ] Buy-only: reject side != BUY
-- [ ] Remove dead marketId branch; eventSlug required
+## Phase 2 — Protocol & correctness (F2–F5) ✅
+- [x] TDD: table tests for pure resolveWebTrade() + validateWebTrade() —
+      2-way, 3-way (F2 regression: marketIndex 2 tradeable), bad indexes
+      (F3 regression: negative index errors instead of panicking), missing
+      markets/tokens; handler-level tests for buy-only and required slug
+- [x] Wire protocol: {marketIndex, outcomeIndex}; yesNoIndex deleted
+      (server + index.html together); dead outcomeName block removed
+- [x] Buy-only: side != BUY rejected with pointer to Telegram
+- [x] Dead marketId branch removed; eventSlug required; validation runs
+      before dependency checks; docs/web-trade-feature.md API spec updated
 
 ## Phase 3 — WebSocket write safety (F6–F8)
 - [ ] Register per-conn write mutex on connect; sendResponse uses it

@@ -30,12 +30,19 @@ Web UI → Trade Button Click → POST /api/trade → Auth Check → Execute Tra
     },
     "trade": {
         "eventSlug": "nba-lac-uta-2026-01-27",
+        "marketIndex": 0,
         "outcomeIndex": 0,
         "side": "BUY",
         "amount": 10.0
     }
 }
 ```
+
+`marketIndex` picks the Moneyline market within the event (always 0 for
+2-way events; 0–2 for 3-way soccer, where each side is its own Yes/No
+market). `outcomeIndex` picks the side within that market (0 or 1). See
+CONTEXT.md: Market Index vs Outcome Index. `side` must be `BUY` — the
+endpoint is buy-only, selling lives in the Telegram bot.
 
 **Response (Success):**
 ```json
@@ -161,7 +168,7 @@ For sports/esports events with multiple markets (spreads, totals, props), the sy
 
 **JavaScript:**
 ```javascript
-async function executeTrade(eventSlug, outcomeIndex, side) {
+async function executeTrade(eventSlug, marketIndex, outcomeIndex) {
     const session = getSession();
     if (!session?.telegramId) {
         alert('Please login first');
@@ -175,7 +182,7 @@ async function executeTrade(eventSlug, outcomeIndex, side) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             session: session,
-            trade: { eventSlug, outcomeIndex, side, amount }
+            trade: { eventSlug, marketIndex, outcomeIndex, side: 'BUY', amount }
         })
     });
 
