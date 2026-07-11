@@ -10,10 +10,8 @@ import (
 )
 
 // NegRiskAdapterAddress is the Polymarket NegRiskAdapter on Polygon
+// (unchanged V1→V2, not configurable).
 var NegRiskAdapterAddress = common.HexToAddress("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
-
-// USDCAddress is the bridged USDC on Polygon (collateral token)
-var USDCAddress = common.HexToAddress("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
 
 // MultiSendAddress is the Gnosis Safe MultiSend contract on Polygon
 var MultiSendAddress = common.HexToAddress("0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e7761")

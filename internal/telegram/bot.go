@@ -61,7 +61,9 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 
 	// Apply Polymarket address + URL overrides from config to the package-level
 	// vars consumed by blockchain/, polymarket/, and live/ constructors.
-	blockchain.InitAddresses(&cfg.Polymarket)
+	if err := blockchain.InitAddresses(&cfg.Polymarket); err != nil {
+		return nil, fmt.Errorf("failed to init contract addresses: %w", err)
+	}
 	polymarket.SetGammaAPIURL(cfg.Polymarket.GammaAPIURL)
 	live.SetGammaAPIURL(cfg.Polymarket.GammaAPIURL)
 

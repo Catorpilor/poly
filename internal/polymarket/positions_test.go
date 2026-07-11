@@ -94,6 +94,7 @@ func TestGetRedeemablePositions_NegRiskMarket(t *testing.T) {
 		{
 			Title:         "Multi-outcome market",
 			Outcome:       "No",
+			OutcomeIndex:  1,
 			ConditionID:   "0xdef456",
 			Asset:         "token-no",
 			OppositeAsset: "token-yes",
@@ -121,6 +122,9 @@ func TestGetRedeemablePositions_NegRiskMarket(t *testing.T) {
 
 	if !positions[0].NegativeRisk {
 		t.Error("expected NegativeRisk = true")
+	}
+	if positions[0].OutcomeIndex != 1 {
+		t.Errorf("outcomeIndex = %d, want 1 (must be plumbed through — neg-risk redemption orders amounts by outcome index)", positions[0].OutcomeIndex)
 	}
 }
 

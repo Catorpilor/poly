@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"unicode/utf8"
 
 	"github.com/ethereum/go-ethereum/common"
 )
@@ -52,11 +53,7 @@ func (ups *UnifiedPositionScanner) formatPositionsFromAPI(positions []*Position)
 	result := fmt.Sprintf("📊 *Your Positions (%d)*\n\n", len(positions))
 
 	for i, pos := range positions {
-		// Truncate long titles
-		title := pos.MarketTitle
-		if len(title) > 50 {
-			title = title[:47] + "..."
-		}
+		title := truncateRunes(pos.MarketTitle, 50)
 
 		result += fmt.Sprintf("*%d. %s*\n", i+1, title)
 		result += fmt.Sprintf("   • Outcome: %s\n", pos.Outcome)
@@ -84,4 +81,15 @@ func (ups *UnifiedPositionScanner) formatPositionsFromAPI(positions []*Position)
 // GetRedeemablePositions fetches redeemable positions for the Claim All flow.
 func (ups *UnifiedPositionScanner) GetRedeemablePositions(ctx context.Context, proxyAddress common.Address) ([]*RedeemablePositionInfo, error) {
 	return ups.positionManager.GetRedeemablePositions(ctx, proxyAddress)
+}
+
+// truncateRunes truncates a string to maxRunes runes and appends "..." if
+// truncated. Byte slicing (s[:n]) would cut multi-byte characters in half,
+// producing invalid UTF-8 that Telegram rejects.
+func truncateRunes(s string, maxRunes int) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:maxRunes-3]) + "..."
 }

@@ -60,7 +60,8 @@ type DataAPIPosition struct {
 // RedeemablePositionInfo contains all data needed to display and execute a redemption.
 type RedeemablePositionInfo struct {
 	Title         string  `json:"title"`
-	Outcome       string  `json:"outcome"`
+	Outcome       string  `json:"outcome"`       // display label only — casing varies by API
+	OutcomeIndex  int     `json:"outcome_index"` // positional identity; orders neg-risk amounts
 	ConditionID   string  `json:"condition_id"`
 	Asset         string  `json:"asset"`          // token ID (YES or NO)
 	OppositeAsset string  `json:"opposite_asset"` // complementary token ID
@@ -194,6 +195,7 @@ func (pm *PositionManager) GetRedeemablePositions(ctx context.Context, proxyAddr
 		positions = append(positions, &RedeemablePositionInfo{
 			Title:         ap.Title,
 			Outcome:       ap.Outcome,
+			OutcomeIndex:  ap.OutcomeIndex,
 			ConditionID:   ap.ConditionID,
 			Asset:         ap.Asset,
 			OppositeAsset: ap.OppositeAsset,

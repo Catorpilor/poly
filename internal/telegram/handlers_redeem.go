@@ -292,15 +292,38 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 }
 
 // getNegRiskAmounts fetches on-chain ERC1155 balances for neg-risk redemption.
+// The adapter's amounts array is positional, so tokens are ordered by the
+// Data API's outcome index — never by the display label, whose casing varies
+// across APIs and which is a team/candidate name on multi-outcome markets.
 func (b *Bot) getNegRiskAmounts(ctx context.Context, bc *blockchain.BalanceChecker, proxyAddress common.Address, positions []*polymarket.RedeemablePositionInfo) ([]*big.Int, error) {
-	var yesTokenID, noTokenID *big.Int
+	token0, token1, err := negRiskTokenIDs(positions)
+	if err != nil {
+		return nil, err
+	}
 
+	amounts := []*big.Int{big.NewInt(0), big.NewInt(0)}
+	for i, tokenID := range []*big.Int{token0, token1} {
+		if tokenID == nil {
+			continue
+		}
+		bal, err := bc.GetERC1155Balance(ctx, proxyAddress, tokenID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get outcome-%d balance: %w", i, err)
+		}
+		amounts[i] = bal
+	}
+
+	return amounts, nil
+}
+
+// negRiskTokenIDs orders a redemption group's token IDs by outcome index.
+func negRiskTokenIDs(positions []*polymarket.RedeemablePositionInfo) (token0, token1 *big.Int, err error) {
 	for _, pos := range positions {
 		tokenID, ok := new(big.Int).SetString(pos.Asset, 0)
 		if !ok {
 			tokenID, ok = new(big.Int).SetString(pos.Asset, 10)
 			if !ok {
-				return nil, fmt.Errorf("invalid token ID: %s", pos.Asset)
+				return nil, nil, fmt.Errorf("invalid token ID: %s", pos.Asset)
 			}
 		}
 
@@ -309,39 +332,22 @@ func (b *Bot) getNegRiskAmounts(ctx context.Context, bc *blockchain.BalanceCheck
 			oppositeID, _ = new(big.Int).SetString(pos.OppositeAsset, 10)
 		}
 
-		if pos.Outcome == "Yes" {
-			yesTokenID = tokenID
+		switch pos.OutcomeIndex {
+		case 0:
+			token0 = tokenID
 			if oppositeID != nil {
-				noTokenID = oppositeID
+				token1 = oppositeID
 			}
-		} else {
-			noTokenID = tokenID
+		case 1:
+			token1 = tokenID
 			if oppositeID != nil {
-				yesTokenID = oppositeID
+				token0 = oppositeID
 			}
+		default:
+			return nil, nil, fmt.Errorf("unexpected outcome index %d for token %s", pos.OutcomeIndex, pos.Asset)
 		}
 	}
-
-	yesBalance := big.NewInt(0)
-	noBalance := big.NewInt(0)
-
-	if yesTokenID != nil {
-		bal, err := bc.GetERC1155Balance(ctx, proxyAddress, yesTokenID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get YES balance: %w", err)
-		}
-		yesBalance = bal
-	}
-
-	if noTokenID != nil {
-		bal, err := bc.GetERC1155Balance(ctx, proxyAddress, noTokenID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get NO balance: %w", err)
-		}
-		noBalance = bal
-	}
-
-	return []*big.Int{yesBalance, noBalance}, nil
+	return token0, token1, nil
 }
 
 // buildRedeemSummary builds the summary message and keyboard for redeemable positions.
