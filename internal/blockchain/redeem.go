@@ -58,11 +58,14 @@ const setApprovalForAllABI = `[{
 // Burns the caller's entire position balance for the condition and pays out the
 // underlying collateral for winning tokens.
 //
-// Collateral is hardcoded to USDC.e (LegacyUSDCAddress). The collateral token
-// is part of the position-ID hash, so it must match what the position was minted
-// with. Every currently-resolvable Polymarket market was created pre-V2 and is
-// therefore USDC.e-backed. When V2-era markets begin resolving, this needs to
-// become per-market (look up the market's collateralToken from Gamma).
+// Collateral is deliberately hardcoded to USDC.e (LegacyUSDCAddress). The
+// collateral token is part of the position-ID hash, so it must match what the
+// position was minted with — and CTF conditions still settle in USDC.e in the
+// V2 era: pUSD is a boundary wrapper minted by Polymarket's adapters, not the
+// condition collateral (verified on-chain against production redemptions,
+// 2026-07-09; ADR 0003). The payout therefore arrives as raw USDC.e and is
+// swept into pUSD by the caller's follow-up wrap. Revisit only if Polymarket
+// ever creates natively-pUSD conditions.
 func EncodeStandardRedemption(conditionID common.Hash) (common.Address, []byte, error) {
 	parsed, err := abi.JSON(strings.NewReader(ctfRedeemABI))
 	if err != nil {

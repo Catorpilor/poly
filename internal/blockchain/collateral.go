@@ -1,6 +1,7 @@
 package blockchain
 
 import (
+	"context"
 	"fmt"
 	"math/big"
 	"strings"
@@ -68,6 +69,50 @@ func EncodeWrapCollateral(asset, to common.Address, amount *big.Int) ([]byte, er
 		return nil, fmt.Errorf("pack wrap: %w", err)
 	}
 	return data, nil
+}
+
+// BuildWrapAllTxs returns the approve+wrap sub-transactions that convert
+// `amount` of the proxy's USDC.e into pUSD via the Collateral Onramp.
+// Shared by the /migrate bootstrap and the post-redemption sweep (ADR 0003):
+// redemptions pay raw USDC.e, which the V2 exchanges cannot spend, so it is
+// wrapped in the same flow. A zero amount returns no transactions.
+func BuildWrapAllTxs(proxy common.Address, amount *big.Int) ([]MultiSendTx, error) {
+	if CollateralOnrampAddress == (common.Address{}) {
+		return nil, fmt.Errorf("V2 collateral onramp address not configured (POLYMARKET_COLLATERAL_ONRAMP_ADDRESS)")
+	}
+	if amount == nil || amount.Sign() <= 0 {
+		return nil, nil
+	}
+
+	// Wrapping requires the onramp to be approved as a USDC.e spender.
+	approveData, err := EncodeApproveERC20(CollateralOnrampAddress, MaxUint256)
+	if err != nil {
+		return nil, fmt.Errorf("encode USDC.e approve: %w", err)
+	}
+	wrapData, err := EncodeWrapCollateral(LegacyUSDCAddress, proxy, amount)
+	if err != nil {
+		return nil, fmt.Errorf("encode wrap: %w", err)
+	}
+	return []MultiSendTx{
+		{To: LegacyUSDCAddress, Data: approveData},
+		{To: CollateralOnrampAddress, Data: wrapData},
+	}, nil
+}
+
+// PlanCollateralSweep reads the proxy's current USDC.e balance and returns
+// the approve+wrap transactions that convert all of it to pUSD, plus the
+// amount. Used after a confirmed redemption (the relayer waits for on-chain
+// confirmation, so the payout is already in the balance) and by /migrate.
+func PlanCollateralSweep(ctx context.Context, bc *BalanceChecker, proxyAddress common.Address) ([]MultiSendTx, *big.Int, error) {
+	balance, err := bc.getERC20Balance(ctx, proxyAddress, LegacyUSDCAddress)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read USDC.e balance: %w", err)
+	}
+	txs, err := BuildWrapAllTxs(proxyAddress, balance)
+	if err != nil {
+		return nil, nil, err
+	}
+	return txs, balance, nil
 }
 
 // EncodeUnwrapCollateral builds calldata for CollateralOnramp.unwrap(asset, to, amount).

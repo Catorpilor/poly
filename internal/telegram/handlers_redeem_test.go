@@ -108,6 +108,32 @@ func TestNegRiskTokenIDs_OrdersByOutcomeIndex(t *testing.T) {
 	}
 }
 
+// /redeem is unavailable for Deposit Wallet accounts (ADR 0003): the relayer
+// path signs Gnosis SafeTx hashes, which a deposit-wallet contract cannot
+// validate, and Polymarket auto-redeems winners anyway.
+func TestRedeemUnavailable(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		accountType string
+		blocked     bool
+	}{
+		{string(polymarket.AccountDepositWallet), true},
+		{string(polymarket.AccountLegacyProxy), false},
+		{string(polymarket.AccountSafe), false},
+		{"", false}, // legacy rows default to proxy behavior
+	}
+	for _, tt := range tests {
+		msg, blocked := redeemUnavailable(tt.accountType)
+		if blocked != tt.blocked {
+			t.Errorf("redeemUnavailable(%q) blocked = %v, want %v", tt.accountType, blocked, tt.blocked)
+		}
+		if blocked && !strings.Contains(msg, "automatically") {
+			t.Errorf("blocked message should explain winnings arrive automatically, got %q", msg)
+		}
+	}
+}
+
 func assertTokenID(t *testing.T, label string, got *big.Int, want string) {
 	t.Helper()
 	if want == "" {
