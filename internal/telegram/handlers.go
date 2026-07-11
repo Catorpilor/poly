@@ -923,6 +923,7 @@ func (b *Bot) handleHelp(ctx context.Context, bot *Bot, update *tgbotapi.Update)
 
 *Portfolio Commands:*
 /positions - Show all positions
+/combos - Show combo (multi-leg) positions
 /pnl - Calculate unrealized P&L
 /history - View trade history
 
