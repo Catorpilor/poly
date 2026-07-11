@@ -212,6 +212,11 @@ func (ws *WebServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 	defer ws.liveManager.UnsubscribeWeb(conn)
 
+	// Register before anything can write to this conn: acks (this
+	// goroutine) and trade broadcasts (RTDS goroutine) share it, and both
+	// go through the registry's serialized write path.
+	ws.liveManager.RegisterWebConn(conn)
+
 	log.Printf("WebServer: Client connected")
 
 	// Handle incoming messages
@@ -351,14 +356,16 @@ func (ws *WebServer) handleList(conn *websocket.Conn) {
 	})
 }
 
-// sendResponse sends a JSON response to the client
+// sendResponse sends a JSON response to the client through the registry's
+// serialized write path — a raw conn.WriteMessage here would race the
+// RTDS goroutine's trade broadcasts on the same conn.
 func (ws *WebServer) sendResponse(conn *websocket.Conn, resp wsResponse) {
 	data, err := json.Marshal(resp)
 	if err != nil {
 		log.Printf("WebServer: Failed to marshal response: %v", err)
 		return
 	}
-	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+	if err := ws.liveManager.WriteWeb(conn, data); err != nil {
 		log.Printf("WebServer: Failed to send response: %v", err)
 	}
 }

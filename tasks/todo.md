@@ -40,11 +40,14 @@ Grilled decisions:
 - [x] Dead marketId branch removed; eventSlug required; validation runs
       before dependency checks; docs/web-trade-feature.md API spec updated
 
-## Phase 3 — WebSocket write safety (F6–F8)
-- [ ] Register per-conn write mutex on connect; sendResponse uses it
-- [ ] Write deadlines in broadcastToWeb; drop conn on write error
-- [ ] Mutex for upstream RTDS conn (pingLoop vs subscribe writes)
-- [ ] go test -race with concurrent ack/broadcast test
+## Phase 3 — WebSocket write safety (F6–F8) ✅
+- [x] RegisterConn on connect; WriteConn = single serialized write path
+      with 5s deadline; sendResponse and broadcastToWeb both use it
+- [x] broadcastToWeb drops conn on write error (dead client can't stall
+      the feed); old GetConnWriteMutex API removed
+- [x] rtdsWriteMu for upstream RTDS conn (pingLoop vs subscribe writes)
+- [x] go test -race green: concurrent-writer serialization test + direct
+      ack-vs-broadcast race test + drop/deliver behavioral tests
 
 ## Phase 4 — Shared trade executor (F9, F10)
 - [ ] Extract helper: user → decrypt → creds → TestL2Auth → fees →
