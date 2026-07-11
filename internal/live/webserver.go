@@ -104,22 +104,35 @@ func NewWebServer(
 	}
 
 	// WebSocket endpoint
-	mux.HandleFunc("/ws", ws.handleWebSocket)
+	mux.HandleFunc("GET /ws", ws.handleWebSocket)
 
 	// Health check
-	mux.HandleFunc("/health", ws.handleHealth)
+	mux.HandleFunc("GET /health", ws.handleHealth)
 
 	// Auth endpoints for Telegram login
-	mux.HandleFunc("/api/auth/init", ws.guardAPI(ws.handleAuthInit))
-	mux.HandleFunc("/api/auth/status", ws.guardAPI(ws.handleAuthStatus))
-	mux.HandleFunc("/api/auth/complete", ws.guardAPI(ws.handleAuthComplete))
+	mux.HandleFunc("POST /api/auth/init", ws.guardAPI(ws.handleAuthInit))
+	mux.HandleFunc("GET /api/auth/status", ws.guardAPI(ws.handleAuthStatus))
+	mux.HandleFunc("POST /api/auth/complete", ws.guardAPI(ws.handleAuthComplete))
 
 	// Trade endpoint
-	mux.HandleFunc("/api/trade", ws.guardAPI(ws.handleTrade))
+	mux.HandleFunc("POST /api/trade", ws.guardAPI(ws.handleTrade))
+
+	// API namespace fallback. Without this, a wrong-method or unknown
+	// /api/ request falls through to the "/" file server and gets an HTML
+	// 404; the method-scoped patterns above only produce a 405 when no
+	// broader pattern matches.
+	mux.HandleFunc("/api/", handleAPIFallback)
 
 	ws.httpServer = &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
 		Handler: mux,
+		// Don't hold connections open forever (slowloris posture, even on
+		// a LAN). Gorilla clears these deadlines when it hijacks the /ws
+		// connection, so the long-lived WebSocket is unaffected.
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	return ws
@@ -177,6 +190,26 @@ func (ws *WebServer) hostAllowed(hostport string) bool {
 		return true
 	}
 	return ws.allowedHost != "" && strings.EqualFold(host, ws.allowedHost)
+}
+
+// apiEndpoints are the registered API paths, used by the fallback to tell
+// a wrong method (405) from an unknown path (404).
+var apiEndpoints = map[string]bool{
+	"/api/auth/init":     true,
+	"/api/auth/status":   true,
+	"/api/auth/complete": true,
+	"/api/trade":         true,
+}
+
+func handleAPIFallback(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if apiEndpoints[r.URL.Path] {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+		return
+	}
+	w.WriteHeader(http.StatusNotFound)
+	json.NewEncoder(w).Encode(map[string]string{"error": "Not found"})
 }
 
 // guardAPI wraps an /api/ handler with the LAN-only request checks
@@ -418,10 +451,12 @@ type authCompleteResponse struct {
 func (ws *WebServer) handleAuthInit(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	// Only allow POST
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+	// Without a configured bot username there is no valid deep link to
+	// hand out — refuse rather than linking to a wrong bot.
+	if ws.config == nil || ws.config.Telegram.BotUsername == "" {
+		log.Printf("WebServer: auth init refused — TELEGRAM_BOT_USERNAME not configured")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Bot username not configured"})
 		return
 	}
 
@@ -443,11 +478,7 @@ func (ws *WebServer) handleAuthInit(w http.ResponseWriter, r *http.Request) {
 
 	// Build Telegram deep link URL
 	tokenStr := repositories.TokenToString(token.Token)
-	botUsername := "poly_trade_test_bot"
-	if ws.config != nil && ws.config.Telegram.BotUsername != "" {
-		botUsername = ws.config.Telegram.BotUsername
-	}
-	telegramURL := fmt.Sprintf("https://t.me/%s?start=login_%s", botUsername, tokenStr)
+	telegramURL := fmt.Sprintf("https://t.me/%s?start=login_%s", ws.config.Telegram.BotUsername, tokenStr)
 
 	resp := authInitResponse{
 		Token:       tokenStr,
@@ -461,13 +492,6 @@ func (ws *WebServer) handleAuthInit(w http.ResponseWriter, r *http.Request) {
 // handleAuthStatus checks the status of a login token
 func (ws *WebServer) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-
-	// Only allow GET
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
-		return
-	}
 
 	// Get token from query parameter
 	tokenStr := r.URL.Query().Get("token")
@@ -517,13 +541,6 @@ func (ws *WebServer) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 // handleAuthComplete completes the login and returns user data
 func (ws *WebServer) handleAuthComplete(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-
-	// Only allow POST
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
-		return
-	}
 
 	// Parse request body
 	var req struct {
@@ -598,6 +615,10 @@ type webTradeResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
+// maxWebTradeAmount caps a single web buy in USDC — a fat-finger guard
+// mirroring the UI input's max attribute.
+const maxWebTradeAmount = 1000
+
 // validateWebTrade checks the request-shape rules that need no market data.
 // The web endpoint is buy-only: selling is a "how much of my position at
 // what P&L" decision that belongs in the Telegram flow, which sells exact
@@ -614,6 +635,9 @@ func validateWebTrade(t webTradeData) error {
 	}
 	if t.Amount <= 0 {
 		return fmt.Errorf("amount must be positive")
+	}
+	if t.Amount > maxWebTradeAmount {
+		return fmt.Errorf("amount must be at most %d USDC", maxWebTradeAmount)
 	}
 	if t.MarketIndex < 0 {
 		return fmt.Errorf("marketIndex must be non-negative")
@@ -654,13 +678,6 @@ func resolveWebTrade(mlMarkets []*MarketInfo, marketIndex, outcomeIndex int) (ma
 // handleTrade handles trade execution from the web interface
 func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-
-	// Only allow POST
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Method not allowed"})
-		return
-	}
 
 	// Parse request body
 	var req webTradeRequest

@@ -191,6 +191,84 @@ func TestAPIRequestGuard(t *testing.T) {
 	}
 }
 
+// Routing is method-scoped (Go 1.22+ mux patterns): a wrong method on a
+// known API path is 405, an unknown API path is a JSON 404 — never the
+// static file server's HTML 404.
+func TestAPIMethodScopedRouting(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{}
+	cfg.App.LiveWebURL = "http://localhost:8081"
+	ws := NewWebServer(nil, 0, nil, cfg, nil, nil)
+	handler := ws.httpServer.Handler
+
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		wantStatus int
+	}{
+		{name: "GET on trade endpoint", method: "GET", path: "/api/trade", wantStatus: http.StatusMethodNotAllowed},
+		{name: "DELETE on auth init", method: "DELETE", path: "/api/auth/init", wantStatus: http.StatusMethodNotAllowed},
+		{name: "POST on auth status", method: "POST", path: "/api/auth/status", wantStatus: http.StatusMethodNotAllowed},
+		{name: "unknown API path", method: "GET", path: "/api/nope", wantStatus: http.StatusNotFound},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := httptest.NewRequest(tt.method, "http://localhost:8081"+tt.path, strings.NewReader("{}"))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantStatus {
+				t.Errorf("%s %s = %d, want %d; body: %s", tt.method, tt.path, rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+				t.Errorf("%s %s Content-Type = %q, want JSON (API namespace must not fall through to the file server)", tt.method, tt.path, ct)
+			}
+		})
+	}
+}
+
+// Without a configured bot username there is no valid deep link — auth
+// init must refuse instead of deep-linking users to a hardcoded default.
+func TestAuthInitRequiresBotUsername(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{} // Telegram.BotUsername empty
+	cfg.App.LiveWebURL = "http://localhost:8081"
+	ws := NewWebServer(nil, 0, nil, cfg, nil, nil)
+
+	req := httptest.NewRequest("POST", "http://localhost:8081/api/auth/init", strings.NewReader("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	ws.httpServer.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("auth init without bot username = %d, want %d; body: %s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "username") {
+		t.Errorf("body %q should name the missing bot username", rec.Body.String())
+	}
+}
+
+// The server must not hold connections open forever (slowloris posture,
+// even on a LAN). Gorilla clears these deadlines on WebSocket hijack, so
+// /ws is unaffected.
+func TestServerHasTimeouts(t *testing.T) {
+	t.Parallel()
+
+	ws := NewWebServer(nil, 0, nil, nil, nil, nil)
+	srv := ws.httpServer
+	if srv.ReadHeaderTimeout <= 0 || srv.ReadTimeout <= 0 || srv.WriteTimeout <= 0 || srv.IdleTimeout <= 0 {
+		t.Errorf("timeouts = header %v, read %v, write %v, idle %v — all must be positive",
+			srv.ReadHeaderTimeout, srv.ReadTimeout, srv.WriteTimeout, srv.IdleTimeout)
+	}
+}
+
 // The WebSocket upgrade must apply the same origin predicate: a page this
 // server didn't serve must not be able to open the live feed socket.
 func TestWebSocketUpgradeRejectsForeignOrigin(t *testing.T) {

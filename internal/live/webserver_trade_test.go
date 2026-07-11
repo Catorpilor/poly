@@ -55,6 +55,16 @@ func TestValidateWebTrade(t *testing.T) {
 			wantErr: "amount",
 		},
 		{
+			// Fat-finger guard, mirroring the UI input's max="1000".
+			name:    "amount above server cap rejected",
+			mutate:  func(t *webTradeData) { t.Amount = 1000.01 },
+			wantErr: "amount",
+		},
+		{
+			name:   "amount at the cap accepted",
+			mutate: func(t *webTradeData) { t.Amount = 1000 },
+		},
+		{
 			name:    "missing event slug rejected",
 			mutate:  func(t *webTradeData) { t.EventSlug = "" },
 			wantErr: "eventSlug",

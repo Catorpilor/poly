@@ -56,13 +56,43 @@ Grilled decisions:
 - [x] handleTrade rewired: parse → validate → auth → resolve → Execute;
       web path gains the L2 auth pre-check (F10)
 
-## Phase 5 — Polish (F11 cut)
-- [ ] Method-scoped routes ("POST /api/trade" etc.)
-- [ ] http.Server ReadHeaderTimeout/ReadTimeout/IdleTimeout
-- [ ] Remove hardcoded poly_trade_test_bot fallback (disable auth-init +
-      log error when username unconfigured)
-- [ ] Server-side max amount 1000 on /api/trade
+## Phase 5 — Polish (F11 cut) ✅
+- [x] Method-scoped routes (GET/POST patterns) + /api/ JSON fallback
+      (known path wrong method → 405, unknown path → 404; never the
+      file server's HTML 404); four manual method checks deleted
+- [x] http.Server timeouts (header 5s, read/write 30s, idle 120s;
+      gorilla clears deadlines on /ws hijack so WebSocket unaffected)
+- [x] Hardcoded poly_trade_test_bot fallback removed — auth-init 503s
+      with a log line when TELEGRAM_BOT_USERNAME unset (prod .env sets it)
+- [x] Server-side max amount 1000 USDC in validateWebTrade
 
 ## Review
 
-(filled in as phases complete)
+All five phases landed on refactor/web-live-trading, one commit each,
+TDD RED→GREEN throughout; `go test ./...`, `-race`, and `go vet` clean
+after every phase.
+
+- Phase 1 (a30b66d): CSRF/DNS-rebinding guard on /api/* and /ws —
+  Host allowlist, Origin==Host, JSON content type. 13 httptest cases.
+- Phase 2 (d018b4c): {marketIndex, outcomeIndex} protocol; soccer's
+  third outcome tradeable (F2), negative-index panic fixed (F3), web
+  is buy-only (F4), dead marketId branch gone (F5). Pure
+  resolveWebTrade()/validateWebTrade() with 26 table cases.
+- Phase 3 (3a8daa7): single serialized write path per web conn with 5s
+  deadline + drop-on-error (F6/F7); upstream RTDS write mutex (F8).
+  Real-WebSocket concurrency tests under -race.
+- Phase 4 (7a89dfe): polymarket.TradeExecutor (creds → L2 pre-check →
+  best-effort fees → ExecuteTrade); web rewired, gains TestL2Auth
+  (F10); Telegram executors untouched per Q5. Fake CLOB/Gamma tests.
+- Phase 5: method-scoped routes, server timeouts, no hardcoded bot
+  username, 1000 USDC cap.
+
+Deploy notes:
+- Refresh any open browser tab after deploying — the embedded frontend
+  and the wire protocol changed together (stale JS would send the old
+  field names; server ignores unknown fields, so a stale 3-way trade
+  would silently target market 0).
+- Prod .env: TELEGRAM_BOT_USERNAME already set; LIVE_WEB_URL unset is
+  fine while browsing by IP/localhost (set it if using an mDNS name).
+- Deferred by decision: bearer-token sessions (until the page leaves
+  the LAN), Telegram executor migration onto TradeExecutor.
