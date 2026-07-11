@@ -1,5 +1,15 @@
 # Polymarket CTF Exchange V2 Migration Plan
 
+> **⚠️ HISTORICAL DOCUMENT** (2026-07): the migration is complete and this
+> plan is kept as a record only. File:line references are stale, and some
+> "open risks" have since been resolved differently than planned (e.g.
+> POLY_1271 deposit-wallet signing was implemented — `orderv2/deposit_wallet.go`,
+> [deposit-wallet-flow.md](deposit-wallet-flow.md)). For current architecture
+> see [ARCHITECTURE.md](ARCHITECTURE.md); for the post-cutover collateral
+> reality (CTF conditions still settle in USDC.e; pUSD is a boundary
+> wrapper; Polymarket auto-redeems winners) see
+> [ADR 0003](adr/0003-redeem-strategy-post-auto-redeem.md).
+
 **Date**: 2026-04-07 (last updated 2026-04-30)
 **Migration cutover**: **2026-04-28 ~11:00 UTC**, ~1 hour downtime
 **Status**: ✅ **Cutover complete; bot migrated to V2 on `feat/v2-migration`** (2026-04-30)

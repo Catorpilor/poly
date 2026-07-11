@@ -38,6 +38,10 @@ is the resting, unmatched remainder of one.
 anyone's fill; in our own results, ours. A Trade results from an Order and
 is never a synonym for one.
 
+**Live Feed** — A spectator view of a market's tape: third-party Trades
+streamed to subscribed chats and web clients. Watch-only — it never places
+orders and is not copy trading.
+
 **Position** — A user's current holdings of one outcome token: share count
 plus average price. Lives on Polymarket, keyed by Token ID.
 
