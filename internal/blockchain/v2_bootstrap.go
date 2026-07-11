@@ -81,20 +81,12 @@ func PlanV2Bootstrap(ctx context.Context, bc *BalanceChecker, proxyAddress commo
 	if err != nil {
 		return nil, fmt.Errorf("read USDC.e balance: %w", err)
 	}
-	if usdcEBalance.Sign() > 0 {
-		// Wrapping requires the onramp to be approved as a USDC.e spender.
-		// Add an approve(MaxUint256) for the onramp before the wrap call.
-		approveData, err := EncodeApproveERC20(CollateralOnrampAddress, MaxUint256)
-		if err != nil {
-			return nil, fmt.Errorf("encode USDC.e approve: %w", err)
-		}
-		plan.Txs = append(plan.Txs, MultiSendTx{To: LegacyUSDCAddress, Data: approveData})
-
-		wrapData, err := EncodeWrapCollateral(LegacyUSDCAddress, proxyAddress, usdcEBalance)
-		if err != nil {
-			return nil, fmt.Errorf("encode wrap: %w", err)
-		}
-		plan.Txs = append(plan.Txs, MultiSendTx{To: CollateralOnrampAddress, Data: wrapData})
+	wrapTxs, err := BuildWrapAllTxs(proxyAddress, usdcEBalance)
+	if err != nil {
+		return nil, err
+	}
+	if len(wrapTxs) > 0 {
+		plan.Txs = append(plan.Txs, wrapTxs...)
 		plan.WrapAmount = usdcEBalance
 	}
 

@@ -4,23 +4,20 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math/big"
+	"unicode/utf8"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/ethclient"
 )
 
 // UnifiedPositionScanner uses Polymarket Data API for position queries
 type UnifiedPositionScanner struct {
-	client          *ethclient.Client
 	positionManager *PositionManager
 }
 
 // NewUnifiedPositionScanner creates a scanner that uses the Data API
-func NewUnifiedPositionScanner(client *ethclient.Client) *UnifiedPositionScanner {
+func NewUnifiedPositionScanner() *UnifiedPositionScanner {
 	return &UnifiedPositionScanner{
-		client:          client,
-		positionManager: NewPositionManager(client, "https://clob.polymarket.com"),
+		positionManager: NewPositionManager(),
 	}
 }
 
@@ -56,11 +53,7 @@ func (ups *UnifiedPositionScanner) formatPositionsFromAPI(positions []*Position)
 	result := fmt.Sprintf("📊 *Your Positions (%d)*\n\n", len(positions))
 
 	for i, pos := range positions {
-		// Truncate long titles
-		title := pos.MarketTitle
-		if len(title) > 50 {
-			title = title[:47] + "..."
-		}
+		title := truncateRunes(pos.MarketTitle, 50)
 
 		result += fmt.Sprintf("*%d. %s*\n", i+1, title)
 		result += fmt.Sprintf("   • Outcome: %s\n", pos.Outcome)
@@ -90,14 +83,13 @@ func (ups *UnifiedPositionScanner) GetRedeemablePositions(ctx context.Context, p
 	return ups.positionManager.GetRedeemablePositions(ctx, proxyAddress)
 }
 
-// GetPositionValue attempts to calculate the value of positions
-func (ups *UnifiedPositionScanner) GetPositionValue(ctx context.Context, proxyAddress common.Address) (*big.Int, error) {
-	// This would require:
-	// 1. Getting all position token IDs
-	// 2. Getting balances for each
-	// 3. Getting current prices from CLOB
-	// 4. Calculating total value
-
-	// For now, return a placeholder
-	return big.NewInt(0), fmt.Errorf("position value calculation not implemented")
+// truncateRunes truncates a string to maxRunes runes and appends "..." if
+// truncated. Byte slicing (s[:n]) would cut multi-byte characters in half,
+// producing invalid UTF-8 that Telegram rejects.
+func truncateRunes(s string, maxRunes int) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:maxRunes-3]) + "..."
 }

@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"fmt"
 	"log"
 	"math/big"
@@ -12,6 +13,18 @@ import (
 	"github.com/Catorpilor/poly/internal/blockchain"
 	"github.com/Catorpilor/poly/internal/polymarket"
 )
+
+// redeemUnavailable reports whether /redeem is blocked for this account type,
+// with the user-facing notice. Deposit-wallet accounts can't redeem through
+// the bot (ADR 0003): the relayer path signs Gnosis SafeTx hashes, which a
+// deposit-wallet contract cannot validate — and Polymarket's keeper
+// auto-redeems winners anyway, so nothing is lost.
+func redeemUnavailable(accountType string) (string, bool) {
+	if accountType == string(polymarket.AccountDepositWallet) {
+		return "🎁 *Winnings arrive automatically*\n\nDeposit-wallet accounts don't need /redeem — Polymarket redeems resolved positions for you (usually same-day) and the pUSD lands in your wallet.", true
+	}
+	return "", false
+}
 
 // handleRedeem handles the /redeem command (entry point)
 func (b *Bot) handleRedeem(ctx context.Context, bot *Bot, update *tgbotapi.Update) error {
@@ -31,10 +44,15 @@ func (b *Bot) handleRedeem(ctx context.Context, bot *Bot, update *tgbotapi.Updat
 		return nil
 	}
 
+	if msg, blocked := redeemUnavailable(user.AccountType); blocked {
+		b.sendMessage(update.Message.Chat.ID, msg)
+		return nil
+	}
+
 	loadingMsg := b.sendMessageAndReturn(update.Message.Chat.ID, "🎁 *Checking redeemable positions...*")
 
 	proxyAddr := common.HexToAddress(user.ProxyAddress)
-	scanner := polymarket.NewUnifiedPositionScanner(nil)
+	scanner := polymarket.NewUnifiedPositionScanner()
 	positions, err := scanner.GetRedeemablePositions(ctx, proxyAddr)
 	if err != nil {
 		b.editMessage(update.Message.Chat.ID, loadingMsg.MessageID, fmt.Sprintf("❌ Failed to fetch redeemable positions: %v", err))
@@ -73,10 +91,15 @@ func (b *Bot) handleRedeemPositions(ctx context.Context, update *tgbotapi.Update
 		return
 	}
 
+	if msg, blocked := redeemUnavailable(user.AccountType); blocked {
+		b.editMessage(chatID, messageID, msg)
+		return
+	}
+
 	b.editMessage(chatID, messageID, "🎁 *Checking redeemable positions...*")
 
 	proxyAddr := common.HexToAddress(user.ProxyAddress)
-	scanner := polymarket.NewUnifiedPositionScanner(nil)
+	scanner := polymarket.NewUnifiedPositionScanner()
 	positions, err := scanner.GetRedeemablePositions(ctx, proxyAddr)
 	if err != nil {
 		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Failed to fetch redeemable positions: %v", err))
@@ -124,6 +147,11 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 	user, err := b.userRepo.GetByTelegramID(ctx, userID)
 	if err != nil || user == nil {
 		b.editMessage(chatID, messageID, "❌ User not found.")
+		return
+	}
+
+	if msg, blocked := redeemUnavailable(user.AccountType); blocked {
+		b.editMessage(chatID, messageID, msg)
 		return
 	}
 
@@ -288,19 +316,78 @@ func (b *Bot) handleRedeemAll(ctx context.Context, update *tgbotapi.Update) {
 	}
 
 	log.Printf("Redeem: SUCCESS tx=%s, positions=%d, payout=%.2f", txHash, total, totalPayout)
-	b.editMessage(chatID, messageID, b.buildRedeemResult(total-len(encodeErrors), total, totalPayout, []string{txHash}, encodeErrors))
+
+	// Redemptions pay raw USDC.e (ADR 0003) — sweep it into pUSD so the
+	// payout is immediately visible and tradeable on V2.
+	wrapNote := b.wrapRedeemedCollateral(redeemCtx, eoaAddress, proxyAddress, userWallet.PrivateKey)
+	b.editMessage(chatID, messageID, b.buildRedeemResult(total-len(encodeErrors), total, totalPayout, []string{txHash}, encodeErrors)+wrapNote)
+}
+
+// wrapRedeemedCollateral wraps the proxy's entire USDC.e balance into pUSD
+// after a confirmed redemption, sweeping the payout (and any pre-existing
+// dust). Failures are non-fatal by design: the USDC.e stays in the wallet
+// and the next /migrate wraps it.
+func (b *Bot) wrapRedeemedCollateral(ctx context.Context, eoaAddress, proxyAddress common.Address, privateKey *ecdsa.PrivateKey) string {
+	const fallbackNote = "\n\n⚠️ Payout received as USDC.e — run /migrate to convert it to pUSD."
+
+	if b.blockchain == nil || b.relayerClient == nil {
+		return fallbackNote
+	}
+
+	bc := blockchain.NewBalanceChecker(b.blockchain.GetClient())
+	txs, amount, err := blockchain.PlanCollateralSweep(ctx, bc, proxyAddress)
+	if err != nil {
+		log.Printf("Redeem: wrap sweep planning failed (USDC.e stays in wallet; /migrate will wrap): %v", err)
+		return fallbackNote
+	}
+	if len(txs) == 0 {
+		return ""
+	}
+
+	log.Printf("Redeem: wrapping %s raw USDC.e into pUSD via relayer", amount.String())
+	if _, err := b.relayerClient.ExecMultiSendTransaction(ctx, eoaAddress, proxyAddress, txs, privateKey); err != nil {
+		log.Printf("Redeem: wrap sweep failed (USDC.e stays in wallet; /migrate will wrap): %v", err)
+		return fallbackNote
+	}
+
+	usdc := new(big.Float).Quo(new(big.Float).SetInt(amount), big.NewFloat(1e6))
+	wrapped, _ := usdc.Float64()
+	return fmt.Sprintf("\n\n🔄 Wrapped $%.2f into pUSD.", wrapped)
 }
 
 // getNegRiskAmounts fetches on-chain ERC1155 balances for neg-risk redemption.
+// The adapter's amounts array is positional, so tokens are ordered by the
+// Data API's outcome index — never by the display label, whose casing varies
+// across APIs and which is a team/candidate name on multi-outcome markets.
 func (b *Bot) getNegRiskAmounts(ctx context.Context, bc *blockchain.BalanceChecker, proxyAddress common.Address, positions []*polymarket.RedeemablePositionInfo) ([]*big.Int, error) {
-	var yesTokenID, noTokenID *big.Int
+	token0, token1, err := negRiskTokenIDs(positions)
+	if err != nil {
+		return nil, err
+	}
 
+	amounts := []*big.Int{big.NewInt(0), big.NewInt(0)}
+	for i, tokenID := range []*big.Int{token0, token1} {
+		if tokenID == nil {
+			continue
+		}
+		bal, err := bc.GetERC1155Balance(ctx, proxyAddress, tokenID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get outcome-%d balance: %w", i, err)
+		}
+		amounts[i] = bal
+	}
+
+	return amounts, nil
+}
+
+// negRiskTokenIDs orders a redemption group's token IDs by outcome index.
+func negRiskTokenIDs(positions []*polymarket.RedeemablePositionInfo) (token0, token1 *big.Int, err error) {
 	for _, pos := range positions {
 		tokenID, ok := new(big.Int).SetString(pos.Asset, 0)
 		if !ok {
 			tokenID, ok = new(big.Int).SetString(pos.Asset, 10)
 			if !ok {
-				return nil, fmt.Errorf("invalid token ID: %s", pos.Asset)
+				return nil, nil, fmt.Errorf("invalid token ID: %s", pos.Asset)
 			}
 		}
 
@@ -309,39 +396,22 @@ func (b *Bot) getNegRiskAmounts(ctx context.Context, bc *blockchain.BalanceCheck
 			oppositeID, _ = new(big.Int).SetString(pos.OppositeAsset, 10)
 		}
 
-		if pos.Outcome == "Yes" {
-			yesTokenID = tokenID
+		switch pos.OutcomeIndex {
+		case 0:
+			token0 = tokenID
 			if oppositeID != nil {
-				noTokenID = oppositeID
+				token1 = oppositeID
 			}
-		} else {
-			noTokenID = tokenID
+		case 1:
+			token1 = tokenID
 			if oppositeID != nil {
-				yesTokenID = oppositeID
+				token0 = oppositeID
 			}
+		default:
+			return nil, nil, fmt.Errorf("unexpected outcome index %d for token %s", pos.OutcomeIndex, pos.Asset)
 		}
 	}
-
-	yesBalance := big.NewInt(0)
-	noBalance := big.NewInt(0)
-
-	if yesTokenID != nil {
-		bal, err := bc.GetERC1155Balance(ctx, proxyAddress, yesTokenID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get YES balance: %w", err)
-		}
-		yesBalance = bal
-	}
-
-	if noTokenID != nil {
-		bal, err := bc.GetERC1155Balance(ctx, proxyAddress, noTokenID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get NO balance: %w", err)
-		}
-		noBalance = bal
-	}
-
-	return []*big.Int{yesBalance, noBalance}, nil
+	return token0, token1, nil
 }
 
 // buildRedeemSummary builds the summary message and keyboard for redeemable positions.

@@ -61,7 +61,9 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 
 	// Apply Polymarket address + URL overrides from config to the package-level
 	// vars consumed by blockchain/, polymarket/, and live/ constructors.
-	blockchain.InitAddresses(&cfg.Polymarket)
+	if err := blockchain.InitAddresses(&cfg.Polymarket); err != nil {
+		return nil, fmt.Errorf("failed to init contract addresses: %w", err)
+	}
 	polymarket.SetGammaAPIURL(cfg.Polymarket.GammaAPIURL)
 	live.SetGammaAPIURL(cfg.Polymarket.GammaAPIURL)
 
@@ -1542,7 +1544,7 @@ func (b *Bot) handleRefreshPositions(ctx context.Context, update *tgbotapi.Updat
 
 	// Fetch positions using Polymarket Data API (no blockchain required)
 	proxyAddr := common.HexToAddress(user.ProxyAddress)
-	unifiedScanner := polymarket.NewUnifiedPositionScanner(nil)
+	unifiedScanner := polymarket.NewUnifiedPositionScanner()
 	summary, err := unifiedScanner.ScanAllStrategies(ctx, proxyAddr)
 	if err != nil {
 		log.Printf("Unified position scan error: %v", err)
@@ -1597,7 +1599,7 @@ func (b *Bot) handleSellPositions(ctx context.Context, update *tgbotapi.Update) 
 
 	// Fetch positions using Polymarket Data API (no blockchain required)
 	proxyAddr := common.HexToAddress(user.ProxyAddress)
-	unifiedScanner := polymarket.NewUnifiedPositionScanner(nil)
+	unifiedScanner := polymarket.NewUnifiedPositionScanner()
 	positions, err := unifiedScanner.GetPositions(ctx, proxyAddr)
 
 	if err != nil {

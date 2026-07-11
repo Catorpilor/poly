@@ -10,10 +10,8 @@ import (
 )
 
 // NegRiskAdapterAddress is the Polymarket NegRiskAdapter on Polygon
+// (unchanged V1→V2, not configurable).
 var NegRiskAdapterAddress = common.HexToAddress("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
-
-// USDCAddress is the bridged USDC on Polygon (collateral token)
-var USDCAddress = common.HexToAddress("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
 
 // MultiSendAddress is the Gnosis Safe MultiSend contract on Polygon
 var MultiSendAddress = common.HexToAddress("0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e7761")
@@ -60,11 +58,14 @@ const setApprovalForAllABI = `[{
 // Burns the caller's entire position balance for the condition and pays out the
 // underlying collateral for winning tokens.
 //
-// Collateral is hardcoded to USDC.e (LegacyUSDCAddress). The collateral token
-// is part of the position-ID hash, so it must match what the position was minted
-// with. Every currently-resolvable Polymarket market was created pre-V2 and is
-// therefore USDC.e-backed. When V2-era markets begin resolving, this needs to
-// become per-market (look up the market's collateralToken from Gamma).
+// Collateral is deliberately hardcoded to USDC.e (LegacyUSDCAddress). The
+// collateral token is part of the position-ID hash, so it must match what the
+// position was minted with — and CTF conditions still settle in USDC.e in the
+// V2 era: pUSD is a boundary wrapper minted by Polymarket's adapters, not the
+// condition collateral (verified on-chain against production redemptions,
+// 2026-07-09; ADR 0003). The payout therefore arrives as raw USDC.e and is
+// swept into pUSD by the caller's follow-up wrap. Revisit only if Polymarket
+// ever creates natively-pUSD conditions.
 func EncodeStandardRedemption(conditionID common.Hash) (common.Address, []byte, error) {
 	parsed, err := abi.JSON(strings.NewReader(ctfRedeemABI))
 	if err != nil {

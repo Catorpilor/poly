@@ -68,6 +68,15 @@ Note: we can sidestep the unknown CREATE2 derivation entirely — the deposit-wa
 
 The deposit wallet is derived via CREATE2 from `depositWalletFactory` (beacon proxy). The beta bundle is minified; the **exact init-code hash and salt were not extracted** (facet open question). Two derivation paths `it()`/`st()` (beacon vs direct) exist in `chunk-2ZZDFOKL.js`. **This is an implementation blocker** — see §6.
 
+> **Status 2026-07 — accepted as a known limitation
+> ([ADR 0004](adr/0004-personal-bot-scope.md)).** The bot's wallet-import
+> resolver cannot derive deposit-wallet addresses minted by the new factory,
+> so an email/third-party Polymarket signup importing their key would get
+> bound to a wrong, empty Trading Wallet. Under personal-bot scope this is
+> documented, not scheduled work: the trusted-circle onboarding path is to
+> verify the trading-wallet address by hand against the user's Polymarket
+> profile. Revisit only if ADR 0004's scope ever changes.
+
 ---
 
 ## 3. Signing — ERC-7739 nested `TypedDataSign` + ERC-1271 (sigType 3)

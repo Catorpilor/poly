@@ -155,13 +155,6 @@ func (bc *BalanceChecker) GetERC1155Balance(ctx context.Context, owner common.Ad
 	return new(big.Int).SetBytes(result), nil
 }
 
-// Polymarket contract addresses on Polygon
-var (
-	ConditionalTokensAddress = common.HexToAddress("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
-	CTFExchangeAddress       = common.HexToAddress("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E")
-	NegRiskExchangeAddress   = common.HexToAddress("0xC5d563A36AE78145C45a50134d48A1215220f80a")
-)
-
 // IsApprovedForAll checks if an operator is approved to transfer ERC-1155 tokens
 func (bc *BalanceChecker) IsApprovedForAll(ctx context.Context, owner, operator common.Address) (bool, error) {
 	// ERC-1155 isApprovedForAll(address,address) returns (bool)
