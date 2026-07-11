@@ -49,10 +49,12 @@ Grilled decisions:
 - [x] go test -race green: concurrent-writer serialization test + direct
       ack-vs-broadcast race test + drop/deliver behavioral tests
 
-## Phase 4 — Shared trade executor (F9, F10)
-- [ ] Extract helper: user → decrypt → creds → TestL2Auth → fees →
-      TradeRequest → ExecuteTrade
-- [ ] Rewire handleTrade onto it; handleTrade = parse/validate/resolve/execute
+## Phase 4 — Shared trade executor (F9, F10) ✅
+- [x] polymarket.TradeExecutor: creds → TestL2Auth → fee discovery
+      (best-effort) → ExecuteTrade; httptest-tested against fake CLOB +
+      Gamma (happy path, L2 abort-before-order, creds abort, fee outages)
+- [x] handleTrade rewired: parse → validate → auth → resolve → Execute;
+      web path gains the L2 auth pre-check (F10)
 
 ## Phase 5 — Polish (F11 cut)
 - [ ] Method-scoped routes ("POST /api/trade" etc.)

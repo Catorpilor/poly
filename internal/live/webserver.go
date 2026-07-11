@@ -54,6 +54,7 @@ type WebServer struct {
 	userRepo       repositories.UserRepository
 	walletManager  *wallet.Manager
 	tradingClient  *polymarket.TradingClient
+	tradeExecutor  *polymarket.TradeExecutor
 	allowedHost    string // hostname from LIVE_WEB_URL, allowed alongside localhost/IP literals
 }
 
@@ -75,6 +76,10 @@ func NewWebServer(
 		tradingClient: tradingClient,
 	}
 	ws.upgrader = websocket.Upgrader{CheckOrigin: ws.requestAllowed}
+
+	if tradingClient != nil {
+		ws.tradeExecutor = polymarket.NewTradeExecutor(tradingClient, polymarket.NewMarketClient())
+	}
 
 	if cfg != nil && cfg.App.LiveWebURL != "" {
 		if u, err := url.Parse(cfg.App.LiveWebURL); err == nil {
@@ -726,15 +731,6 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get API credentials
-	creds, err := ws.tradingClient.GetOrCreateAPICredentials(r.Context(), decryptedWallet.PrivateKey)
-	if err != nil {
-		log.Printf("WebServer: Failed to get API credentials: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Failed to get API credentials"})
-		return
-	}
-
 	// Resolve the event's ML markets and map the indexes onto a token
 	eventInfo, err := ws.liveManager.resolver.GetEventInfo(r.Context(), req.Trade.EventSlug)
 	if err != nil {
@@ -753,41 +749,21 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 	log.Printf("WebServer: Trade resolved: event=%s market=%s (%d/%d) outcome=%s token=%s",
 		req.Trade.EventSlug, marketID, req.Trade.MarketIndex, len(mlMarkets), outcome, tokenID)
 
-	// Get fee rates and negRisk: Gamma feeSchedule for calculation, CLOB for order submission
-	var calcFeeBps, orderFeeBps int
-	var negRisk bool
-	mc := polymarket.NewMarketClient()
-	if gammaMarket, err := mc.GetMarketByID(r.Context(), marketID); err != nil {
-		log.Printf("WebServer: Failed to get Gamma market for fee schedule: %v (using defaults)", err)
-	} else {
-		calcFeeBps = gammaMarket.GetFeeRateBps()
-		negRisk = gammaMarket.NegRisk
-		log.Printf("WebServer: feeSchedule=%+v, feeType=%s, calcFeeBps=%d, negRisk=%v", gammaMarket.FeeSchedule, gammaMarket.FeeType, calcFeeBps, negRisk)
-	}
-	if feeRate, err := ws.tradingClient.GetFeeRate(r.Context(), tokenID); err != nil {
-		log.Printf("WebServer: Failed to get CLOB fee rate: %v (using 0)", err)
-	} else {
-		orderFeeBps = feeRate
-	}
-
-	// Build trade request
+	// Build trade request; the executor fills the fee fields
 	tradeReq := &polymarket.TradeRequest{
-		MarketID:     marketID,
-		TokenID:      tokenID,
-		Side:         "BUY", // validateWebTrade enforces buy-only
-		Outcome:      outcome,
-		Amount:       req.Trade.Amount,
-		Price:        0, // Market order - uses VWAP
-		OrderType:    polymarket.OrderTypeGTC,
-		TakerFeeBps:  orderFeeBps,
-		CalcFeeBps:   calcFeeBps,
-		NegativeRisk: negRisk,
-		AccountType:  user.AccountType,
+		MarketID:    marketID,
+		TokenID:     tokenID,
+		Side:        "BUY", // validateWebTrade enforces buy-only
+		Outcome:     outcome,
+		Amount:      req.Trade.Amount,
+		Price:       0, // Market order - uses VWAP
+		OrderType:   polymarket.OrderTypeGTC,
+		AccountType: user.AccountType,
 	}
 
-	// Execute the trade
+	// Execute: credentials, L2 auth pre-check, fee discovery, submission
 	proxyAddr := common.HexToAddress(user.ProxyAddress)
-	result, err := ws.tradingClient.ExecuteTrade(r.Context(), decryptedWallet.PrivateKey, proxyAddr, creds, tradeReq)
+	result, err := ws.tradeExecutor.Execute(r.Context(), decryptedWallet.PrivateKey, proxyAddr, tradeReq)
 	if err != nil {
 		log.Printf("WebServer: Trade execution failed: %v", err)
 		w.WriteHeader(http.StatusBadRequest)
