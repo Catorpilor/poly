@@ -53,6 +53,17 @@ The outcome *label* ("YES", "KNICKS") is display metadata only: its casing
 varies across Polymarket's APIs, and it must never be used as a key or
 compared case-sensitively.
 
+**Outcome Index** — The position of an Outcome within its market's token
+list (0 or 1 for binary markets). Positional identity: it selects which
+Token ID a trade or redemption targets, and must never be inferred from
+the outcome label.
+
+**Market Index** — The position of a market within an event's Moneyline
+market list. Always 0 for events with a single Moneyline market (2-way);
+0–2 for events with one market per side (3-way soccer: home/draw/away).
+Distinct from Outcome Index: Market Index picks the market, Outcome Index
+picks the side within it.
+
 ## Wallets & accounts
 
 **EOA** — The externally-owned account whose private key the bot holds

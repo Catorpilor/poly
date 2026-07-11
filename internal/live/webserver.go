@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -51,6 +54,7 @@ type WebServer struct {
 	userRepo       repositories.UserRepository
 	walletManager  *wallet.Manager
 	tradingClient  *polymarket.TradingClient
+	allowedHost    string // hostname from LIVE_WEB_URL, allowed alongside localhost/IP literals
 }
 
 // NewWebServer creates a new web server for live monitoring
@@ -69,11 +73,13 @@ func NewWebServer(
 		config:        cfg,
 		walletManager: walletManager,
 		tradingClient: tradingClient,
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool {
-				return true // Allow all origins for development
-			},
-		},
+	}
+	ws.upgrader = websocket.Upgrader{CheckOrigin: ws.requestAllowed}
+
+	if cfg != nil && cfg.App.LiveWebURL != "" {
+		if u, err := url.Parse(cfg.App.LiveWebURL); err == nil {
+			ws.allowedHost = u.Hostname()
+		}
 	}
 
 	// Initialize repositories if db is available
@@ -99,12 +105,12 @@ func NewWebServer(
 	mux.HandleFunc("/health", ws.handleHealth)
 
 	// Auth endpoints for Telegram login
-	mux.HandleFunc("/api/auth/init", ws.handleAuthInit)
-	mux.HandleFunc("/api/auth/status", ws.handleAuthStatus)
-	mux.HandleFunc("/api/auth/complete", ws.handleAuthComplete)
+	mux.HandleFunc("/api/auth/init", ws.guardAPI(ws.handleAuthInit))
+	mux.HandleFunc("/api/auth/status", ws.guardAPI(ws.handleAuthStatus))
+	mux.HandleFunc("/api/auth/complete", ws.guardAPI(ws.handleAuthComplete))
 
 	// Trade endpoint
-	mux.HandleFunc("/api/trade", ws.handleTrade)
+	mux.HandleFunc("/api/trade", ws.guardAPI(ws.handleTrade))
 
 	ws.httpServer = &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
@@ -128,6 +134,67 @@ func (ws *WebServer) Start() error {
 // Stop stops the web server
 func (ws *WebServer) Stop() error {
 	return ws.httpServer.Close()
+}
+
+// The server is LAN-only and issues no bearer credentials, so the API's only
+// protection against a LAN browser being used as a CSRF proxy is rejecting
+// requests that couldn't have come from a page this server served:
+//   - the Host must be localhost, an IP literal, or the LIVE_WEB_URL host —
+//     under DNS rebinding the Host carries the attacker's domain instead;
+//   - an Origin header, when present, must match the request Host exactly —
+//     cross-site fetches carry the foreign page's origin;
+//   - POST bodies must declare Content-Type: application/json — cross-origin
+//     fetches then require a CORS preflight, which this server never answers.
+
+// requestAllowed is the shared predicate for /api/ requests and the /ws
+// upgrade (websocket.Upgrader.CheckOrigin).
+func (ws *WebServer) requestAllowed(r *http.Request) bool {
+	if !ws.hostAllowed(r.Host) {
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
+func (ws *WebServer) hostAllowed(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	if strings.EqualFold(host, "localhost") || net.ParseIP(host) != nil {
+		return true
+	}
+	return ws.allowedHost != "" && strings.EqualFold(host, ws.allowedHost)
+}
+
+// guardAPI wraps an /api/ handler with the LAN-only request checks
+func (ws *WebServer) guardAPI(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !ws.requestAllowed(r) {
+			log.Printf("WebServer: Rejected request to %s (Host=%q Origin=%q)", r.URL.Path, r.Host, r.Header.Get("Origin"))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Forbidden origin"})
+			return
+		}
+		if r.Method == http.MethodPost {
+			mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+			if err != nil || mediaType != "application/json" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnsupportedMediaType)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Content-Type must be application/json"})
+				return
+			}
+		}
+		next(w, r)
+	}
 }
 
 // handleWebSocket handles WebSocket connections for live trade streaming
