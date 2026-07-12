@@ -258,6 +258,13 @@ For sub-markets (game winners, totals, props): click **Markets ▾** in
 the trade section — the list is fetched fresh on every open — and use
 the per-outcome buy buttons on any row. Prices shown are indicative.
 
+Subscribing with a **market slug** (e.g. `…-2026-07-12-game3`, what a
+Polymarket market page URL ends in) resolves to the parent event and
+**pins that market**: the subscribe response carries `market` +
+`marketQuestion`, the panel shows a 🎯 label with the market question,
+and the primary buy buttons trade the pinned market instead of the
+Moneyline. Subscribing with the event slug keeps the usual ML buttons.
+
 **Caution:** sub-market order books are much thinner than Moneyline
 books. Market orders (VWAP + 2% slippage cap) walk whatever liquidity is
 there; the 1000 USDC cap bounds the damage, but expect worse fills than

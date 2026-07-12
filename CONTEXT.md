@@ -70,6 +70,11 @@ Classified by question keywords, not slug shape. Addressed by its market
 slug — a stable identity — never by position in the event's market list,
 which reorders.
 
+**Pinned Market** — The Sub-market a web subscription addressed directly
+(the user subscribed with its market slug rather than the event slug).
+The panel's primary buy buttons target the pinned market; without a pin
+they target the Moneyline.
+
 ## Wallets & accounts
 
 **EOA** — The externally-owned account whose private key the bot holds

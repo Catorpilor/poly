@@ -37,6 +37,10 @@ type wsResponse struct {
 	Outcomes []string `json:"outcomes,omitempty"` // outcome names for the main market (for subscribe response)
 	Events   []string `json:"events,omitempty"`  // list of subscribed events
 	Message  string   `json:"message,omitempty"` // error message
+	// Set when the subscribe slug named a specific sub-market: the panel's
+	// primary buy buttons target this market instead of the Moneyline.
+	Market         string `json:"market,omitempty"`
+	MarketQuestion string `json:"marketQuestion,omitempty"`
 }
 
 //go:embed static/*
@@ -339,28 +343,61 @@ func (ws *WebServer) handleSubscribe(conn *websocket.Conn, eventSlug string, all
 		return
 	}
 
-	// Extract outcomes from the Moneyline market using resolver's logic
-	var outcomes []string
-	mlMarkets := ws.liveManager.resolver.GetAllMLMarkets(eventInfo)
-	if len(mlMarkets) >= 3 {
-		// 3-way market (soccer): use market short names as outcomes
-		for _, m := range mlMarkets {
-			shortName := ExtractMarketShortName(m.Question)
-			if shortName != "" {
-				outcomes = append(outcomes, shortName)
-			}
-		}
-	} else if len(mlMarkets) > 0 {
-		// 2-way market (NBA, esports): use outcomes from primary market
-		outcomes = mlMarkets[0].GetOutcomes()
+	resp := wsResponse{
+		Type:  "subscribed",
+		Event: eventSlug,
+		Title: eventInfo.Title,
 	}
 
-	ws.sendResponse(conn, wsResponse{
-		Type:     "subscribed",
-		Event:    eventSlug,
-		Title:    eventInfo.Title,
-		Outcomes: outcomes,
-	})
+	if pinned := pinnedMarket(ws.liveManager.resolver, eventInfo, eventSlug); pinned != nil {
+		// The subscriber addressed a specific sub-market — its outcomes
+		// drive the panel's primary buy buttons, not the Moneyline's.
+		resp.Market = pinned.Slug
+		resp.MarketQuestion = pinned.Question
+		resp.Outcomes = pinned.GetOutcomes()
+	} else {
+		// Extract outcomes from the Moneyline market using resolver's logic
+		mlMarkets := ws.liveManager.resolver.GetAllMLMarkets(eventInfo)
+		if len(mlMarkets) >= 3 {
+			// 3-way market (soccer): use market short names as outcomes
+			for _, m := range mlMarkets {
+				shortName := ExtractMarketShortName(m.Question)
+				if shortName != "" {
+					resp.Outcomes = append(resp.Outcomes, shortName)
+				}
+			}
+		} else if len(mlMarkets) > 0 {
+			// 2-way market (NBA, esports): use outcomes from primary market
+			resp.Outcomes = mlMarkets[0].GetOutcomes()
+		}
+	}
+
+	ws.sendResponse(conn, resp)
+}
+
+// pinnedMarket returns the market the subscriber addressed directly, when
+// the subscribe slug names a tradeable non-ML market within the event.
+// Subscribing with a market slug (a Polymarket market page URL ends in
+// one) pins that market as the panel's primary trade target — otherwise
+// the buy buttons would silently trade the event's Moneyline instead of
+// the market the user asked for.
+func pinnedMarket(resolver *EventSlugResolver, eventInfo *EventInfo, slug string) *MarketInfo {
+	var match *MarketInfo
+	for i := range eventInfo.Markets {
+		if eventInfo.Markets[i].Slug == slug {
+			match = &eventInfo.Markets[i]
+			break
+		}
+	}
+	if match == nil || !match.Active || match.Closed {
+		return nil
+	}
+	for _, ml := range resolver.GetAllMLMarkets(eventInfo) {
+		if ml.ID == match.ID {
+			return nil // it's the Moneyline: normal panel behavior
+		}
+	}
+	return match
 }
 
 // handleUnsubscribe handles an unsubscribe request
