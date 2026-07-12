@@ -313,10 +313,39 @@ func (r *SubscriptionRegistry) WantsAllMarkets(conn *websocket.Conn, eventSlug s
 	return false
 }
 
-func (r *SubscriptionRegistry) GetConnWriteMutex(conn *websocket.Conn) *sync.Mutex {
+// RegisterConn creates the connection's write mutex. Called when the
+// connection is accepted, before any write can happen; UnsubscribeWeb
+// removes it on disconnect.
+func (r *SubscriptionRegistry) RegisterConn(conn *websocket.Conn) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.connWriteMu[conn] == nil {
+		r.connWriteMu[conn] = &sync.Mutex{}
+	}
+}
+
+// webWriteTimeout bounds a single write to a web client so a wedged
+// connection can only stall its caller briefly before erroring out and
+// getting dropped.
+const webWriteTimeout = 5 * time.Second
+
+// WriteConn is the single write path to a web connection: it serializes
+// writers (gorilla/websocket forbids concurrent writes to one conn — the
+// subscribe-ack and broadcast goroutines share each conn) and applies
+// webWriteTimeout. Fails if the connection was never registered or is
+// already cleaned up.
+func (r *SubscriptionRegistry) WriteConn(conn *websocket.Conn, data []byte) error {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.connWriteMu[conn]
+	mu := r.connWriteMu[conn]
+	r.mu.RUnlock()
+	if mu == nil {
+		return fmt.Errorf("connection not registered")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	conn.SetWriteDeadline(time.Now().Add(webWriteTimeout))
+	return conn.WriteMessage(websocket.TextMessage, data)
 }
 
 func (r *SubscriptionRegistry) GetAllSubscribedEvents() []string {
@@ -352,6 +381,11 @@ type LiveTradeManager struct {
 	lastMessageTime time.Time
 	ctx             context.Context
 	cancel          context.CancelFunc
+
+	// Serializes writes to the upstream RTDS conn: pingLoop and
+	// subscribeToAllTrades (reachable from subscribe-handler goroutines)
+	// would otherwise write concurrently, which gorilla/websocket forbids.
+	rtdsWriteMu sync.Mutex
 
 	// Map asset ID to event slug for trade matching
 	assetToEvent map[string]string
@@ -465,7 +499,10 @@ func (m *LiveTradeManager) pingLoop() {
 				return
 			}
 
-			if err := conn.WriteMessage(websocket.TextMessage, []byte("PING")); err != nil {
+			m.rtdsWriteMu.Lock()
+			err := conn.WriteMessage(websocket.TextMessage, []byte("PING"))
+			m.rtdsWriteMu.Unlock()
+			if err != nil {
 				log.Printf("LiveTradeManager: Ping failed: %v", err)
 				m.handleDisconnect()
 				return
@@ -662,7 +699,10 @@ func (m *LiveTradeManager) subscribeToAllTrades() error {
 		return err
 	}
 
-	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+	m.rtdsWriteMu.Lock()
+	err = conn.WriteMessage(websocket.TextMessage, data)
+	m.rtdsWriteMu.Unlock()
+	if err != nil {
 		return err
 	}
 	log.Println("LiveTradeManager: Subscribed to activity trades")
@@ -944,6 +984,18 @@ func (m *LiveTradeManager) trackEventAssets(eventSlug string, eventInfo *EventIn
 	}
 }
 
+// RegisterWebConn must be called when a web connection is accepted, before
+// anything writes to it — WriteWeb refuses unregistered connections.
+func (m *LiveTradeManager) RegisterWebConn(conn *websocket.Conn) {
+	m.subscriptions.RegisterConn(conn)
+}
+
+// WriteWeb sends one frame to a web client through the registry's single
+// serialized write path.
+func (m *LiveTradeManager) WriteWeb(conn *websocket.Conn, data []byte) error {
+	return m.subscriptions.WriteConn(conn, data)
+}
+
 func (m *LiveTradeManager) UnsubscribeWeb(conn *websocket.Conn) {
 	m.subscriptions.UnsubscribeWeb(conn)
 }
@@ -996,11 +1048,13 @@ func (m *LiveTradeManager) broadcastToWeb(eventSlug string, trade *TradeInfo, rt
 		if isSubMarket && !m.subscriptions.WantsAllMarkets(conn, eventSlug) {
 			continue
 		}
-		// Use mutex to prevent concurrent writes to the same connection
-		if mu := m.subscriptions.GetConnWriteMutex(conn); mu != nil {
-			mu.Lock()
-			conn.WriteMessage(websocket.TextMessage, data)
-			mu.Unlock()
+		if err := m.subscriptions.WriteConn(conn, data); err != nil {
+			// A dead or wedged client must not stall the feed for the
+			// rest. Drop it here; its handler goroutine finishes cleanup
+			// when its ReadMessage fails.
+			log.Printf("LiveTradeManager: Dropping web client, write failed: %v", err)
+			m.subscriptions.UnsubscribeWeb(conn)
+			conn.Close()
 		}
 	}
 }

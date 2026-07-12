@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -51,6 +54,8 @@ type WebServer struct {
 	userRepo       repositories.UserRepository
 	walletManager  *wallet.Manager
 	tradingClient  *polymarket.TradingClient
+	tradeExecutor  *polymarket.TradeExecutor
+	allowedHost    string // hostname from LIVE_WEB_URL, allowed alongside localhost/IP literals
 }
 
 // NewWebServer creates a new web server for live monitoring
@@ -69,11 +74,17 @@ func NewWebServer(
 		config:        cfg,
 		walletManager: walletManager,
 		tradingClient: tradingClient,
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool {
-				return true // Allow all origins for development
-			},
-		},
+	}
+	ws.upgrader = websocket.Upgrader{CheckOrigin: ws.requestAllowed}
+
+	if tradingClient != nil {
+		ws.tradeExecutor = polymarket.NewTradeExecutor(tradingClient, polymarket.NewMarketClient())
+	}
+
+	if cfg != nil && cfg.App.LiveWebURL != "" {
+		if u, err := url.Parse(cfg.App.LiveWebURL); err == nil {
+			ws.allowedHost = u.Hostname()
+		}
 	}
 
 	// Initialize repositories if db is available
@@ -93,22 +104,35 @@ func NewWebServer(
 	}
 
 	// WebSocket endpoint
-	mux.HandleFunc("/ws", ws.handleWebSocket)
+	mux.HandleFunc("GET /ws", ws.handleWebSocket)
 
 	// Health check
-	mux.HandleFunc("/health", ws.handleHealth)
+	mux.HandleFunc("GET /health", ws.handleHealth)
 
 	// Auth endpoints for Telegram login
-	mux.HandleFunc("/api/auth/init", ws.handleAuthInit)
-	mux.HandleFunc("/api/auth/status", ws.handleAuthStatus)
-	mux.HandleFunc("/api/auth/complete", ws.handleAuthComplete)
+	mux.HandleFunc("POST /api/auth/init", ws.guardAPI(ws.handleAuthInit))
+	mux.HandleFunc("GET /api/auth/status", ws.guardAPI(ws.handleAuthStatus))
+	mux.HandleFunc("POST /api/auth/complete", ws.guardAPI(ws.handleAuthComplete))
 
 	// Trade endpoint
-	mux.HandleFunc("/api/trade", ws.handleTrade)
+	mux.HandleFunc("POST /api/trade", ws.guardAPI(ws.handleTrade))
+
+	// API namespace fallback. Without this, a wrong-method or unknown
+	// /api/ request falls through to the "/" file server and gets an HTML
+	// 404; the method-scoped patterns above only produce a 405 when no
+	// broader pattern matches.
+	mux.HandleFunc("/api/", handleAPIFallback)
 
 	ws.httpServer = &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
 		Handler: mux,
+		// Don't hold connections open forever (slowloris posture, even on
+		// a LAN). Gorilla clears these deadlines when it hijacks the /ws
+		// connection, so the long-lived WebSocket is unaffected.
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	return ws
@@ -130,6 +154,87 @@ func (ws *WebServer) Stop() error {
 	return ws.httpServer.Close()
 }
 
+// The server is LAN-only and issues no bearer credentials, so the API's only
+// protection against a LAN browser being used as a CSRF proxy is rejecting
+// requests that couldn't have come from a page this server served:
+//   - the Host must be localhost, an IP literal, or the LIVE_WEB_URL host —
+//     under DNS rebinding the Host carries the attacker's domain instead;
+//   - an Origin header, when present, must match the request Host exactly —
+//     cross-site fetches carry the foreign page's origin;
+//   - POST bodies must declare Content-Type: application/json — cross-origin
+//     fetches then require a CORS preflight, which this server never answers.
+
+// requestAllowed is the shared predicate for /api/ requests and the /ws
+// upgrade (websocket.Upgrader.CheckOrigin).
+func (ws *WebServer) requestAllowed(r *http.Request) bool {
+	if !ws.hostAllowed(r.Host) {
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
+func (ws *WebServer) hostAllowed(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	if strings.EqualFold(host, "localhost") || net.ParseIP(host) != nil {
+		return true
+	}
+	return ws.allowedHost != "" && strings.EqualFold(host, ws.allowedHost)
+}
+
+// apiEndpoints are the registered API paths, used by the fallback to tell
+// a wrong method (405) from an unknown path (404).
+var apiEndpoints = map[string]bool{
+	"/api/auth/init":     true,
+	"/api/auth/status":   true,
+	"/api/auth/complete": true,
+	"/api/trade":         true,
+}
+
+func handleAPIFallback(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if apiEndpoints[r.URL.Path] {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+		return
+	}
+	w.WriteHeader(http.StatusNotFound)
+	json.NewEncoder(w).Encode(map[string]string{"error": "Not found"})
+}
+
+// guardAPI wraps an /api/ handler with the LAN-only request checks
+func (ws *WebServer) guardAPI(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !ws.requestAllowed(r) {
+			log.Printf("WebServer: Rejected request to %s (Host=%q Origin=%q)", r.URL.Path, r.Host, r.Header.Get("Origin"))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Forbidden origin"})
+			return
+		}
+		if r.Method == http.MethodPost {
+			mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+			if err != nil || mediaType != "application/json" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnsupportedMediaType)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Content-Type must be application/json"})
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
 // handleWebSocket handles WebSocket connections for live trade streaming
 // Supports multi-subscribe protocol:
 //   - {"action": "subscribe", "event": "slug"} - subscribe to an event
@@ -144,6 +249,11 @@ func (ws *WebServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 	defer ws.liveManager.UnsubscribeWeb(conn)
+
+	// Register before anything can write to this conn: acks (this
+	// goroutine) and trade broadcasts (RTDS goroutine) share it, and both
+	// go through the registry's serialized write path.
+	ws.liveManager.RegisterWebConn(conn)
 
 	log.Printf("WebServer: Client connected")
 
@@ -284,14 +394,16 @@ func (ws *WebServer) handleList(conn *websocket.Conn) {
 	})
 }
 
-// sendResponse sends a JSON response to the client
+// sendResponse sends a JSON response to the client through the registry's
+// serialized write path — a raw conn.WriteMessage here would race the
+// RTDS goroutine's trade broadcasts on the same conn.
 func (ws *WebServer) sendResponse(conn *websocket.Conn, resp wsResponse) {
 	data, err := json.Marshal(resp)
 	if err != nil {
 		log.Printf("WebServer: Failed to marshal response: %v", err)
 		return
 	}
-	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+	if err := ws.liveManager.WriteWeb(conn, data); err != nil {
 		log.Printf("WebServer: Failed to send response: %v", err)
 	}
 }
@@ -339,10 +451,12 @@ type authCompleteResponse struct {
 func (ws *WebServer) handleAuthInit(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	// Only allow POST
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+	// Without a configured bot username there is no valid deep link to
+	// hand out — refuse rather than linking to a wrong bot.
+	if ws.config == nil || ws.config.Telegram.BotUsername == "" {
+		log.Printf("WebServer: auth init refused — TELEGRAM_BOT_USERNAME not configured")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Bot username not configured"})
 		return
 	}
 
@@ -364,11 +478,7 @@ func (ws *WebServer) handleAuthInit(w http.ResponseWriter, r *http.Request) {
 
 	// Build Telegram deep link URL
 	tokenStr := repositories.TokenToString(token.Token)
-	botUsername := "poly_trade_test_bot"
-	if ws.config != nil && ws.config.Telegram.BotUsername != "" {
-		botUsername = ws.config.Telegram.BotUsername
-	}
-	telegramURL := fmt.Sprintf("https://t.me/%s?start=login_%s", botUsername, tokenStr)
+	telegramURL := fmt.Sprintf("https://t.me/%s?start=login_%s", ws.config.Telegram.BotUsername, tokenStr)
 
 	resp := authInitResponse{
 		Token:       tokenStr,
@@ -382,13 +492,6 @@ func (ws *WebServer) handleAuthInit(w http.ResponseWriter, r *http.Request) {
 // handleAuthStatus checks the status of a login token
 func (ws *WebServer) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-
-	// Only allow GET
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
-		return
-	}
 
 	// Get token from query parameter
 	tokenStr := r.URL.Query().Get("token")
@@ -439,13 +542,6 @@ func (ws *WebServer) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 func (ws *WebServer) handleAuthComplete(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	// Only allow POST
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
-		return
-	}
-
 	// Parse request body
 	var req struct {
 		Token string `json:"token"`
@@ -495,11 +591,14 @@ type webTradeSession struct {
 	ProxyAddress  string `json:"proxyAddress"`
 }
 
+// webTradeData addresses one side of one Moneyline market: MarketIndex picks
+// the market within the event's ML list (0 for 2-way events, 0-2 for 3-way
+// soccer), OutcomeIndex picks the side within it (see CONTEXT.md: Market
+// Index vs Outcome Index).
 type webTradeData struct {
 	EventSlug    string  `json:"eventSlug"`
-	MarketID     string  `json:"marketId"`
+	MarketIndex  int     `json:"marketIndex"`
 	OutcomeIndex int     `json:"outcomeIndex"`
-	YesNoIndex   *int    `json:"yesNoIndex"` // For 3-way markets: 0=Yes, 1=No (nil for 2-way)
 	Side         string  `json:"side"`
 	Amount       float64 `json:"amount"`
 }
@@ -516,14 +615,83 @@ type webTradeResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
+// maxWebTradeAmount caps a single web buy in USDC — a fat-finger guard
+// mirroring the UI input's max attribute.
+const maxWebTradeAmount = 1000
+
+// validateWebTrade checks the request-shape rules that need no market data.
+// The web endpoint is buy-only: selling is a "how much of my position at
+// what P&L" decision that belongs in the Telegram flow, which sells exact
+// share counts (SharesRaw) instead of back-solving them from a USD amount.
+func validateWebTrade(t webTradeData) error {
+	if t.EventSlug == "" {
+		return fmt.Errorf("eventSlug is required")
+	}
+	if side := strings.ToUpper(t.Side); side != "BUY" {
+		if side == "SELL" {
+			return fmt.Errorf("selling is not available on the web — use the Telegram bot")
+		}
+		return fmt.Errorf("side must be BUY")
+	}
+	if t.Amount <= 0 {
+		return fmt.Errorf("amount must be positive")
+	}
+	if t.Amount > maxWebTradeAmount {
+		return fmt.Errorf("amount must be at most %d USDC", maxWebTradeAmount)
+	}
+	if t.MarketIndex < 0 {
+		return fmt.Errorf("marketIndex must be non-negative")
+	}
+	if t.OutcomeIndex < 0 || t.OutcomeIndex > 1 {
+		return fmt.Errorf("outcomeIndex must be 0 or 1")
+	}
+	return nil
+}
+
+// resolveWebTrade maps (marketIndex, outcomeIndex) onto a concrete market
+// and token. mlMarkets is the event's Moneyline market list in resolver
+// order — the same order the subscribe response presents outcomes in, so
+// the indexes the frontend sends line up positionally.
+func resolveWebTrade(mlMarkets []*MarketInfo, marketIndex, outcomeIndex int) (marketID, tokenID, outcome string, err error) {
+	if len(mlMarkets) == 0 {
+		return "", "", "", fmt.Errorf("event has no Moneyline markets")
+	}
+	if marketIndex < 0 || marketIndex >= len(mlMarkets) {
+		return "", "", "", fmt.Errorf("marketIndex %d out of range (event has %d markets)", marketIndex, len(mlMarkets))
+	}
+	market := mlMarkets[marketIndex]
+
+	tokenIDs := market.GetClobTokenIds()
+	if outcomeIndex < 0 || outcomeIndex >= len(tokenIDs) {
+		return "", "", "", fmt.Errorf("outcomeIndex %d out of range (market has %d outcomes)", outcomeIndex, len(tokenIDs))
+	}
+
+	// The outcome label is display metadata only — never identity.
+	outcomes := market.GetOutcomes()
+	if outcomeIndex < len(outcomes) {
+		outcome = outcomes[outcomeIndex]
+	}
+
+	return market.ID, tokenIDs[outcomeIndex], outcome, nil
+}
+
 // handleTrade handles trade execution from the web interface
 func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	// Only allow POST
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Method not allowed"})
+	// Parse request body
+	var req webTradeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Invalid request body"})
+		return
+	}
+
+	// Validate trade data before dependency checks, so a malformed request
+	// never reads as "trading not configured"
+	if err := validateWebTrade(req.Trade); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: err.Error()})
 		return
 	}
 
@@ -541,44 +709,10 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse request body
-	var req webTradeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Invalid request body"})
-		return
-	}
-
 	// Validate session
 	if req.Session.TelegramID == 0 {
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Not authenticated"})
-		return
-	}
-
-	// Validate trade data
-	if req.Trade.EventSlug == "" && req.Trade.MarketID == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Event slug or market ID required"})
-		return
-	}
-
-	if req.Trade.Amount <= 0 {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Amount must be positive"})
-		return
-	}
-
-	side := strings.ToUpper(req.Trade.Side)
-	if side != "BUY" && side != "SELL" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Side must be BUY or SELL"})
-		return
-	}
-
-	if req.Trade.OutcomeIndex < 0 || req.Trade.OutcomeIndex > 1 {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Outcome index must be 0 or 1"})
 		return
 	}
 
@@ -614,134 +748,39 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get API credentials
-	creds, err := ws.tradingClient.GetOrCreateAPICredentials(r.Context(), decryptedWallet.PrivateKey)
+	// Resolve the event's ML markets and map the indexes onto a token
+	eventInfo, err := ws.liveManager.resolver.GetEventInfo(r.Context(), req.Trade.EventSlug)
 	if err != nil {
-		log.Printf("WebServer: Failed to get API credentials: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Failed to get API credentials"})
-		return
-	}
-
-	// Resolve event to market and token ID
-	var tokenID string
-	var marketID string
-	var outcome string
-
-	if req.Trade.MarketID != "" {
-		// Direct market ID provided
-		marketID = req.Trade.MarketID
-		// Fetch market info to get token ID
-		eventInfo, err := ws.liveManager.resolver.GetEventInfo(r.Context(), req.Trade.EventSlug)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Event not found"})
-			return
-		}
-		for _, market := range eventInfo.Markets {
-			if market.ID == marketID {
-				tokenIDs := market.GetClobTokenIds()
-				if len(tokenIDs) > req.Trade.OutcomeIndex {
-					tokenID = tokenIDs[req.Trade.OutcomeIndex]
-				}
-				outcomes := market.GetOutcomes()
-				if len(outcomes) > req.Trade.OutcomeIndex {
-					outcome = outcomes[req.Trade.OutcomeIndex]
-				}
-				break
-			}
-		}
-	} else {
-		// Resolve from event slug - use ML market(s) from resolver
-		eventInfo, err := ws.liveManager.resolver.GetEventInfo(r.Context(), req.Trade.EventSlug)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Event not found"})
-			return
-		}
-
-		// Get all ML markets to detect 2-way vs 3-way
-		mlMarkets := ws.liveManager.resolver.GetAllMLMarkets(eventInfo)
-		if len(mlMarkets) >= 3 {
-			// 3-way market (soccer): outcomeIndex selects which market, yesNoIndex selects Yes/No
-			if req.Trade.OutcomeIndex < len(mlMarkets) {
-				selectedMarket := mlMarkets[req.Trade.OutcomeIndex]
-				marketID = selectedMarket.ID
-				tokenIDs := selectedMarket.GetClobTokenIds()
-				outcomes := selectedMarket.GetOutcomes()
-
-				// Use yesNoIndex if provided, default to 0 (Yes)
-				yesNoIdx := 0
-				if req.Trade.YesNoIndex != nil {
-					yesNoIdx = *req.Trade.YesNoIndex
-				}
-
-				if yesNoIdx < len(tokenIDs) {
-					tokenID = tokenIDs[yesNoIdx]
-				}
-				if yesNoIdx < len(outcomes) {
-					outcome = outcomes[yesNoIdx]
-				}
-				shortName := ExtractMarketShortName(selectedMarket.Question)
-				log.Printf("WebServer: 3-way market selected: %s (%s), yesNo=%d, question: %s", marketID, shortName, yesNoIdx, selectedMarket.Question)
-			}
-		} else if len(mlMarkets) > 0 {
-			// 2-way market (NBA, esports): outcomeIndex selects outcome within the market
-			primaryMarket := mlMarkets[0]
-			marketID = primaryMarket.ID
-			tokenIDs := primaryMarket.GetClobTokenIds()
-			outcomes := primaryMarket.GetOutcomes()
-			if req.Trade.OutcomeIndex < len(tokenIDs) {
-				tokenID = tokenIDs[req.Trade.OutcomeIndex]
-			}
-			if req.Trade.OutcomeIndex < len(outcomes) {
-				outcome = outcomes[req.Trade.OutcomeIndex]
-			}
-			log.Printf("WebServer: 2-way market selected: %s, question: %s, outcomes: %v", marketID, primaryMarket.Question, outcomes)
-		}
-	}
-
-	if tokenID == "" {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Could not resolve market token ID"})
+		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Event not found"})
 		return
 	}
 
-	// Get fee rates and negRisk: Gamma feeSchedule for calculation, CLOB for order submission
-	var calcFeeBps, orderFeeBps int
-	var negRisk bool
-	mc := polymarket.NewMarketClient()
-	if gammaMarket, err := mc.GetMarketByID(r.Context(), marketID); err != nil {
-		log.Printf("WebServer: Failed to get Gamma market for fee schedule: %v (using defaults)", err)
-	} else {
-		calcFeeBps = gammaMarket.GetFeeRateBps()
-		negRisk = gammaMarket.NegRisk
-		log.Printf("WebServer: feeSchedule=%+v, feeType=%s, calcFeeBps=%d, negRisk=%v", gammaMarket.FeeSchedule, gammaMarket.FeeType, calcFeeBps, negRisk)
+	mlMarkets := ws.liveManager.resolver.GetAllMLMarkets(eventInfo)
+	marketID, tokenID, outcome, err := resolveWebTrade(mlMarkets, req.Trade.MarketIndex, req.Trade.OutcomeIndex)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: err.Error()})
+		return
 	}
-	if feeRate, err := ws.tradingClient.GetFeeRate(r.Context(), tokenID); err != nil {
-		log.Printf("WebServer: Failed to get CLOB fee rate: %v (using 0)", err)
-	} else {
-		orderFeeBps = feeRate
-	}
+	log.Printf("WebServer: Trade resolved: event=%s market=%s (%d/%d) outcome=%s token=%s",
+		req.Trade.EventSlug, marketID, req.Trade.MarketIndex, len(mlMarkets), outcome, tokenID)
 
-	// Build trade request
+	// Build trade request; the executor fills the fee fields
 	tradeReq := &polymarket.TradeRequest{
-		MarketID:     marketID,
-		TokenID:      tokenID,
-		Side:         side,
-		Outcome:      outcome,
-		Amount:       req.Trade.Amount,
-		Price:        0, // Market order - uses VWAP
-		OrderType:    polymarket.OrderTypeGTC,
-		TakerFeeBps:  orderFeeBps,
-		CalcFeeBps:   calcFeeBps,
-		NegativeRisk: negRisk,
-		AccountType:  user.AccountType,
+		MarketID:    marketID,
+		TokenID:     tokenID,
+		Side:        "BUY", // validateWebTrade enforces buy-only
+		Outcome:     outcome,
+		Amount:      req.Trade.Amount,
+		Price:       0, // Market order - uses VWAP
+		OrderType:   polymarket.OrderTypeGTC,
+		AccountType: user.AccountType,
 	}
 
-	// Execute the trade
+	// Execute: credentials, L2 auth pre-check, fee discovery, submission
 	proxyAddr := common.HexToAddress(user.ProxyAddress)
-	result, err := ws.tradingClient.ExecuteTrade(r.Context(), decryptedWallet.PrivateKey, proxyAddr, creds, tradeReq)
+	result, err := ws.tradeExecutor.Execute(r.Context(), decryptedWallet.PrivateKey, proxyAddr, tradeReq)
 	if err != nil {
 		log.Printf("WebServer: Trade execution failed: %v", err)
 		w.WriteHeader(http.StatusBadRequest)
