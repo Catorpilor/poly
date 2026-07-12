@@ -44,6 +44,48 @@ market). `outcomeIndex` picks the side within that market (0 or 1). See
 CONTEXT.md: Market Index vs Outcome Index. `side` must be `BUY` — the
 endpoint is buy-only, selling lives in the Telegram bot.
 
+Sub-market trades (from the market picker) send `marketSlug` instead of
+`marketIndex`:
+
+```json
+{
+    "trade": {
+        "eventSlug": "lol-hle1-ly-2026-07-11",
+        "marketSlug": "lol-hle1-ly-2026-07-11-game1",
+        "outcomeIndex": 0,
+        "side": "BUY",
+        "amount": 10.0
+    }
+}
+```
+
+When `marketSlug` is present, resolution runs over **all** of the event's
+markets (not just Moneyline) and `marketIndex` is ignored. Unknown slugs
+and closed or inactive markets are rejected with a 400.
+
+### GET `/api/events/{slug}/markets`
+
+Lists an event's tradeable sub-markets for the picker — active,
+non-closed markets excluding the Moneyline set (which has its own
+buttons). Prices are indicative (Gamma's last-known values, cached up to
+5 minutes); fills always price off the live order book.
+
+```json
+{
+    "event": "lol-hle1-ly-2026-07-11",
+    "markets": [
+        {
+            "slug": "lol-hle1-ly-2026-07-11-game1",
+            "question": "HLE vs. LY: Game 1 Winner",
+            "outcomes": ["HLE", "LY"],
+            "prices": ["0.55", "0.46"]
+        }
+    ]
+}
+```
+
+Returns 404 for an unknown event.
+
 **Response (Success):**
 ```json
 {
@@ -131,7 +173,8 @@ For sports/esports events with multiple markets (spreads, totals, props), the sy
 - `baron` - first baron
 - `inhibitor` - first inhibitor
 - `kills` - total kills
-- `map `, `maps` - map-specific markets
+- `map `, `maps` - map-specific markets (CS2)
+- `game ` - game-specific markets (LoL "Game 1 Winner"; trailing space keeps "total games" patterns unaffected)
 - `series:` - series markets
 
 **Fallback logic:**
@@ -210,6 +253,15 @@ Markets may have taker fees (e.g., 10% for crypto markets). The system:
 5. Trade section appears with Buy buttons showing team names
 6. Enter amount (default: 10 USDC), click Buy button
 7. Trade executes immediately as market order
+
+For sub-markets (game winners, totals, props): click **Markets ▾** in
+the trade section — the list is fetched fresh on every open — and use
+the per-outcome buy buttons on any row. Prices shown are indicative.
+
+**Caution:** sub-market order books are much thinner than Moneyline
+books. Market orders (VWAP + 2% slippage cap) walk whatever liquidity is
+there; the 1000 USDC cap bounds the damage, but expect worse fills than
+on ML markets.
 
 ## Limitations
 

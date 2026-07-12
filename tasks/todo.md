@@ -149,11 +149,13 @@ Design decisions:
 - [x] Reuses panel amount input and button-disable loading state;
       inline JS syntax-checked with node --check
 
-## Phase C — Docs & wrap-up
-- [ ] docs/web-trade-feature.md: marketSlug protocol + picker section
-- [ ] CONTEXT.md: Sub-market entry
-- [ ] Full suite + -race; PR; manual smoke on a live esports event
-      (picker lists game markets; buy on a game-winner market)
+## Phase C — Docs & wrap-up ✅
+- [x] docs/web-trade-feature.md: marketSlug protocol, picker endpoint,
+      "game " keyword in the classification table, thin-book caution
+- [x] CONTEXT.md: Sub-market entry
+- [x] Full suite + -race clean; PR opened
+- [ ] Manual smoke on a live esports event (picker lists game markets;
+      buy on a game-winner market) — user, post-deploy
 
 Caution (told to user): sub-market books are thin; VWAP + 2% slippage
 walks them — the 1000 cap bounds damage but spreads cost more than ML.

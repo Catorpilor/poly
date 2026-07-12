@@ -64,6 +64,12 @@ market list. Always 0 for events with a single Moneyline market (2-way);
 Distinct from Outcome Index: Market Index picks the market, Outcome Index
 picks the side within it.
 
+**Sub-market** — Any market in an event other than its Moneyline
+market(s): game/map winners, totals, spreads, props, first objectives.
+Classified by question keywords, not slug shape. Addressed by its market
+slug — a stable identity — never by position in the event's market list,
+which reorders.
+
 ## Wallets & accounts
 
 **EOA** — The externally-owned account whose private key the bot holds
