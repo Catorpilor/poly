@@ -1046,6 +1046,14 @@
                         </div>
                     </div>
                     ` : ''}
+                    <!-- Sub-market picker -->
+                    <div class="mt-2">
+                        <button onclick="toggleMarketPicker('${slug}')" id="picker-toggle-${slug}"
+                                class="text-xs text-gray-400 hover:text-gray-200 transition-colors">
+                            Markets ▾
+                        </button>
+                        <div id="picker-${slug}" class="hidden mt-2 space-y-1 max-h-48 overflow-y-auto"></div>
+                    </div>
                 </div>
 
                 <!-- Stats Row -->
@@ -1279,6 +1287,68 @@
             hideAll3WayRows();
         }
 
+        // --- Sub-market picker ---
+
+        // Toggle the picker; fetch a fresh list on every open so markets
+        // that closed as the event progressed drop out.
+        async function toggleMarketPicker(eventSlug) {
+            const panel = document.getElementById(`picker-${eventSlug}`);
+            const toggle = document.getElementById(`picker-toggle-${eventSlug}`);
+            if (!panel || !toggle) return;
+
+            if (!panel.classList.contains('hidden')) {
+                panel.classList.add('hidden');
+                toggle.textContent = 'Markets ▾';
+                return;
+            }
+
+            panel.classList.remove('hidden');
+            toggle.textContent = 'Markets ▴';
+            panel.innerHTML = '<div class="text-gray-500 text-xs px-1">Loading markets…</div>';
+
+            try {
+                const resp = await fetch(`/api/events/${encodeURIComponent(eventSlug)}/markets`);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json();
+                renderMarketPicker(eventSlug, data.markets || []);
+            } catch (e) {
+                console.error('Failed to load sub-markets:', e);
+                panel.innerHTML = '<div class="text-red-400 text-xs px-1">Failed to load markets</div>';
+            }
+        }
+
+        function renderMarketPicker(eventSlug, markets) {
+            const panel = document.getElementById(`picker-${eventSlug}`);
+            if (!panel) return;
+
+            if (markets.length === 0) {
+                panel.innerHTML = '<div class="text-gray-500 text-xs px-1">No open sub-markets</div>';
+                return;
+            }
+
+            panel.innerHTML = markets.map(m => {
+                const buttons = (m.outcomes || []).slice(0, 2).map((label, idx) => {
+                    const price = formatCents(m.prices?.[idx]);
+                    return `<button onclick="executeTrade('${eventSlug}', 0, ${idx}, '${m.slug}')"
+                                    class="px-2 py-1 bg-blue-600 hover:bg-blue-700 rounded text-xs whitespace-nowrap transition-colors">
+                                ${label}${price ? ' ' + price : ''}
+                            </button>`;
+                }).join('');
+                const question = m.question.replace(/"/g, '&quot;');
+                return `<div class="flex items-center justify-between gap-2 bg-gray-800/60 rounded px-2 py-1">
+                            <span class="text-gray-300 text-xs truncate" title="${question}">${question}</span>
+                            <div class="flex gap-1 shrink-0">${buttons}</div>
+                        </div>`;
+            }).join('');
+        }
+
+        // Indicative price → cents label ("0.55" → "55¢"). Fills still
+        // price off the live order book server-side.
+        function formatCents(p) {
+            const n = parseFloat(p);
+            return isNaN(n) ? '' : `${Math.round(n * 100)}¢`;
+        }
+
         // Click outside handler to hide YES/NO row
         document.addEventListener('click', function(event) {
             // Check if click is outside any yesno row and not on a 3-way selector button
@@ -1293,8 +1363,10 @@
 
         // Execute a trade. marketIndex picks the ML market within the event
         // (always 0 for 2-way events), outcomeIndex picks the side within it.
+        // Picker trades pass marketSlug instead, which targets that market
+        // directly and makes marketIndex irrelevant.
         // The web UI is buy-only — selling lives in the Telegram bot.
-        async function executeTrade(eventSlug, marketIndex, outcomeIndex) {
+        async function executeTrade(eventSlug, marketIndex, outcomeIndex, marketSlug = null) {
             const session = getSession();
             if (!session?.telegramId) {
                 alert('Please login first');
@@ -1329,6 +1401,7 @@
                         },
                         trade: {
                             eventSlug: eventSlug,
+                            marketSlug: marketSlug || undefined,
                             marketIndex: marketIndex,
                             outcomeIndex: outcomeIndex,
                             side: 'BUY',

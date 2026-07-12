@@ -129,24 +129,25 @@ Design decisions:
 - Glossary: add **Sub-market** to CONTEXT.md (term already lives in
   code as isSubMarketSlug and the "All Markets" toggle).
 
-## Phase A — Backend: list + resolve + trade by slug (TDD)
-- [ ] GET /api/events/{slug}/markets (Go 1.22 path param, guardAPI):
-      returns active, non-closed markets — slug, question, outcomes;
-      404 for unknown event. httptest with fake-Gamma resolver.
-- [ ] webTradeData gains optional marketSlug; validateWebTrade: when
-      set, marketIndex is ignored; outcomeIndex still 0/1.
-- [ ] resolveWebTradeBySlug(markets []MarketInfo, slug, outcomeIndex):
-      match by slug, reject closed/inactive, bounds-check tokens.
-      Table tests incl. closed-market and unknown-slug cases.
-- [ ] handleTrade: marketSlug present → slug resolution over all event
-      markets; else existing ML path. Handler-level tests.
+## Phase A — Backend: list + resolve + trade by slug (TDD) ✅
+- [x] GET /api/events/{slug}/markets (guardAPI): active non-closed
+      sub-markets with slug/question/outcomes/prices; 404 unknown event
+- [x] webTradeData gains optional marketSlug; marketIndex ignored when
+      set; outcomeIndex still 0/1
+- [x] resolveWebTradeBySlug: slug match over all event markets;
+      closed/inactive/unknown/bounds rejected. Table-tested.
+- [x] **Classifier fix found en route**: "Game N Winner" counted as ML
+      ("map " keyword existed, "game " didn't) — LoL Bo3 rendered as a
+      fake 3-way in prod. "game " added + Bo3 regression case; existing
+      NBA/soccer/tennis/esports tables unchanged.
 
-## Phase B — Frontend: picker UI
-- [ ] "Markets ▾" toggle per event panel; on open fetch the endpoint,
-      render one row per market (question + Buy <outcome0>/<outcome1>)
-- [ ] Row click → executeTrade with {eventSlug, marketSlug,
-      outcomeIndex}; reuse panel amount input, loading state, alerts
-- [ ] Refresh list each open; show closed/empty states
+## Phase B — Frontend: picker UI ✅
+- [x] "Markets ▾" toggle in each panel's trade section; fetch on every
+      open (fresh closed-state); loading / error / empty states
+- [x] Rows: question + per-outcome buy buttons with indicative cent
+      prices; click → executeTrade(eventSlug, 0, idx, marketSlug)
+- [x] Reuses panel amount input and button-disable loading state;
+      inline JS syntax-checked with node --check
 
 ## Phase C — Docs & wrap-up
 - [ ] docs/web-trade-feature.md: marketSlug protocol + picker section
