@@ -22,6 +22,11 @@ var subMarketKeywords = []string{
 	"total points", "total maps", "total rounds",
 	": total", ": o/u",
 	"- game ", "game handicap", "games total",
+	// "game " (trailing space) marks per-game markets ("Game 1 Winner") as
+	// sub-markets, mirroring "map ". Without it, LoL game-winner markets
+	// classified as ML and a Bo3 series rendered as a fake 3-way market.
+	// The trailing space keeps "games" (e.g. "total games") unaffected.
+	"game ",
 }
 
 // isSubMarketQuestion checks if a market question contains sub-market keywords
@@ -53,6 +58,8 @@ type MarketInfo struct {
 	OutcomesRaw    string   `json:"outcomes"`
 	ClobTokenIds   []string `json:"-"` // Parsed from ClobTokenIdsRaw
 	ClobTokenIdsRaw string  `json:"clobTokenIds"`
+	OutcomePrices  []string `json:"-"` // Parsed from OutcomePricesRaw
+	OutcomePricesRaw string `json:"outcomePrices"`
 	Active         bool     `json:"active"`
 	Closed         bool     `json:"closed"`
 }
@@ -68,6 +75,21 @@ func (m *MarketInfo) GetOutcomes() []string {
 	}
 	m.Outcomes = outcomes
 	return outcomes
+}
+
+// GetOutcomePrices parses the outcomePrices JSON string. These are
+// indicative (Gamma's last-known prices, cached up to the resolver TTL) —
+// a fill still prices off the live order book at execution.
+func (m *MarketInfo) GetOutcomePrices() []string {
+	if len(m.OutcomePrices) > 0 {
+		return m.OutcomePrices
+	}
+	var prices []string
+	if err := json.Unmarshal([]byte(m.OutcomePricesRaw), &prices); err != nil {
+		return nil
+	}
+	m.OutcomePrices = prices
+	return prices
 }
 
 // GetClobTokenIds parses the clobTokenIds JSON string
@@ -244,6 +266,27 @@ func (r *EventSlugResolver) GetAllMLMarkets(event *EventInfo) []*MarketInfo {
 	}
 
 	return nil
+}
+
+// GetSubMarkets returns an event's tradeable non-Moneyline markets: active,
+// not closed, and not in the ML set. The ML set is excluded by market ID
+// (not question wording), so whatever GetAllMLMarkets selects — including
+// its "win"/first-active fallbacks — is filtered out consistently.
+func (r *EventSlugResolver) GetSubMarkets(event *EventInfo) []*MarketInfo {
+	mlIDs := make(map[string]bool)
+	for _, m := range r.GetAllMLMarkets(event) {
+		mlIDs[m.ID] = true
+	}
+
+	var subs []*MarketInfo
+	for i := range event.Markets {
+		m := &event.Markets[i]
+		if !m.Active || m.Closed || mlIDs[m.ID] {
+			continue
+		}
+		subs = append(subs, m)
+	}
+	return subs
 }
 
 // GetAllMLMarketsAssetIDs returns asset IDs from all moneyline markets
