@@ -808,7 +808,11 @@
                         buys: existing?.buys || 0,
                         sells: existing?.sells || 0,
                         allMarkets: allMarkets,
-                        outcomes: data.outcomes || existing?.outcomes || null // Store outcome names
+                        outcomes: data.outcomes || existing?.outcomes || null, // Store outcome names
+                        // Pinned sub-market: set when the subscribe slug named a
+                        // specific market — primary buy buttons target it
+                        market: data.market || null,
+                        marketQuestion: data.marketQuestion || null
                     });
                     saveSubscriptions();
                     renderPanels();
@@ -954,8 +958,10 @@
             const leftTeam = isUSLeague ? teams.away : teams.home;
             const rightTeam = isUSLeague ? teams.home : teams.away;
 
-            // Generate trade buttons dynamically
-            const is3Way = outcomeLabels.length >= 3;
+            // Generate trade buttons dynamically. A pinned sub-market
+            // (subscribed via its market slug) targets that market directly.
+            const pinnedMarket = eventData.market || null;
+            const is3Way = !pinnedMarket && outcomeLabels.length >= 3;
             let tradeButtons;
             if (is3Way) {
                 // 3-way market: show selector buttons that reveal YES/NO options
@@ -966,9 +972,10 @@
                     </button>
                 `).join('');
             } else {
-                // 2-way market: direct trade buttons
+                // 2-way market (or pinned sub-market): direct trade buttons
+                const pinnedArg = pinnedMarket ? `, '${pinnedMarket}'` : '';
                 tradeButtons = outcomeLabels.map((label, idx) => `
-                    <button onclick="executeTrade('${slug}', 0, ${idx})"
+                    <button onclick="executeTrade('${slug}', 0, ${idx}${pinnedArg})"
                             class="flex-1 px-3 py-2 bg-green-600 hover:bg-green-700 rounded text-sm font-medium transition-colors">
                         Buy ${label}
                     </button>
@@ -1025,6 +1032,11 @@
                                class="w-20 px-2 py-1 text-xs bg-gray-700 border border-gray-600 rounded focus:outline-none focus:border-blue-500">
                         <span class="text-gray-500 text-xs">USDC</span>
                     </div>
+                    ${pinnedMarket ? `
+                    <div class="text-xs text-yellow-400/90 mb-2 truncate" title="${(eventData.marketQuestion || pinnedMarket).replace(/"/g, '&quot;')}">
+                        🎯 ${eventData.marketQuestion || pinnedMarket}
+                    </div>
+                    ` : ''}
                     <div class="flex gap-2">
                         ${tradeButtons}
                     </div>
