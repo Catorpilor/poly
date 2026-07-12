@@ -96,3 +96,66 @@ Deploy notes:
   fine while browsing by IP/localhost (set it if using an mDNS name).
 - Deferred by decision: bearer-token sessions (until the page leaves
   the LAN), Telegram executor migration onto TradeExecutor.
+
+---
+
+# Sub-Market Trading via Market Picker (grilled & confirmed 2026-07-12)
+
+Goal: trade any active market in a subscribed event (e.g. LoL
+`lol-hle1-ly-2026-07-11-game1` game winner), not just the Moneyline.
+UI shape confirmed: market picker in the event panel (not
+trade-what-you-see feed buttons).
+
+Grilled decisions:
+- Q1 **(a)** v0.9.0 merged/tagged/deployed first ✅; picker ships as its
+  own release for isolated blast radius.
+- Q2 **(a)** Picker lists sub-markets only (event markets minus
+  GetAllMLMarkets, active && !closed) — ML keeps its dedicated buttons.
+- Q3 **(a)** Rows show indicative outcomePrices (resolver cache ≤5 min
+  stale; fills still price off the live book, VWAP + 2% slippage).
+
+Branch: feat/web-submarket-trading off main (post-#14).
+
+Design decisions:
+- Sub-markets are addressed by **market slug** (stable identity), not
+  by index into the full market list (ordering-fragile). ML buttons
+  keep using marketIndex.
+- Picker data comes from a REST endpoint fetched when the picker is
+  opened (fresh active/closed state), not baked into the subscribe
+  response. Freshness bound: resolver caches events 5 min — a market
+  that closes mid-game may linger in the picker briefly; the CLOB
+  rejects orders on closed markets, so worst case is a clean error.
+- Same buy-only rule, same 1000 USDC cap, same amount input per panel.
+- Glossary: add **Sub-market** to CONTEXT.md (term already lives in
+  code as isSubMarketSlug and the "All Markets" toggle).
+
+## Phase A — Backend: list + resolve + trade by slug (TDD) ✅
+- [x] GET /api/events/{slug}/markets (guardAPI): active non-closed
+      sub-markets with slug/question/outcomes/prices; 404 unknown event
+- [x] webTradeData gains optional marketSlug; marketIndex ignored when
+      set; outcomeIndex still 0/1
+- [x] resolveWebTradeBySlug: slug match over all event markets;
+      closed/inactive/unknown/bounds rejected. Table-tested.
+- [x] **Classifier fix found en route**: "Game N Winner" counted as ML
+      ("map " keyword existed, "game " didn't) — LoL Bo3 rendered as a
+      fake 3-way in prod. "game " added + Bo3 regression case; existing
+      NBA/soccer/tennis/esports tables unchanged.
+
+## Phase B — Frontend: picker UI ✅
+- [x] "Markets ▾" toggle in each panel's trade section; fetch on every
+      open (fresh closed-state); loading / error / empty states
+- [x] Rows: question + per-outcome buy buttons with indicative cent
+      prices; click → executeTrade(eventSlug, 0, idx, marketSlug)
+- [x] Reuses panel amount input and button-disable loading state;
+      inline JS syntax-checked with node --check
+
+## Phase C — Docs & wrap-up ✅
+- [x] docs/web-trade-feature.md: marketSlug protocol, picker endpoint,
+      "game " keyword in the classification table, thin-book caution
+- [x] CONTEXT.md: Sub-market entry
+- [x] Full suite + -race clean; PR opened
+- [ ] Manual smoke on a live esports event (picker lists game markets;
+      buy on a game-winner market) — user, post-deploy
+
+Caution (told to user): sub-market books are thin; VWAP + 2% slippage
+walks them — the 1000 cap bounds damage but spreads cost more than ML.

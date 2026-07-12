@@ -114,6 +114,9 @@ func NewWebServer(
 	mux.HandleFunc("GET /api/auth/status", ws.guardAPI(ws.handleAuthStatus))
 	mux.HandleFunc("POST /api/auth/complete", ws.guardAPI(ws.handleAuthComplete))
 
+	// Sub-market listing for the picker
+	mux.HandleFunc("GET /api/events/{slug}/markets", ws.guardAPI(ws.handleListEventMarkets))
+
 	// Trade endpoint
 	mux.HandleFunc("POST /api/trade", ws.guardAPI(ws.handleTrade))
 
@@ -426,6 +429,51 @@ func (ws *WebServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// Sub-market listing types
+type marketListItem struct {
+	Slug     string   `json:"slug"`
+	Question string   `json:"question"`
+	Outcomes []string `json:"outcomes"`
+	Prices   []string `json:"prices"` // indicative — fills price off the live book
+}
+
+type marketListResponse struct {
+	Event   string           `json:"event"`
+	Markets []marketListItem `json:"markets"`
+}
+
+// handleListEventMarkets returns an event's tradeable sub-markets for the
+// picker (the ML markets have their own buttons and are excluded).
+func (ws *WebServer) handleListEventMarkets(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	slug := r.PathValue("slug")
+	if slug == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Missing event slug"})
+		return
+	}
+
+	eventInfo, err := ws.liveManager.resolver.GetEventInfo(r.Context(), slug)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Event not found"})
+		return
+	}
+
+	resp := marketListResponse{Event: slug, Markets: []marketListItem{}}
+	for _, m := range ws.liveManager.resolver.GetSubMarkets(eventInfo) {
+		resp.Markets = append(resp.Markets, marketListItem{
+			Slug:     m.Slug,
+			Question: m.Question,
+			Outcomes: m.GetOutcomes(),
+			Prices:   m.GetOutcomePrices(),
+		})
+	}
+
+	json.NewEncoder(w).Encode(resp)
+}
+
 // Auth response types
 type authInitResponse struct {
 	Token       string `json:"token"`
@@ -591,12 +639,15 @@ type webTradeSession struct {
 	ProxyAddress  string `json:"proxyAddress"`
 }
 
-// webTradeData addresses one side of one Moneyline market: MarketIndex picks
-// the market within the event's ML list (0 for 2-way events, 0-2 for 3-way
-// soccer), OutcomeIndex picks the side within it (see CONTEXT.md: Market
-// Index vs Outcome Index).
+// webTradeData addresses one side of one market. When MarketSlug is set the
+// trade targets that market directly (used by the sub-market picker) and
+// MarketIndex is ignored; otherwise MarketIndex picks the market within the
+// event's ML list (0 for 2-way events, 0-2 for 3-way soccer). OutcomeIndex
+// picks the side within the chosen market (see CONTEXT.md: Market Index vs
+// Outcome Index, Sub-market).
 type webTradeData struct {
 	EventSlug    string  `json:"eventSlug"`
+	MarketSlug   string  `json:"marketSlug"` // sub-market target; empty = ML by MarketIndex
 	MarketIndex  int     `json:"marketIndex"`
 	OutcomeIndex int     `json:"outcomeIndex"`
 	Side         string  `json:"side"`
@@ -639,13 +690,45 @@ func validateWebTrade(t webTradeData) error {
 	if t.Amount > maxWebTradeAmount {
 		return fmt.Errorf("amount must be at most %d USDC", maxWebTradeAmount)
 	}
-	if t.MarketIndex < 0 {
+	// MarketIndex only matters for the ML path; a picker trade carries a
+	// MarketSlug and leaves MarketIndex unused.
+	if t.MarketSlug == "" && t.MarketIndex < 0 {
 		return fmt.Errorf("marketIndex must be non-negative")
 	}
 	if t.OutcomeIndex < 0 || t.OutcomeIndex > 1 {
 		return fmt.Errorf("outcomeIndex must be 0 or 1")
 	}
 	return nil
+}
+
+// resolveWebTradeBySlug maps a market slug + outcome onto a concrete token,
+// searching all of the event's markets (not just the ML list). Rejects a
+// closed or inactive market — the CLOB would reject the order anyway, but
+// failing here gives a clearer error.
+func resolveWebTradeBySlug(markets []MarketInfo, slug string, outcomeIndex int) (marketID, tokenID, outcome string, err error) {
+	for i := range markets {
+		m := &markets[i]
+		if m.Slug != slug {
+			continue
+		}
+		if m.Closed {
+			return "", "", "", fmt.Errorf("market %s is closed", slug)
+		}
+		if !m.Active {
+			return "", "", "", fmt.Errorf("market %s is not active", slug)
+		}
+
+		tokenIDs := m.GetClobTokenIds()
+		if outcomeIndex < 0 || outcomeIndex >= len(tokenIDs) {
+			return "", "", "", fmt.Errorf("outcomeIndex %d out of range (market has %d outcomes)", outcomeIndex, len(tokenIDs))
+		}
+		outcomes := m.GetOutcomes()
+		if outcomeIndex < len(outcomes) {
+			outcome = outcomes[outcomeIndex]
+		}
+		return m.ID, tokenIDs[outcomeIndex], outcome, nil
+	}
+	return "", "", "", fmt.Errorf("market not found: %s", slug)
 }
 
 // resolveWebTrade maps (marketIndex, outcomeIndex) onto a concrete market
@@ -756,15 +839,21 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mlMarkets := ws.liveManager.resolver.GetAllMLMarkets(eventInfo)
-	marketID, tokenID, outcome, err := resolveWebTrade(mlMarkets, req.Trade.MarketIndex, req.Trade.OutcomeIndex)
+	var marketID, tokenID, outcome string
+	if req.Trade.MarketSlug != "" {
+		// Sub-market picker: address the market directly by slug
+		marketID, tokenID, outcome, err = resolveWebTradeBySlug(eventInfo.Markets, req.Trade.MarketSlug, req.Trade.OutcomeIndex)
+	} else {
+		mlMarkets := ws.liveManager.resolver.GetAllMLMarkets(eventInfo)
+		marketID, tokenID, outcome, err = resolveWebTrade(mlMarkets, req.Trade.MarketIndex, req.Trade.OutcomeIndex)
+	}
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: err.Error()})
 		return
 	}
-	log.Printf("WebServer: Trade resolved: event=%s market=%s (%d/%d) outcome=%s token=%s",
-		req.Trade.EventSlug, marketID, req.Trade.MarketIndex, len(mlMarkets), outcome, tokenID)
+	log.Printf("WebServer: Trade resolved: event=%s marketSlug=%q market=%s outcome=%s token=%s",
+		req.Trade.EventSlug, req.Trade.MarketSlug, marketID, outcome, tokenID)
 
 	// Build trade request; the executor fills the fee fields
 	tradeReq := &polymarket.TradeRequest{

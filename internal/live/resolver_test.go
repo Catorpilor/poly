@@ -460,6 +460,24 @@ func TestGetAllMLMarkets(t *testing.T) {
 			wantFirst: "DRX vs. HLE",
 		},
 		{
+			// Regression: "Game N Winner" markets used to classify as ML,
+			// so a LoL Bo3 rendered as a fake 3-way market (series ML +
+			// two game winners) instead of a 2-way with sub-markets.
+			name: "Esports Bo3 - game winner markets are sub-markets, not ML",
+			event: &EventInfo{
+				ID:    "lol-hle1-ly-2026-07-11",
+				Title: "HLE vs. LY",
+				Markets: []MarketInfo{
+					{ID: "1", Question: "HLE vs. LY", OutcomesRaw: `["HLE", "LY"]`, Active: true, Closed: false},
+					{ID: "2", Question: "HLE vs. LY: Game 1 Winner", OutcomesRaw: `["HLE", "LY"]`, Active: true, Closed: false},
+					{ID: "3", Question: "HLE vs. LY: Game 2 Winner", OutcomesRaw: `["HLE", "LY"]`, Active: true, Closed: false},
+					{ID: "4", Question: "Total Kills O/U 26.5", OutcomesRaw: `["Over", "Under"]`, Active: true, Closed: false},
+				},
+			},
+			wantCount: 1,
+			wantFirst: "HLE vs. LY",
+		},
+		{
 			name: "Tennis - should filter out set winner markets",
 			event: &EventInfo{
 				ID:    "tennis-match",

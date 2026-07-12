@@ -75,6 +75,17 @@ func TestValidateWebTrade(t *testing.T) {
 			wantErr: "marketIndex",
 		},
 		{
+			// With a marketSlug the marketIndex is ignored, so a leftover
+			// negative default must not spuriously fail validation.
+			name:   "marketSlug set makes marketIndex irrelevant",
+			mutate: func(t *webTradeData) { t.MarketSlug = "lol-hle1-ly-game1"; t.MarketIndex = -1 },
+		},
+		{
+			name:    "outcomeIndex still bounded with marketSlug",
+			mutate:  func(t *webTradeData) { t.MarketSlug = "lol-hle1-ly-game1"; t.OutcomeIndex = 2 },
+			wantErr: "outcomeIndex",
+		},
+		{
 			name:    "negative outcome index rejected",
 			mutate:  func(t *webTradeData) { t.OutcomeIndex = -1 },
 			wantErr: "outcomeIndex",
