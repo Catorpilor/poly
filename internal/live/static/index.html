@@ -481,6 +481,20 @@
             statusDot.className = `w-2.5 h-2.5 rounded-full ${colors[state]}`;
         }
 
+        // The game number a panel is pinned to, from the pinned market slug
+        // ("…-game4" → 4). Null for unpinned panels or non-game pins.
+        function getPinnedGameNumber(eventSlug) {
+            const market = subscriptions.get(eventSlug)?.market;
+            const m = market && market.match(/-game(\d+)$/);
+            return m ? parseInt(m[1], 10) : null;
+        }
+
+        // The game currently being played, from the series period ("3/5" → 3).
+        function parseCurrentGame(period) {
+            const m = (period || '').match(/^(\d+)\/\d+/);
+            return m ? parseInt(m[1], 10) : null;
+        }
+
         function updateGameStateUI(eventSlug, gameData) {
             const gamePanel = document.getElementById(`game-${eventSlug}`);
             if (!gamePanel) return;
@@ -515,13 +529,23 @@
             // Store current scores for next comparison
             previousScores.set(eventSlug, { left: leftScore, right: rightScore });
 
-            // Update live indicator
+            // Update live indicator. The sports feed carries ONE state per
+            // series (period "3/5" = game 3 of 5 running), so a panel pinned
+            // to a specific game must not claim LIVE while a different game
+            // of the series is the one being played.
             const liveIndicator = gamePanel.querySelector('.live-indicator');
             if (liveIndicator) {
-                if (isLive) {
-                    liveIndicator.innerHTML = '<span class="live-pulse text-red-500 font-bold text-xs">● LIVE</span>';
-                } else if (gameData.ended) {
+                const pinnedGame = getPinnedGameNumber(eventSlug);
+                const currentGame = parseCurrentGame(period);
+                if (gameData.ended) {
                     liveIndicator.innerHTML = '<span class="text-gray-400 text-xs">FINAL</span>';
+                } else if (isLive && pinnedGame && currentGame && pinnedGame > currentGame) {
+                    liveIndicator.innerHTML = `<span class="text-gray-500 text-xs">UPCOMING · GAME ${pinnedGame}</span>`;
+                } else if (isLive && pinnedGame && currentGame && pinnedGame < currentGame) {
+                    liveIndicator.innerHTML = `<span class="text-gray-400 text-xs">GAME ${pinnedGame} ENDED</span>`;
+                } else if (isLive) {
+                    const suffix = pinnedGame && currentGame === pinnedGame ? ` · GAME ${pinnedGame}` : '';
+                    liveIndicator.innerHTML = `<span class="live-pulse text-red-500 font-bold text-xs">● LIVE${suffix}</span>`;
                 } else {
                     liveIndicator.innerHTML = '<span class="text-gray-500 text-xs">UPCOMING</span>';
                 }
