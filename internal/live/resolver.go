@@ -64,6 +64,13 @@ type MarketInfo struct {
 	Closed         bool     `json:"closed"`
 }
 
+// The accessors below parse their raw JSON on every call instead of
+// memoizing into the struct: MarketInfo values live inside the resolver's
+// shared event cache, so a lazy write races concurrent readers (two
+// trades, or a trade and a picker fetch, on the same event). The parsed
+// fields remain as read-only injection points for tests and pre-populated
+// data.
+
 // GetOutcomes parses the outcomes JSON string
 func (m *MarketInfo) GetOutcomes() []string {
 	if len(m.Outcomes) > 0 {
@@ -73,7 +80,6 @@ func (m *MarketInfo) GetOutcomes() []string {
 	if err := json.Unmarshal([]byte(m.OutcomesRaw), &outcomes); err != nil {
 		return []string{"Yes", "No"}
 	}
-	m.Outcomes = outcomes
 	return outcomes
 }
 
@@ -88,7 +94,6 @@ func (m *MarketInfo) GetOutcomePrices() []string {
 	if err := json.Unmarshal([]byte(m.OutcomePricesRaw), &prices); err != nil {
 		return nil
 	}
-	m.OutcomePrices = prices
 	return prices
 }
 
@@ -101,7 +106,6 @@ func (m *MarketInfo) GetClobTokenIds() []string {
 	if err := json.Unmarshal([]byte(m.ClobTokenIdsRaw), &tokenIds); err != nil {
 		return nil
 	}
-	m.ClobTokenIds = tokenIds
 	return tokenIds
 }
 
@@ -154,7 +158,30 @@ func (r *EventSlugResolver) GetEventInfo(ctx context.Context, slug string) (*Eve
 	}
 	r.mu.RUnlock()
 
-	// Fetch from API
+	event, err := r.fetchEventBySlug(ctx, slug)
+	if err != nil {
+		// Users paste market slugs where event slugs are expected — a
+		// Polymarket market page URL ends in the market slug (e.g.
+		// "…-2026-07-12-game1"). Follow the market to its parent event.
+		parentSlug, perr := r.parentEventSlug(ctx, slug)
+		if perr != nil {
+			return nil, err // report the original event-not-found
+		}
+		if event, err = r.fetchEventBySlug(ctx, parentSlug); err != nil {
+			return nil, err
+		}
+	}
+
+	r.cacheEvent(slug, event)
+	if event.Slug != "" && event.Slug != slug {
+		r.cacheEvent(event.Slug, event)
+	}
+
+	return event, nil
+}
+
+// fetchEventBySlug does the raw Gamma /events lookup.
+func (r *EventSlugResolver) fetchEventBySlug(ctx context.Context, slug string) (*EventInfo, error) {
 	url := fmt.Sprintf("%s/events?slug=%s", r.gammaAPIURL, slug)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -186,17 +213,53 @@ func (r *EventSlugResolver) GetEventInfo(ctx context.Context, slug string) (*Eve
 		return nil, fmt.Errorf("event not found: %s", slug)
 	}
 
-	event := &events[0]
+	return &events[0], nil
+}
 
-	// Cache the result
+// parentEventSlug resolves a market slug to the slug of the event that
+// contains it, via Gamma's /markets lookup.
+func (r *EventSlugResolver) parentEventSlug(ctx context.Context, marketSlug string) (string, error) {
+	url := fmt.Sprintf("%s/markets?slug=%s", r.gammaAPIURL, marketSlug)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch market: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("Gamma API returned status %d", resp.StatusCode)
+	}
+
+	var markets []struct {
+		Events []struct {
+			Slug string `json:"slug"`
+		} `json:"events"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&markets); err != nil {
+		return "", fmt.Errorf("failed to decode markets: %w", err)
+	}
+
+	if len(markets) == 0 || len(markets[0].Events) == 0 || markets[0].Events[0].Slug == "" {
+		return "", fmt.Errorf("market not found: %s", marketSlug)
+	}
+
+	return markets[0].Events[0].Slug, nil
+}
+
+func (r *EventSlugResolver) cacheEvent(slug string, event *EventInfo) {
 	r.mu.Lock()
 	r.cache[slug] = &cacheEntry{
 		info:      event,
 		expiresAt: time.Now().Add(r.cacheTTL),
 	}
 	r.mu.Unlock()
-
-	return event, nil
 }
 
 // GetAllAssetIDs returns all asset/token IDs for an event
