@@ -732,7 +732,8 @@ func (m *LiveTradeManager) handleTrade(payload *rtdsTradePayload) bool {
 	var matchedSlug string
 	var matchedByAsset bool
 
-	// Primary: match by asset ID (most accurate — we only track ML market assets)
+	// Primary: match by asset ID (most accurate — tracked assets are the
+	// Moneyline's, or the pinned market's for pinned web subscriptions)
 	if payload.Asset != "" {
 		m.assetMu.RLock()
 		if slug, found := m.assetToEvent[payload.Asset]; found {
@@ -770,12 +771,12 @@ func (m *LiveTradeManager) handleTrade(payload *rtdsTradePayload) bool {
 	}
 
 	// Determine if this is a sub-market trade
-	// If matched by asset ID, it's an ML trade (we only track ML assets)
+	// If matched by asset ID, it's a directly tracked market (ML or pinned)
 	// If matched by prefix, check the market slug for sub-market indicators
 	var marketName string
 	var isSubMarket bool
 	if matchedByAsset {
-		// Matched by ML asset — look up market name for 3-way markets
+		// Look up market name for 3-way markets (empty for 2-way/pinned)
 		m.assetMu.RLock()
 		marketName = m.assetToMarketName[payload.Asset]
 		m.assetMu.RUnlock()
@@ -799,7 +800,7 @@ func (m *LiveTradeManager) handleTrade(payload *rtdsTradePayload) bool {
 	}
 
 	m.broadcastToTelegram(matchedSlug, tradeInfo)
-	m.broadcastToWeb(matchedSlug, tradeInfo, marketSlug) // Pass market slug for sub-market filtering
+	m.broadcastToWeb(matchedSlug, tradeInfo, marketSlug, matchedByAsset)
 	return true
 }
 
@@ -873,7 +874,13 @@ func (m *LiveTradeManager) SubscribeWeb(conn *websocket.Conn, eventSlug string, 
 	m.subscriptions.SubscribeWeb(conn, eventSlug, allMarkets)
 
 	if isNew {
-		m.trackEventAssets(eventSlug, eventInfo)
+		if pinned := pinnedMarket(m.resolver, eventInfo, eventSlug); pinned != nil {
+			// The subscriber addressed a specific sub-market: feed the
+			// panel that market's trades, not the event Moneyline's.
+			m.trackMarketAssets(eventSlug, pinned)
+		} else {
+			m.trackEventAssets(eventSlug, eventInfo)
+		}
 	}
 
 	return nil
@@ -984,6 +991,25 @@ func (m *LiveTradeManager) trackEventAssets(eventSlug string, eventInfo *EventIn
 	}
 }
 
+// trackMarketAssets maps a single (pinned) market's assets to the
+// subscription slug, so only that market's trades match the subscription.
+func (m *LiveTradeManager) trackMarketAssets(eventSlug string, market *MarketInfo) {
+	assetIDs := market.GetClobTokenIds()
+	if len(assetIDs) == 0 {
+		return
+	}
+
+	m.assetMu.Lock()
+	for _, assetID := range assetIDs {
+		m.assetToEvent[assetID] = eventSlug
+	}
+	m.assetMu.Unlock()
+
+	if err := m.subscribeToAllTrades(); err != nil {
+		log.Printf("LiveTradeManager: Failed to subscribe to trades: %v", err)
+	}
+}
+
 // RegisterWebConn must be called when a web connection is accepted, before
 // anything writes to it — WriteWeb refuses unregistered connections.
 func (m *LiveTradeManager) RegisterWebConn(conn *websocket.Conn) {
@@ -1028,14 +1054,16 @@ func (m *LiveTradeManager) broadcastToTelegram(eventSlug string, trade *TradeInf
 	}
 }
 
-func (m *LiveTradeManager) broadcastToWeb(eventSlug string, trade *TradeInfo, rtdsSlug string) {
+func (m *LiveTradeManager) broadcastToWeb(eventSlug string, trade *TradeInfo, rtdsSlug string, matchedByAsset bool) {
 	subscribers := m.subscriptions.GetWebSubscribers(eventSlug)
 	if len(subscribers) == 0 {
 		return
 	}
 
-	// Check if this is a sub-market trade using both slug check and trade flag
-	isSubMarket := trade.IsSubMarket || isSubMarketSlug(rtdsSlug)
+	// Asset-matched trades are on a market the subscription tracks
+	// directly (Moneyline or pinned) — the allMarkets gate applies only
+	// to prefix-matched spillover from the rest of the event.
+	isSubMarket := !matchedByAsset && (trade.IsSubMarket || isSubMarketSlug(rtdsSlug))
 
 	webFormat := m.formatter.FormatForWeb(trade)
 	data, err := json.Marshal(webFormat)

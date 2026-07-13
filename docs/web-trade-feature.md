@@ -265,6 +265,14 @@ Polymarket market page URL ends in) resolves to the parent event and
 and the primary buy buttons trade the pinned market instead of the
 Moneyline. Subscribing with the event slug keeps the usual ML buttons.
 
+The live trade feed follows the pin: a pinned subscription tracks the
+pinned market's token IDs, so its panel shows only that market's trades —
+Moneyline and other sub-market activity from the same event never
+reaches it (the "all markets" checkbox only affects event-slug
+subscriptions). One consequence of single-destination matching: while a
+market is pinned by any panel, its trades route to the pinned panel
+only, so an event-slug panel with "all markets" checked won't see them.
+
 **Caution:** sub-market order books are much thinner than Moneyline
 books. Market orders (VWAP + 2% slippage cap) walk whatever liquidity is
 there; the 1000 USDC cap bounds the damage, but expect worse fills than

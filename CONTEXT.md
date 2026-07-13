@@ -72,8 +72,8 @@ which reorders.
 
 **Pinned Market** — The Sub-market a web subscription addressed directly
 (the user subscribed with its market slug rather than the event slug).
-The panel's primary buy buttons target the pinned market; without a pin
-they target the Moneyline.
+The panel's primary buy buttons and its live trade feed target the pinned
+market; without a pin they target the Moneyline.
 
 ## Wallets & accounts
 
