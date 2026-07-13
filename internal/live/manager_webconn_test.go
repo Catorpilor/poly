@@ -138,7 +138,7 @@ func TestBroadcastToWebDropsFailedConn(t *testing.T) {
 	server.Close()
 	client.Close()
 
-	m.broadcastToWeb("test-event", &TradeInfo{}, "")
+	m.broadcastToWeb("test-event", &TradeInfo{}, "", false)
 
 	if subs := m.subscriptions.GetWebSubscribers("test-event"); len(subs) != 0 {
 		t.Errorf("failed conn still subscribed after broadcast: %d subscribers", len(subs))
@@ -166,7 +166,7 @@ func TestSendResponseAndBroadcastShareWritePath(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 0; i < rounds; i++ {
-			m.broadcastToWeb("test-event", &TradeInfo{EventSlug: "test-event"}, "")
+			m.broadcastToWeb("test-event", &TradeInfo{EventSlug: "test-event"}, "", false)
 		}
 	}()
 	for i := 0; i < rounds; i++ {
@@ -196,7 +196,7 @@ func TestBroadcastToWebDeliversToSubscriber(t *testing.T) {
 	m.subscriptions.RegisterConn(server)
 	m.subscriptions.SubscribeWeb(server, "test-event", false)
 
-	m.broadcastToWeb("test-event", &TradeInfo{EventSlug: "test-event"}, "")
+	m.broadcastToWeb("test-event", &TradeInfo{EventSlug: "test-event"}, "", false)
 
 	client.SetReadDeadline(time.Now().Add(5 * time.Second))
 	_, msg, err := client.ReadMessage()

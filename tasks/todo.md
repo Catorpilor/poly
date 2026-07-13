@@ -159,3 +159,35 @@ Design decisions:
 
 Caution (told to user): sub-market books are thin; VWAP + 2% slippage
 walks them — the 1000 cap bounds damage but spreads cost more than ML.
+
+---
+
+# Pinned feed filter (v0.10.4)
+
+User report: pinned game3/game4 panels showed the whole event's
+activity ("all the event slug activities were flushed in").
+
+Root cause: SubscribeWeb always called trackEventAssets → pinned
+subscriptions mapped the parent Moneyline's token IDs to the pinned
+slug. So (a) every series-winner trade flushed into a pinned panel,
+(b) two pinned panels from one event overwrote each other's mapping
+(last subscriber received all ML trades), (c) the pinned market's own
+trades never matched — assets untracked, prefix fallback compares the
+parent event slug against the longer pinned slug.
+
+Fix (TDD, manager_pinned_feed_test.go):
+- [x] SubscribeWeb: pinned subscription → trackMarketAssets (pinned
+      clobTokenIds → subscription slug); event slug → ML as before
+- [x] broadcastToWeb gains matchedByAsset: asset-matched trades bypass
+      the allMarkets sub-market gate (they ARE the selected market)
+- [x] Tests: pinned asset tracking, ML-not-tracked, per-panel routing
+      (game3/game4 on one conn), ML trade matches nothing, indicator-
+      slug pinned market delivered without allMarkets
+- [x] Docs: CONTEXT.md Pinned Market (feed follows pin),
+      web-trade-feature.md (single-destination note: pinned markets'
+      trades no longer reach event-slug allMarkets panels)
+- [x] Full suite + -race clean
+
+Known edge (accepted): a Telegram subscription made with a market slug
+still tracks ML assets under that slug (Telegram has no pinning) — if
+combined with a web pin on the same slug, ML trades reach that panel.
