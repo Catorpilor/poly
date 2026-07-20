@@ -68,6 +68,10 @@ type SLTPArm struct {
 	Outcome            Outcome   `json:"outcome" db:"outcome"`
 	AvgPrice           float64   `json:"avg_price" db:"avg_price"`
 	SharesAtArm        float64   `json:"shares_at_arm" db:"shares_at_arm"`
+	// HighWaterMark is the highest best-bid observed since arm/re-arm, seeded
+	// to AvgPrice. The trailing SL is dormant until it reaches
+	// AvgPrice*SLActivationMult; the monitor ratchets it monotonically.
+	HighWaterMark      float64   `json:"high_water_mark" db:"high_water_mark"`
 	TPArmed            bool      `json:"tp_armed" db:"tp_armed"`
 	SLArmed            bool      `json:"sl_armed" db:"sl_armed"`
 	NegRisk            bool      `json:"neg_risk" db:"neg_risk"`
@@ -82,8 +86,19 @@ type SLTPArm struct {
 // TPMultiplier is the fixed v1 take-profit multiplier: trigger when bid >= avg_price * TPMultiplier.
 const TPMultiplier = 2.0
 
-// SLMultiplier is the fixed v1 stop-loss multiplier: trigger when bid <= avg_price * SLMultiplier.
-const SLMultiplier = 0.70
+// SLActivationMult gates the breakeven-trailing stop: it stays dormant until
+// the high-water mark reaches avg_price * SLActivationMult. Below that the
+// position has no stop — max loss is the stake. Chosen over the old fixed
+// -30% stop, which realized ~-48% of basis and sold 29% of eventual winners.
+const SLActivationMult = 1.20
+
+// SLTrailMult sets the trailing distance once active:
+// trigger = max(avg_price, high_water_mark * SLTrailMult).
+const SLTrailMult = 0.80
+
+// SLMaxSlip bounds SL execution: the sell is a FOK limit at
+// trigger * (1 - SLMaxSlip), never a market order into a gapped book.
+const SLMaxSlip = 0.10
 
 // TPSellFraction is the fraction of current shares sold on a TP fire.
 const TPSellFraction = 0.50
@@ -110,9 +125,32 @@ func (a *SLTPArm) TPTriggerPrice() float64 {
 	return p
 }
 
-// SLTriggerPrice returns the bid threshold for SL on this arm.
+// SLActive reports whether the trailing stop has been activated by the
+// high-water mark reaching avg_price * SLActivationMult.
+func (a *SLTPArm) SLActive() bool {
+	return a.HighWaterMark >= a.AvgPrice*SLActivationMult
+}
+
+// SLTriggerPrice returns the bid threshold for the trailing SL: the stop
+// follows the high-water mark down by SLTrailMult but never sits below entry,
+// so a once-activated stop exits at worst around breakeven.
 func (a *SLTPArm) SLTriggerPrice() float64 {
-	return a.AvgPrice * SLMultiplier
+	trigger := a.HighWaterMark * SLTrailMult
+	if trigger < a.AvgPrice {
+		return a.AvgPrice
+	}
+	return trigger
+}
+
+// SLFloorPrice is the lowest acceptable fill for an SL exit (the FOK limit
+// price). Clamped to 0.001 because the explicit-price order path has no floor
+// of its own.
+func (a *SLTPArm) SLFloorPrice() float64 {
+	floor := a.SLTriggerPrice() * (1 - SLMaxSlip)
+	if floor < 0.001 {
+		return 0.001
+	}
+	return floor
 }
 
 // Validate validates the SLTPArm.

@@ -2,6 +2,7 @@ package live
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,11 @@ type fakeStore struct {
 	// clearTPCalls / disarmCalls count successful (non-idempotent) clears
 	clearTPCalls int
 	disarmCalls  int
+	// updateHWMCalls records every UpdateHWM invocation's hwm argument.
+	updateHWMCalls []float64
+	// disarmFailN makes the next N Disarm calls fail with a generic error
+	// (simulates a transient DB outage; not ErrSLTPArmNotFound).
+	disarmFailN int
 }
 
 func newFakeStore() *fakeStore {
@@ -78,6 +84,10 @@ func (s *fakeStore) ClearTP(_ context.Context, telegramID int64, tokenID string)
 func (s *fakeStore) Disarm(_ context.Context, telegramID int64, tokenID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.disarmFailN > 0 {
+		s.disarmFailN--
+		return errors.New("simulated disarm failure")
+	}
 	arms := s.byToken[tokenID]
 	for i, a := range arms {
 		if a.TelegramID == telegramID {
@@ -87,6 +97,57 @@ func (s *fakeStore) Disarm(_ context.Context, telegramID int64, tokenID string) 
 		}
 	}
 	return repositories.ErrSLTPArmNotFound
+}
+
+func (s *fakeStore) UpdateHWM(_ context.Context, telegramID int64, tokenID string, hwm float64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.updateHWMCalls = append(s.updateHWMCalls, hwm)
+	for _, a := range s.byToken[tokenID] {
+		// Mirrors the SQL monotonic guard: only ever raises, no-op otherwise.
+		if a.TelegramID == telegramID && a.HighWaterMark < hwm {
+			a.HighWaterMark = hwm
+		}
+	}
+	return nil
+}
+
+// storedHWM returns the fake's high_water_mark for the first arm on tokenID.
+func (s *fakeStore) storedHWM(tokenID string) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if arms := s.byToken[tokenID]; len(arms) > 0 {
+		return arms[0].HighWaterMark
+	}
+	return -1
+}
+
+// replace swaps the stored arm with the same ID (simulates a re-arm upsert
+// that re-snapshots avg_price/shares and resets the HWM on the same row).
+func (s *fakeStore) replace(arm *database.SLTPArm) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	arms := s.byToken[arm.TokenID]
+	for i, a := range arms {
+		if a.ID == arm.ID {
+			arms[i] = arm
+			return
+		}
+	}
+	s.byToken[arm.TokenID] = append(arms, arm)
+}
+
+// armedCount returns how many armed rows remain for tokenID.
+func (s *fakeStore) armedCount(tokenID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, a := range s.byToken[tokenID] {
+		if a.TPArmed || a.SLArmed {
+			n++
+		}
+	}
+	return n
 }
 
 type fakeFeed struct {
@@ -205,6 +266,9 @@ type fakeExecutor struct {
 	mu    sync.Mutex
 	calls []executorCall
 	ret   *polymarket.TradeResult
+	// onSell, when set, is invoked (outside the lock) on every ExecuteSell —
+	// used to observe ordering (e.g. disarm must not precede the sell).
+	onSell func()
 
 	// Lottery-related fields. When unset, ResolveOtherToken returns the
 	// configured "<armToken>-other" stub and ExecuteLotteryBuy succeeds.
@@ -216,8 +280,10 @@ type fakeExecutor struct {
 }
 
 type executorCall struct {
-	armID     int
-	sharesRaw int64
+	armID      int
+	sharesRaw  int64
+	limitPrice float64
+	orderType  polymarket.OrderType
 }
 
 type lotteryCall struct {
@@ -228,12 +294,20 @@ type lotteryCall struct {
 	maxPrice     float64
 }
 
-func (e *fakeExecutor) ExecuteSell(_ context.Context, arm *database.SLTPArm, sharesRaw int64) *polymarket.TradeResult {
+func (e *fakeExecutor) ExecuteSell(_ context.Context, arm *database.SLTPArm, sharesRaw int64,
+	limitPrice float64, orderType polymarket.OrderType) *polymarket.TradeResult {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.calls = append(e.calls, executorCall{armID: arm.ID, sharesRaw: sharesRaw})
-	if e.ret != nil {
-		return e.ret
+	e.calls = append(e.calls, executorCall{
+		armID: arm.ID, sharesRaw: sharesRaw, limitPrice: limitPrice, orderType: orderType,
+	})
+	ret := e.ret
+	hook := e.onSell
+	e.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	if ret != nil {
+		return ret
 	}
 	return &polymarket.TradeResult{Success: true, OrderID: "ord-stub"}
 }
@@ -277,6 +351,15 @@ type fakeNotifier struct {
 	fires    []fireNotice
 	paused   []int64 // telegramIDs notified of pause
 	lotteries []lotteryNotice
+	pendings []pendingNotice
+}
+
+type pendingNotice struct {
+	telegramID int64
+	armID      int
+	bid        float64
+	trigger    float64
+	floor      float64
 }
 
 type lotteryNotice struct {
@@ -301,6 +384,12 @@ func (n *fakeNotifier) NotifySLTPFired(telegramID int64, kind string, arm *datab
 	n.fires = append(n.fires, fireNotice{telegramID, kind, bid, arm.ID})
 }
 
+func (n *fakeNotifier) NotifySLExitPending(telegramID int64, arm *database.SLTPArm, bid, trigger, floor float64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.pendings = append(n.pendings, pendingNotice{telegramID, arm.ID, bid, trigger, floor})
+}
+
 func (n *fakeNotifier) NotifySLTPPaused(telegramID int64, _ *database.SLTPArm) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -322,6 +411,45 @@ func (n *fakeNotifier) NotifyLottery(telegramID int64, _ *database.SLTPArm, othe
 		notice.resultSuccess = result.Success
 	}
 	n.lotteries = append(n.lotteries, notice)
+}
+
+// fakeClock is a mutex-guarded manual clock wired into SLTPMonitor.now so
+// debounce tests advance time deterministically instead of sleeping.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newFakeClock() *fakeClock {
+	return &fakeClock{t: time.Unix(1_700_000_000, 0)}
+}
+
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
+
+// breachStamped reports whether the monitor holds in-memory breach state for
+// armID (white-box: same package).
+func breachStamped(m *SLTPMonitor, armID int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st := m.slState[armID]
+	return st != nil && !st.breachStart.IsZero()
+}
+
+// slStateCleared reports whether no in-memory SL state exists for armID.
+func slStateCleared(m *SLTPMonitor, armID int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.slState[armID] == nil
 }
 
 // waitFor polls cond until true or timeout; fails the test otherwise.
@@ -383,6 +511,10 @@ func TestSLTPMonitor_TPFiresAt2x(t *testing.T) {
 	if exec.calls[0].sharesRaw != int64(100*0.50*1e6) {
 		t.Errorf("expected TP sell 50e6 shares, got %d", exec.calls[0].sharesRaw)
 	}
+	// TP execution is unchanged by the trailing-SL rework: market order (GTC).
+	if exec.calls[0].limitPrice != 0 || exec.calls[0].orderType != polymarket.OrderTypeGTC {
+		t.Errorf("expected TP sell as (0, GTC), got (%v, %v)", exec.calls[0].limitPrice, exec.calls[0].orderType)
+	}
 	exec.mu.Unlock()
 	store.mu.Lock()
 	clears := store.clearTPCalls
@@ -407,19 +539,27 @@ func TestSLTPMonitor_TPFiresAt2x(t *testing.T) {
 	}
 }
 
-func TestSLTPMonitor_SLFiresAtMinus30(t *testing.T) {
+func TestSLTPMonitor_SL_FiresOnConfirmedBreach(t *testing.T) {
 	t.Parallel()
 	store := newFakeStore()
-	arm := &database.SLTPArm{ID: 11, TelegramID: 7, TokenID: "U", AvgPrice: 0.50, SharesAtArm: 80, TPArmed: true, SLArmed: true}
+	// Active trailing stop: avg=0.50, peak=0.65 → trigger = max(0.50, 0.52) = 0.52.
+	arm := &database.SLTPArm{ID: 11, TelegramID: 7, TokenID: "U", AvgPrice: 0.50, SharesAtArm: 80,
+		HighWaterMark: 0.65, TPArmed: true, SLArmed: true}
 	store.seed(arm)
 
 	feed := newFakeFeed()
 	exec := &fakeExecutor{}
 	notif := &fakeNotifier{}
+	clock := newFakeClock()
 	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	m.now = clock.now
 	_ = m.Start()
 
-	feed.setBid("U", 0.34) // <= 0.50*0.70 = 0.35
+	feed.setBid("U", 0.45) // below trigger 0.52 — starts the confirmation window
+	feed.emit("U")
+	waitFor(t, func() bool { return breachStamped(m, 11) })
+
+	clock.advance(31 * time.Second)
 	feed.emit("U")
 
 	waitFor(t, func() bool {
@@ -429,10 +569,17 @@ func TestSLTPMonitor_SLFiresAtMinus30(t *testing.T) {
 	})
 
 	exec.mu.Lock()
-	shares := exec.calls[0].sharesRaw
+	call := exec.calls[0]
 	exec.mu.Unlock()
-	if shares != int64(80*1e6) {
-		t.Errorf("expected SL sell 80e6 shares, got %d", shares)
+	if call.sharesRaw != int64(80*1e6) {
+		t.Errorf("expected SL sell 80e6 shares, got %d", call.sharesRaw)
+	}
+	wantFloor := arm.SLFloorPrice() // 0.52 * 0.90 = 0.468
+	if diff := call.limitPrice - wantFloor; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("expected FOK floor %v, got %v", wantFloor, call.limitPrice)
+	}
+	if call.orderType != polymarket.OrderTypeFOK {
+		t.Errorf("expected FOK order, got %v", call.orderType)
 	}
 	store.mu.Lock()
 	disarms := store.disarmCalls
@@ -457,17 +604,25 @@ func TestSLTPMonitor_SLFiresAtMinus30(t *testing.T) {
 func TestSLTPMonitor_SLAfterTPSellsHalf(t *testing.T) {
 	t.Parallel()
 	store := newFakeStore()
-	// TP already fired previously: TPArmed=false, SLArmed=true
-	arm := &database.SLTPArm{ID: 12, TelegramID: 9, TokenID: "V", AvgPrice: 0.20, SharesAtArm: 100, TPArmed: false, SLArmed: true}
+	// TP already fired previously: TPArmed=false, SLArmed=true. Peak 0.30 makes
+	// the trailing stop active: trigger = max(0.20, 0.24) = 0.24.
+	arm := &database.SLTPArm{ID: 12, TelegramID: 9, TokenID: "V", AvgPrice: 0.20, SharesAtArm: 100,
+		HighWaterMark: 0.30, TPArmed: false, SLArmed: true}
 	store.seed(arm)
 
 	feed := newFakeFeed()
 	exec := &fakeExecutor{}
 	notif := &fakeNotifier{}
+	clock := newFakeClock()
 	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	m.now = clock.now
 	_ = m.Start()
 
-	feed.setBid("V", 0.13) // <= 0.20*0.70 = 0.14
+	feed.setBid("V", 0.20) // below trigger 0.24
+	feed.emit("V")
+	waitFor(t, func() bool { return breachStamped(m, 12) })
+
+	clock.advance(31 * time.Second)
 	feed.emit("V")
 
 	waitFor(t, func() bool {
@@ -641,20 +796,27 @@ func fastTickMonitor(store SLTPArmStore, feed PriceFeedSubscriber, exec TradeExe
 func TestSLTPMonitor_Tick_FiresSLWhenWSBidIsStale(t *testing.T) {
 	t.Parallel()
 	store := newFakeStore()
-	// SL threshold = 0.10 * 0.70 = 0.07
-	store.seed(&database.SLTPArm{ID: 30, TelegramID: 9, TokenID: "L", AvgPrice: 0.10, SharesAtArm: 900, TPArmed: true, SLArmed: true})
+	// Active trailing stop: avg=0.10, peak=0.15 → trigger = max(0.10, 0.12) = 0.12.
+	store.seed(&database.SLTPArm{ID: 30, TelegramID: 9, TokenID: "L", AvgPrice: 0.10, SharesAtArm: 900,
+		HighWaterMark: 0.15, TPArmed: true, SLArmed: true})
 
 	feed := newFakeFeed()
-	// Stale WS bid would not have triggered SL (above threshold), but the
-	// fallback returns the live HTTP value below threshold.
-	feed.setBid("L", 0.10)
+	// Stale WS bid would not have triggered SL (above trigger), but the
+	// fallback returns the live HTTP value below trigger. The periodic tick
+	// both stamps the breach and (after the confirm window) fires it.
+	feed.setBid("L", 0.13)
 	feed.setFallbackBid("L", 0.06, "http", true)
 
 	exec := &fakeExecutor{}
 	notif := &fakeNotifier{}
+	clock := newFakeClock()
 	m := fastTickMonitor(store, feed, exec, notif, nil)
+	m.now = clock.now
 	defer m.Stop()
 	_ = m.Start()
+
+	waitFor(t, func() bool { return breachStamped(m, 30) })
+	clock.advance(31 * time.Second)
 
 	waitFor(t, func() bool {
 		notif.mu.Lock()
@@ -1213,5 +1375,639 @@ func TestSLTPMonitor_Lottery_NotFiredIfSellFailed(t *testing.T) {
 	defer exec.mu.Unlock()
 	if len(exec.lotteryCalls) != 0 {
 		t.Errorf("expected no lottery call after failed SELL, got %d", len(exec.lotteryCalls))
+	}
+}
+
+// --- trailing-SL: HWM ratchet ---
+
+func TestSLTPMonitor_HWMRatchetsUpOnNewHigh(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{
+		ID: 60, TelegramID: 41, TokenID: "H1", AvgPrice: 0.20, SharesAtArm: 100,
+		HighWaterMark: 0.20, TPArmed: true, SLArmed: true,
+	})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{}
+	m := NewSLTPMonitor(store, feed, exec, &fakeNotifier{}, nil)
+	_ = m.Start()
+
+	feed.setBid("H1", 0.25)
+	feed.emit("H1")
+	waitFor(t, func() bool { return store.storedHWM("H1") == 0.25 })
+
+	// A lower bid must not lower the stored HWM nor trigger an update call.
+	feed.setBid("H1", 0.22)
+	feed.emit("H1")
+	time.Sleep(50 * time.Millisecond)
+	store.mu.Lock()
+	calls := len(store.updateHWMCalls)
+	store.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("expected 1 UpdateHWM call after lower bid, got %d", calls)
+	}
+	if got := store.storedHWM("H1"); got != 0.25 {
+		t.Errorf("HWM lowered to %v, want 0.25", got)
+	}
+
+	feed.setBid("H1", 0.30)
+	feed.emit("H1")
+	waitFor(t, func() bool { return store.storedHWM("H1") == 0.30 })
+}
+
+func TestSLTPMonitor_HWMPersistCallsAreMonotonic(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{
+		ID: 61, TelegramID: 42, TokenID: "H2", AvgPrice: 0.30, SharesAtArm: 100,
+		HighWaterMark: 0.30, TPArmed: true, SLArmed: true,
+	})
+	feed := newFakeFeed()
+	m := NewSLTPMonitor(store, feed, &fakeExecutor{}, &fakeNotifier{}, nil)
+	_ = m.Start()
+
+	feed.setBid("H2", 0.42)
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			feed.emit("H2")
+		}()
+	}
+	wg.Wait()
+	waitFor(t, func() bool { return store.storedHWM("H2") == 0.42 })
+
+	// Concurrent duplicate calls are fine; the guard must never lower it.
+	feed.setBid("H2", 0.35)
+	feed.emit("H2")
+	time.Sleep(50 * time.Millisecond)
+	if got := store.storedHWM("H2"); got != 0.42 {
+		t.Errorf("HWM regressed to %v, want 0.42", got)
+	}
+}
+
+// --- trailing-SL: state machine ---
+
+// slBreachMonitor builds a monitor wired to a fake clock. Callers seed the
+// store/feed first and Start() it themselves.
+func slBreachMonitor(store *fakeStore, feed *fakeFeed, exec *fakeExecutor, notif *fakeNotifier) (*SLTPMonitor, *fakeClock) {
+	clock := newFakeClock()
+	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	m.now = clock.now
+	return m, clock
+}
+
+func TestSLTPMonitor_SL_DormantNeverFires(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	// HWM == avg: the stop never activated. A crash must NOT sell.
+	store.seed(&database.SLTPArm{ID: 70, TelegramID: 51, TokenID: "D1", AvgPrice: 0.50, SharesAtArm: 100,
+		HighWaterMark: 0.50, TPArmed: false, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("D1", 0.05)
+	feed.emit("D1")
+	clock.advance(10 * time.Minute)
+	feed.emit("D1")
+	time.Sleep(50 * time.Millisecond)
+
+	exec.mu.Lock()
+	calls := len(exec.calls)
+	exec.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("dormant SL must never sell, got %d calls", calls)
+	}
+	store.mu.Lock()
+	disarms := store.disarmCalls
+	store.mu.Unlock()
+	if disarms != 0 {
+		t.Errorf("dormant SL must not disarm, got %d", disarms)
+	}
+	if !slStateCleared(m, 70) {
+		t.Error("dormant branch should keep no breach state")
+	}
+}
+
+func TestSLTPMonitor_SL_ActivationViaRatchetThenBreachFires(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	// Starts dormant (HWM == avg). A rally to 0.62 (>= 0.60 activation)
+	// activates the stop via the live ratchet.
+	store.seed(&database.SLTPArm{ID: 71, TelegramID: 52, TokenID: "D2", AvgPrice: 0.50, SharesAtArm: 100,
+		HighWaterMark: 0.50, TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("D2", 0.62)
+	feed.emit("D2")
+	waitFor(t, func() bool { return store.storedHWM("D2") == 0.62 })
+
+	// Breach: trigger = max(0.50, 0.62*0.80=0.496) = 0.50.
+	feed.setBid("D2", 0.45)
+	feed.emit("D2")
+	waitFor(t, func() bool { return breachStamped(m, 71) })
+	clock.advance(31 * time.Second)
+	feed.emit("D2")
+
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.fires) == 1
+	})
+	exec.mu.Lock()
+	call := exec.calls[0]
+	exec.mu.Unlock()
+	if call.orderType != polymarket.OrderTypeFOK {
+		t.Errorf("expected FOK, got %v", call.orderType)
+	}
+	if diff := call.limitPrice - 0.45; diff > 1e-9 || diff < -1e-9 { // 0.50*0.90
+		t.Errorf("expected floor 0.45, got %v", call.limitPrice)
+	}
+}
+
+func TestSLTPMonitor_SL_NoFireBeforeConfirmWindow(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 72, TelegramID: 53, TokenID: "D3", AvgPrice: 0.50, SharesAtArm: 100,
+		HighWaterMark: 0.65, TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("D3", 0.45)
+	feed.emit("D3")
+	waitFor(t, func() bool { return breachStamped(m, 72) })
+
+	clock.advance(29 * time.Second)
+	feed.emit("D3")
+	time.Sleep(50 * time.Millisecond)
+
+	exec.mu.Lock()
+	calls := len(exec.calls)
+	exec.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("expected no sell before the confirm window, got %d", calls)
+	}
+}
+
+func TestSLTPMonitor_SL_RecoveryResetsDebounce(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 73, TelegramID: 54, TokenID: "D4", AvgPrice: 0.50, SharesAtArm: 100,
+		HighWaterMark: 0.65, TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	// Episode 1: breach, then recover 10s in.
+	feed.setBid("D4", 0.45)
+	feed.emit("D4")
+	waitFor(t, func() bool { return breachStamped(m, 73) })
+	clock.advance(10 * time.Second)
+	feed.setBid("D4", 0.60) // above trigger 0.52, below HWM 0.65
+	feed.emit("D4")
+	waitFor(t, func() bool { return slStateCleared(m, 73) })
+
+	// Episode 2: breach again; the old 10s must not count.
+	feed.setBid("D4", 0.45)
+	feed.emit("D4")
+	waitFor(t, func() bool { return breachStamped(m, 73) })
+	clock.advance(25 * time.Second)
+	feed.emit("D4")
+	time.Sleep(50 * time.Millisecond)
+	exec.mu.Lock()
+	calls := len(exec.calls)
+	exec.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("expected no sell 25s into a fresh episode, got %d", calls)
+	}
+
+	clock.advance(6 * time.Second)
+	feed.emit("D4")
+	waitFor(t, func() bool {
+		exec.mu.Lock()
+		defer exec.mu.Unlock()
+		return len(exec.calls) == 1
+	})
+}
+
+func TestSLTPMonitor_SL_RestartLosesBreachStateSafely(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 74, TelegramID: 55, TokenID: "D5", AvgPrice: 0.50, SharesAtArm: 100,
+		HighWaterMark: 0.65, TPArmed: true, SLArmed: true})
+
+	// Monitor #1 accumulates a confirmed-age breach...
+	feed1 := newFakeFeed()
+	m1, clock1 := slBreachMonitor(store, feed1, &fakeExecutor{}, &fakeNotifier{})
+	_ = m1.Start()
+	feed1.setBid("D5", 0.45)
+	feed1.emit("D5")
+	waitFor(t, func() bool { return breachStamped(m1, 74) })
+	clock1.advance(31 * time.Second)
+	m1.Stop() // "crash" before the next evaluation
+
+	// ...restart: monitor #2 must require a full fresh window.
+	feed2 := newFakeFeed()
+	exec2 := &fakeExecutor{}
+	notif2 := &fakeNotifier{}
+	m2, clock2 := slBreachMonitor(store, feed2, exec2, notif2)
+	_ = m2.Start()
+	feed2.setBid("D5", 0.45)
+	feed2.emit("D5")
+	waitFor(t, func() bool { return breachStamped(m2, 74) })
+	time.Sleep(50 * time.Millisecond)
+	exec2.mu.Lock()
+	calls := len(exec2.calls)
+	exec2.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("restart must not inherit the old breach age, got %d sells", calls)
+	}
+
+	clock2.advance(31 * time.Second)
+	feed2.emit("D5")
+	waitFor(t, func() bool {
+		exec2.mu.Lock()
+		defer exec2.mu.Unlock()
+		return len(exec2.calls) == 1
+	})
+}
+
+func TestSLTPMonitor_SL_FOKFailureKeepsArmAndNotifiesPendingOnce(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 75, TelegramID: 56, TokenID: "D6", AvgPrice: 0.50, SharesAtArm: 100,
+		HighWaterMark: 0.65, TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{ret: &polymarket.TradeResult{Success: false, ErrorMsg: "fok no fill"}}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("D6", 0.45)
+	feed.emit("D6")
+	waitFor(t, func() bool { return breachStamped(m, 75) })
+	clock.advance(31 * time.Second)
+	feed.emit("D6")
+
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.pendings) == 1
+	})
+
+	// Arm must survive; no disarm, no "fired" notice.
+	store.mu.Lock()
+	disarms := store.disarmCalls
+	store.mu.Unlock()
+	if disarms != 0 {
+		t.Errorf("failed FOK must keep the arm, got %d disarms", disarms)
+	}
+	if store.armedCount("D6") != 1 {
+		t.Errorf("arm should still be listed, got %d", store.armedCount("D6"))
+	}
+	notif.mu.Lock()
+	fires := len(notif.fires)
+	pending := notif.pendings[0]
+	notif.mu.Unlock()
+	if fires != 0 {
+		t.Errorf("no fired notice on failed exit, got %d", fires)
+	}
+	if pending.telegramID != 56 || pending.armID != 75 {
+		t.Errorf("pending notice routed wrong: %+v", pending)
+	}
+	if diff := pending.floor - 0.468; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("pending floor = %v, want 0.468", pending.floor)
+	}
+
+	// More breach evaluations inside the retry interval: still exactly one
+	// attempt and one pending notice.
+	clock.advance(10 * time.Second)
+	feed.emit("D6")
+	time.Sleep(50 * time.Millisecond)
+	exec.mu.Lock()
+	calls := len(exec.calls)
+	exec.mu.Unlock()
+	notif.mu.Lock()
+	pendings := len(notif.pendings)
+	notif.mu.Unlock()
+	if calls != 1 || pendings != 1 {
+		t.Errorf("expected 1 attempt / 1 pending inside retry interval, got %d / %d", calls, pendings)
+	}
+}
+
+func TestSLTPMonitor_SL_RetryRateLimited(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 76, TelegramID: 57, TokenID: "D7", AvgPrice: 0.50, SharesAtArm: 100,
+		HighWaterMark: 0.65, TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{ret: &polymarket.TradeResult{Success: false, ErrorMsg: "fok no fill"}}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("D7", 0.45)
+	feed.emit("D7")
+	waitFor(t, func() bool { return breachStamped(m, 76) })
+	clock.advance(31 * time.Second)
+	feed.emit("D7")
+	waitFor(t, func() bool {
+		exec.mu.Lock()
+		defer exec.mu.Unlock()
+		return len(exec.calls) == 1
+	})
+
+	clock.advance(10 * time.Second)
+	feed.emit("D7")
+	clock.advance(10 * time.Second)
+	feed.emit("D7")
+	time.Sleep(50 * time.Millisecond)
+	exec.mu.Lock()
+	calls := len(exec.calls)
+	exec.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("expected retry to be rate-limited, got %d attempts", calls)
+	}
+
+	clock.advance(11 * time.Second) // 31s since attempt #1
+	feed.emit("D7")
+	waitFor(t, func() bool {
+		exec.mu.Lock()
+		defer exec.mu.Unlock()
+		return len(exec.calls) == 2
+	})
+
+	// Second failure must not send a second pending notice (same episode).
+	time.Sleep(50 * time.Millisecond)
+	notif.mu.Lock()
+	pendings := len(notif.pendings)
+	notif.mu.Unlock()
+	if pendings != 1 {
+		t.Errorf("expected 1 pending notice per episode, got %d", pendings)
+	}
+}
+
+func TestSLTPMonitor_SL_DisarmOnlyAfterSuccessfulSell(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 77, TelegramID: 58, TokenID: "D8", AvgPrice: 0.50, SharesAtArm: 100,
+		HighWaterMark: 0.65, TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{}
+	var disarmsAtSellTime int32 = -1
+	exec.onSell = func() {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		atomic.StoreInt32(&disarmsAtSellTime, int32(store.disarmCalls))
+	}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("D8", 0.45)
+	feed.emit("D8")
+	waitFor(t, func() bool { return breachStamped(m, 77) })
+	clock.advance(31 * time.Second)
+	feed.emit("D8")
+	waitFor(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.disarmCalls == 1
+	})
+
+	if got := atomic.LoadInt32(&disarmsAtSellTime); got != 0 {
+		t.Errorf("disarm must happen AFTER the sell; at sell time disarms=%d", got)
+	}
+}
+
+func TestSLTPMonitor_SL_ConcurrentConfirmedBreachFiresOnce(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 78, TelegramID: 59, TokenID: "D9", AvgPrice: 0.50, SharesAtArm: 100,
+		HighWaterMark: 0.65, TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("D9", 0.45)
+	feed.emit("D9")
+	waitFor(t, func() bool { return breachStamped(m, 78) })
+	clock.advance(31 * time.Second)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			feed.emit("D9")
+		}()
+	}
+	wg.Wait()
+
+	waitFor(t, func() bool {
+		exec.mu.Lock()
+		defer exec.mu.Unlock()
+		return len(exec.calls) >= 1
+	})
+	time.Sleep(100 * time.Millisecond)
+	exec.mu.Lock()
+	calls := len(exec.calls)
+	exec.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("expected exactly 1 sell under concurrent confirmed breach, got %d", calls)
+	}
+	store.mu.Lock()
+	disarms := store.disarmCalls
+	store.mu.Unlock()
+	if disarms != 1 {
+		t.Errorf("expected exactly 1 disarm, got %d", disarms)
+	}
+}
+
+func TestSLTPMonitor_SL_SoldButDisarmFailedNeverResells(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 79, TelegramID: 60, TokenID: "DA", AvgPrice: 0.50, SharesAtArm: 100,
+		HighWaterMark: 0.65, TPArmed: true, SLArmed: true})
+	store.mu.Lock()
+	store.disarmFailN = 1
+	store.mu.Unlock()
+	feed := newFakeFeed()
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("DA", 0.45)
+	feed.emit("DA")
+	waitFor(t, func() bool { return breachStamped(m, 79) })
+	clock.advance(31 * time.Second)
+	feed.emit("DA")
+
+	// Sell succeeded, disarm failed once: the fired notice still goes out.
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.fires) == 1
+	})
+
+	// Next evaluation retries ONLY the disarm — no second sell.
+	feed.emit("DA")
+	waitFor(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.disarmCalls == 1
+	})
+	time.Sleep(50 * time.Millisecond)
+	exec.mu.Lock()
+	calls := len(exec.calls)
+	exec.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("sold arm must never re-sell, got %d sells", calls)
+	}
+	notif.mu.Lock()
+	fires := len(notif.fires)
+	notif.mu.Unlock()
+	if fires != 1 {
+		t.Errorf("expected exactly 1 fired notice, got %d", fires)
+	}
+	if store.armedCount("DA") != 0 {
+		t.Errorf("arm should be gone after the disarm retry, got %d", store.armedCount("DA"))
+	}
+}
+
+func TestSLTPMonitor_SL_TPFireDuringBreachClearsDebounce(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	// Active: trigger = max(0.20, 0.30*0.80=0.24) = 0.24. TP trigger = 0.40.
+	store.seed(&database.SLTPArm{ID: 80, TelegramID: 61, TokenID: "DB", AvgPrice: 0.20, SharesAtArm: 100,
+		HighWaterMark: 0.30, TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("DB", 0.23)
+	feed.emit("DB")
+	waitFor(t, func() bool { return breachStamped(m, 80) })
+	clock.advance(15 * time.Second)
+
+	// TP fires mid-breach; the debounce state must be wiped.
+	feed.setBid("DB", 0.41)
+	feed.emit("DB")
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.fires) == 1 && notif.fires[0].kind == "TP"
+	})
+	waitFor(t, func() bool { return slStateCleared(m, 80) })
+
+	// New breach (HWM ratcheted to 0.41 → trigger = max(0.20, 0.328) = 0.328):
+	// needs a FULL fresh window, the old 15s must not count.
+	feed.setBid("DB", 0.23)
+	feed.emit("DB")
+	waitFor(t, func() bool { return breachStamped(m, 80) })
+	clock.advance(20 * time.Second)
+	feed.emit("DB")
+	time.Sleep(50 * time.Millisecond)
+	exec.mu.Lock()
+	calls := len(exec.calls)
+	exec.mu.Unlock()
+	if calls != 1 { // just the TP sell so far
+		t.Errorf("expected no SL sell 20s into the fresh episode, got %d total sells", calls)
+	}
+
+	clock.advance(11 * time.Second)
+	feed.emit("DB")
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.fires) == 2 && notif.fires[1].kind == "SL"
+	})
+	exec.mu.Lock()
+	slCall := exec.calls[1]
+	exec.mu.Unlock()
+	// TP already fired → SL sells the remaining half.
+	if slCall.sharesRaw != int64(100*0.50*1e6) {
+		t.Errorf("expected SL sell of remaining half (50e6), got %d", slCall.sharesRaw)
+	}
+	if slCall.orderType != polymarket.OrderTypeFOK {
+		t.Errorf("expected FOK SL sell, got %v", slCall.orderType)
+	}
+}
+
+func TestSLTPMonitor_SL_CeilingDuringBreachClearsState(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 81, TelegramID: 62, TokenID: "DC", AvgPrice: 0.50, SharesAtArm: 100,
+		HighWaterMark: 0.65, TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("DC", 0.45)
+	feed.emit("DC")
+	waitFor(t, func() bool { return breachStamped(m, 81) })
+	clock.advance(10 * time.Second)
+
+	feed.setBid("DC", 0.96)
+	feed.emit("DC")
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.fires) == 1 && notif.fires[0].kind == "TP-ceiling"
+	})
+	waitFor(t, func() bool { return slStateCleared(m, 81) })
+	if store.armedCount("DC") != 0 {
+		t.Errorf("ceiling fire should disarm fully, got %d armed", store.armedCount("DC"))
+	}
+}
+
+func TestSLTPMonitor_SL_RearmMidBreachResets(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 82, TelegramID: 63, TokenID: "DD", AvgPrice: 0.50, SharesAtArm: 100,
+		HighWaterMark: 0.70, TPArmed: true, SLArmed: true}) // trigger 0.56
+	feed := newFakeFeed()
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("DD", 0.50)
+	feed.emit("DD")
+	waitFor(t, func() bool { return breachStamped(m, 82) })
+	clock.advance(31 * time.Second)
+
+	// Re-arm (upsert, same row ID): HWM reset to avg → dormant again.
+	store.replace(&database.SLTPArm{ID: 82, TelegramID: 63, TokenID: "DD", AvgPrice: 0.50, SharesAtArm: 100,
+		HighWaterMark: 0.50, TPArmed: true, SLArmed: true})
+
+	feed.emit("DD")
+	waitFor(t, func() bool { return slStateCleared(m, 82) })
+	time.Sleep(50 * time.Millisecond)
+	exec.mu.Lock()
+	calls := len(exec.calls)
+	exec.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("re-armed (dormant) arm must not fire from stale breach state, got %d", calls)
 	}
 }

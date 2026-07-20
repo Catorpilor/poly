@@ -48,6 +48,12 @@ type SLTPArmRepository interface {
 	// SetLotteryTicket flips the lottery_ticket_armed flag for an existing
 	// arm. Returns ErrSLTPArmNotFound if no arm exists for the user/token.
 	SetLotteryTicket(ctx context.Context, telegramID int64, tokenID string, on bool) error
+
+	// UpdateHWM raises high_water_mark for (telegramID, tokenID) to hwm.
+	// A no-op (nil error) when the stored value is already >= hwm — the WHERE
+	// clause is the monotonic ratchet guard under concurrent evaluations — or
+	// when the row is gone (disarmed mid-evaluation).
+	UpdateHWM(ctx context.Context, telegramID int64, tokenID string, hwm float64) error
 }
 
 type sltpArmRepo struct {
@@ -60,14 +66,14 @@ func NewSLTPArmRepository(db *database.DB) SLTPArmRepository {
 }
 
 const sltpArmColumns = `id, telegram_id, token_id, condition_id, market_id, outcome,
-		avg_price, shares_at_arm, tp_armed, sl_armed, neg_risk, lottery_ticket_armed,
+		avg_price, shares_at_arm, high_water_mark, tp_armed, sl_armed, neg_risk, lottery_ticket_armed,
 		created_at, updated_at`
 
 func scanArm(row pgx.Row) (*database.SLTPArm, error) {
 	a := &database.SLTPArm{}
 	if err := row.Scan(
 		&a.ID, &a.TelegramID, &a.TokenID, &a.ConditionID, &a.MarketID, &a.Outcome,
-		&a.AvgPrice, &a.SharesAtArm, &a.TPArmed, &a.SLArmed, &a.NegRisk, &a.LotteryTicketArmed,
+		&a.AvgPrice, &a.SharesAtArm, &a.HighWaterMark, &a.TPArmed, &a.SLArmed, &a.NegRisk, &a.LotteryTicketArmed,
 		&a.CreatedAt, &a.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -83,14 +89,15 @@ func (r *sltpArmRepo) Arm(ctx context.Context, arm *database.SLTPArm) (*database
 	query := `
 		INSERT INTO sltp_arms (
 			telegram_id, token_id, condition_id, market_id, outcome,
-			avg_price, shares_at_arm, tp_armed, sl_armed, neg_risk
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, TRUE, $8)
+			avg_price, shares_at_arm, high_water_mark, tp_armed, sl_armed, neg_risk
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $6, TRUE, TRUE, $8)
 		ON CONFLICT (telegram_id, token_id) DO UPDATE SET
 			condition_id = EXCLUDED.condition_id,
 			market_id = EXCLUDED.market_id,
 			outcome = EXCLUDED.outcome,
 			avg_price = EXCLUDED.avg_price,
 			shares_at_arm = EXCLUDED.shares_at_arm,
+			high_water_mark = EXCLUDED.avg_price,
 			tp_armed = TRUE,
 			sl_armed = TRUE,
 			neg_risk = EXCLUDED.neg_risk
@@ -180,6 +187,15 @@ func (r *sltpArmRepo) SetLotteryTicket(ctx context.Context, telegramID int64, to
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrSLTPArmNotFound
+	}
+	return nil
+}
+
+func (r *sltpArmRepo) UpdateHWM(ctx context.Context, telegramID int64, tokenID string, hwm float64) error {
+	query := `UPDATE sltp_arms SET high_water_mark = $3
+		WHERE telegram_id = $1 AND token_id = $2 AND high_water_mark < $3`
+	if _, err := r.db.Pool.Exec(ctx, query, telegramID, tokenID, hwm); err != nil {
+		return fmt.Errorf("failed to update high_water_mark: %w", err)
 	}
 	return nil
 }

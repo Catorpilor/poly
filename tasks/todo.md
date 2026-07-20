@@ -191,3 +191,57 @@ Fix (TDD, manager_pinned_feed_test.go):
 Known edge (accepted): a Telegram subscription made with a market slug
 still tracks ML assets under that slug (Telegram has no pinning) — if
 combined with a web pin on the same slug, ML trades reach that panel.
+
+---
+
+# Breakeven-Trailing Stop-Loss Rework (SL/TP v2)
+
+Plan: ~/.claude/plans/atomic-singing-petal.md
+Why: 92-day data — fixed -30% SL realized -48% of basis over 62 fires,
+29% of stops were comebacks; holding beat stopping by ~$1,470.
+Params (user-chosen): activation = entry×1.20, trail = 20% below peak
+floored at entry, FOK floor = trigger×0.90, retry-only (no market
+escalation), no deep stop. TP side unchanged.
+
+- [x] Stage 0 — Migration 008: high_water_mark column + backfill (+down)
+- [x] Stage 1 — models.go: HWM field, SLActivationMult/SLTrailMult/
+      SLMaxSlip, SLActive/SLTriggerPrice/SLFloorPrice (table tests first)
+- [x] Stage 2 — repository: column plumbing, Arm upsert seeds HWM=avg,
+      UpdateHWM monotonic
+- [x] Stage 3 — executor plumbing: ExecuteSell(limitPrice, orderType),
+      drop GTC hardcode in executeSellOrderFromPosition
+- [x] Stage 4 — monitor: HWM ratchet + fakeStore.UpdateHWM
+- [x] Stage 5a — dormant gate + evaluateSL restructure
+- [x] Stage 5b — 30s confirmation debounce (fakeClock via m.now)
+- [x] Stage 5c — FOK floor exec, single-flight, retry,
+      disarm-after-success, pending notice
+- [x] Stage 5d — interaction tests (TP/ceiling mid-breach, re-arm reset)
+- [x] Stage 6 — telegram: NotifySLExitPending, fire/header/confirm text
+- [x] Final — go test -race -count=2 ./... (green, 2 runs)
+
+## Review
+
+All stages TDD RED→GREEN; full suite + `-race -count=2` clean; `go vet`
+clean. ~1,350 lines added across 9 files + migration 008 (+down) +
+CONTEXT.md glossary (SL rewritten, HWM added).
+
+Key mechanics as built:
+- Trigger math on SLTPArm: SLActive (hwm ≥ avg×1.20), SLTriggerPrice
+  (max(avg, hwm×0.80)), SLFloorPrice (trigger×0.90, clamp ≥0.001).
+- Monitor: ratchetHWM on every evaluation (monotonic SQL guard);
+  per-arm in-memory slArmState {breachStart, lastAttempt, inFlight,
+  sold, pendingNotified} keyed by arm ID; 30s confirm window (20s tick
+  guarantees coverage); FOK exit at floor; retry ≥30s; disarm only
+  after a successful sell (sold flag makes disarm-retry re-sell-proof);
+  TP/ceiling/dormant/recovery all wipe breach state.
+- TP side untouched (still market-style GTC, ClearTP-first).
+- 16 new/rewritten monitor tests (incl. fakeClock determinism,
+  concurrency, restart, sold-but-disarm-failed), 3 new model tables,
+  2 telegram text tables.
+
+NOT deployed yet — deploy steps when user gives the go:
+1. psql "$DATABASE_URL" -f migrations/008_sl_trailing_stop.sql
+2. tag v0.0.XX → CI → bump tag in ~/workspace/poly_deploy → compose
+   down/up; existing arms restart DORMANT (hwm=avg).
+3. Smoke: arm a small position; first production FOK SELL — verify one
+   live fire before trusting broadly.

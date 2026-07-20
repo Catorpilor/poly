@@ -1946,7 +1946,7 @@ func (b *Bot) executeSellWithPrice(ctx context.Context, update *tgbotapi.Update,
 Please wait...`, orderTypeStr, marketName, percentage, pos.Outcome, priceStr, sellValue))
 
 	// Execute the sell order using position data directly
-	result := b.executeSellOrderFromPosition(ctx, user, pos, sellValue, sellSharesRaw, limitPrice)
+	result := b.executeSellOrderFromPosition(ctx, user, pos, sellValue, sellSharesRaw, limitPrice, polymarket.OrderTypeGTC)
 
 	// Clear state
 	b.stateManager.ClearState(userID)
@@ -2047,7 +2047,7 @@ func (b *Bot) handleLimitPriceInput(ctx context.Context, update *tgbotapi.Update
 Please wait...`, marketName, percentage, pos.Outcome, limitPrice, sellValue))
 
 	// Execute the sell order
-	result := b.executeSellOrderFromPosition(ctx, user, pos, sellValue, sellSharesRaw, limitPrice)
+	result := b.executeSellOrderFromPosition(ctx, user, pos, sellValue, sellSharesRaw, limitPrice, polymarket.OrderTypeGTC)
 
 	// Show result
 	if result.Success {
@@ -2505,7 +2505,7 @@ func (b *Bot) executeSellOrder(ctx context.Context, user *database.User, market 
 // executeSellOrderFromPosition executes a sell order using position data directly
 // This avoids needing to query the Gamma API for token ID since we have it from the position
 // limitPrice of 0 means market order (use best bid), otherwise it's a limit order at specified price
-func (b *Bot) executeSellOrderFromPosition(ctx context.Context, user *database.User, pos *polymarket.Position, amount float64, sharesRaw int64, limitPrice float64) *polymarket.TradeResult {
+func (b *Bot) executeSellOrderFromPosition(ctx context.Context, user *database.User, pos *polymarket.Position, amount float64, sharesRaw int64, limitPrice float64, orderType polymarket.OrderType) *polymarket.TradeResult {
 	log.Printf("Executing sell order from position for user %d: %s %s $%.2f (shares: %d, limitPrice: %.2f)", user.TelegramID, pos.Outcome, pos.TokenID, amount, sharesRaw, limitPrice)
 
 	// Decrypt user's private key
@@ -2556,7 +2556,7 @@ func (b *Bot) executeSellOrderFromPosition(ctx context.Context, user *database.U
 		Amount:       amount,
 		SharesRaw:    sharesRaw,   // Use exact shares from position
 		Price:        limitPrice,  // 0 means market order, >0 means limit order
-		OrderType:    polymarket.OrderTypeGTC,
+		OrderType:    orderType,
 		NegativeRisk: pos.NegativeRisk,
 		TakerFeeBps:  orderFeeBps,
 		CalcFeeBps:   calcFeeBps,

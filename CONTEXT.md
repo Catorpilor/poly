@@ -137,8 +137,20 @@ last trade or the midpoint.
 **Take-Profit (TP)** — Trigger: bid reaches 2× the arm-time average price →
 sell half the arm-time shares.
 
-**Stop-Loss (SL)** — Trigger: bid falls to 0.70× the arm-time average
-price → sell everything.
+**Stop-Loss (SL)** — Breakeven-trailing. Dormant until the High-Water Mark
+reaches 1.20× the arm-time average price (until then there is no stop —
+max loss is the stake). Once active: trigger = max(entry, HWM × 0.80),
+ratcheting up only. A breach must hold for 30s straight (confirmation
+debounce), then the exit is a fill-or-kill limit at trigger × 0.90 — never
+a market order into a gapped book; a no-fill keeps the arm and retries
+every ≥30s while the breach persists. Replaced the fixed 0.70× stop in
+v0.11: 92 days of fills showed that stop realizing −48% of basis and
+selling 29% eventual winners.
+
+**High-Water Mark (HWM)** — The highest best bid observed on an armed
+position since arm/re-arm, persisted per arm (`high_water_mark`). Seeded
+to the entry price; only ever raised. Drives SL activation and the
+trailing trigger.
 
 **Ceiling Take-Profit** — Trigger: bid reaches 0.95 → sell everything,
 taking precedence over the 2× rule.
