@@ -230,6 +230,12 @@ func TestSLTPFiredText(t *testing.T) {
 			want:   []string{"Trailing stop hit", "$1.0000", "$0.8000", "$0.7200", "fully disarmed"},
 		},
 		{
+			name:   "SL with confirmed fill shows avg price",
+			kind:   "SL",
+			result: &polymarket.TradeResult{Success: true, FilledSize: 199.99, AveragePrice: 0.3610},
+			want:   []string{"Trailing stop hit", "199.99", "avg", "$0.3610"},
+		},
+		{
 			name:   "failure branch for TP kinds",
 			kind:   "TP",
 			result: fail,
@@ -261,11 +267,11 @@ func TestSLTPArmedText(t *testing.T) {
 	got := sltpArmedText("Knicks vs. Spurs", "KNICKS", arm)
 
 	for _, w := range []string{
-		"$0.5000",       // entry
-		"$0.6000",       // activation = entry × 1.20
-		"20%",           // trail distance below peak
-		"max loss",      // explicit no-stop-below-activation caveat
-		"$0.9900",       // TP trigger (capped)
+		"$0.5000",  // entry
+		"$0.6000",  // activation = entry × 1.20
+		"20%",      // trail distance below peak
+		"max loss", // explicit no-stop-below-activation caveat
+		"$0.9900",  // TP trigger (capped)
 	} {
 		if !strings.Contains(got, w) {
 			t.Errorf("armed text missing %q:\n%s", w, got)

@@ -152,6 +152,21 @@ position since arm/re-arm, persisted per arm (`high_water_mark`). Seeded
 to the entry price; only ever raised. Drives SL activation and the
 trailing trigger.
 
+**Acceptance** — The exchange took an order onto its books (or into its
+bet-delay queue). Says nothing about execution. The natural success
+criterion for resting orders (GTC/GTD): "your limit order is placed."
+
+**Fill** — Shares actually traded. The only success criterion for
+fill-or-kill orders: an accepted-but-killed FOK is a failure, not a
+partial anything. Auto-sell fires, disarms, and "sold" notifications may
+only follow a Fill, never mere Acceptance.
+
+**Bet Delay** — Polymarket's in-play matching delay: on live sports
+markets the CLOB *accepts* an order (`status: delayed`) and matches or
+kills it only after the delay elapses. During the delay an order is
+neither filled nor dead — treating Acceptance as a Fill here is exactly
+the false-fire bug of issue #22.
+
 **Ceiling Take-Profit** — Trigger: bid reaches 0.95 → sell everything,
 taking precedence over the 2× rule.
 

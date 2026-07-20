@@ -465,11 +465,17 @@ func sltpFiredText(kind string, arm *database.SLTPArm, bid float64, result *poly
 			bid, database.CeilingTPPrice, arm.Outcome,
 		)
 	case "SL":
+		// FOK results confirm a fill: show the actual size/avg when the
+		// executor populated them (empty on older/partial data → omit).
+		fill := ""
+		if result.AveragePrice > 0 {
+			fill = fmt.Sprintf(" — filled %.2f shares at avg $%.4f", result.FilledSize, result.AveragePrice)
+		}
 		return fmt.Sprintf(
 			"🛑 *Trailing stop hit* at $%.4f\n\n"+
-				"Peak was $%.4f, stop $%.4f — sold remaining %s shares at ≥ $%.4f (FOK floor).\n"+
+				"Peak was $%.4f, stop $%.4f — sold remaining %s shares at ≥ $%.4f (FOK floor)%s.\n"+
 				"Position fully disarmed.",
-			bid, arm.HighWaterMark, arm.SLTriggerPrice(), arm.Outcome, arm.SLFloorPrice(),
+			bid, arm.HighWaterMark, arm.SLTriggerPrice(), arm.Outcome, arm.SLFloorPrice(), fill,
 		)
 	default:
 		return fmt.Sprintf("ℹ️ %s fired at $%.4f", kind, bid)

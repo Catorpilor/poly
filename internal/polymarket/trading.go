@@ -32,6 +32,13 @@ type TradingClient struct {
 	chainID    *big.Int
 	httpClient *http.Client
 	builder    *orderv2.Builder
+
+	// fokPollInterval / fokConfirmTimeout govern FOK fill confirmation: a
+	// delayed FOK (in-play bet delay) is polled every fokPollInterval until it
+	// reaches a terminal state or fokConfirmTimeout elapses. Fields (not bare
+	// consts) so tests can shrink them.
+	fokPollInterval   time.Duration
+	fokConfirmTimeout time.Duration
 }
 
 // APICredentials holds L2 API credentials for authenticated requests
@@ -49,6 +56,19 @@ const (
 	OrderTypeGTD OrderType = "GTD" // Good-til-date
 	OrderTypeFOK OrderType = "FOK" // Fill-or-kill
 )
+
+// FOK fill-confirmation timing. On in-play markets the CLOB accepts an order
+// (status "delayed") and matches or kills it only after the bet delay; these
+// defaults poll comfortably past that window before giving up. See
+// docs/adr/0005-fok-fill-confirmation.md.
+const (
+	fokPollIntervalDefault   = 2 * time.Second
+	fokConfirmTimeoutDefault = 60 * time.Second
+)
+
+// rawAmountScale is the 6-decimal fixed-point scale the CLOB uses for share and
+// USDC amounts (1 share = 1_000_000 raw units).
+const rawAmountScale = 1e6
 
 // TradeRequest represents a trade request from the user
 type TradeRequest struct {
@@ -71,11 +91,11 @@ type TradeRequest struct {
 
 // TradeResult represents the result of a trade
 type TradeResult struct {
-	Success     bool
-	OrderID     string
-	OrderHash   string
-	ErrorMsg    string
-	FilledSize  float64
+	Success      bool
+	OrderID      string
+	OrderHash    string
+	ErrorMsg     string
+	FilledSize   float64
 	AveragePrice float64
 }
 
@@ -94,10 +114,12 @@ type OrderBook struct {
 // NewTradingClient creates a new trading client
 func NewTradingClient(clobURL string, chainID int64) *TradingClient {
 	return &TradingClient{
-		clobURL:    clobURL,
-		chainID:    big.NewInt(chainID),
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-		builder:    orderv2.NewBuilder(chainID),
+		clobURL:           clobURL,
+		chainID:           big.NewInt(chainID),
+		httpClient:        &http.Client{Timeout: 30 * time.Second},
+		builder:           orderv2.NewBuilder(chainID),
+		fokPollInterval:   fokPollIntervalDefault,
+		fokConfirmTimeout: fokConfirmTimeoutDefault,
 	}
 }
 
@@ -329,14 +351,14 @@ func (tc *TradingClient) GetOrderBook(ctx context.Context, tokenID string) (*Ord
 
 // CLOBMarketInfo contains market information from the CLOB API
 type CLOBMarketInfo struct {
-	ConditionID      string `json:"condition_id"`
-	Question         string `json:"question"`
-	Active           bool   `json:"active"`
-	Closed           bool   `json:"closed"`
-	NegRisk          bool   `json:"neg_risk"`
-	MakerBaseFee     int    `json:"maker_base_fee"`     // Fee in basis points (1000 = 10%)
-	TakerBaseFee     int    `json:"taker_base_fee"`     // Fee in basis points (1000 = 10%)
-	MinimumOrderSize int    `json:"minimum_order_size"`
+	ConditionID      string  `json:"condition_id"`
+	Question         string  `json:"question"`
+	Active           bool    `json:"active"`
+	Closed           bool    `json:"closed"`
+	NegRisk          bool    `json:"neg_risk"`
+	MakerBaseFee     int     `json:"maker_base_fee"` // Fee in basis points (1000 = 10%)
+	TakerBaseFee     int     `json:"taker_base_fee"` // Fee in basis points (1000 = 10%)
+	MinimumOrderSize int     `json:"minimum_order_size"`
 	MinimumTickSize  float64 `json:"minimum_tick_size"`
 	Tokens           []struct {
 		TokenID string  `json:"token_id"`
@@ -806,25 +828,238 @@ func (tc *TradingClient) submitOrder(
 	}
 
 	var result struct {
-		Success    bool     `json:"success"`
-		ErrorMsg   string   `json:"errorMsg"`
-		OrderID    string   `json:"orderId"`
-		OrderHashes []string `json:"orderHashes"`
+		Success      bool     `json:"success"`
+		ErrorMsg     string   `json:"errorMsg"`
+		OrderID      string   `json:"orderId"`
+		OrderHashes  []string `json:"orderHashes"`
+		Status       string   `json:"status"`
+		TakingAmount string   `json:"takingAmount"`
+		MakingAmount string   `json:"makingAmount"`
 	}
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		// Try to parse as success even if structure is different
+		// A 200 whose body we can't parse is NOT a confirmed anything. Fail
+		// closed: a false "failed" is recoverable (the caller keeps the arm and
+		// retries), a false "sold" silently drops protection. Applies to every
+		// order type. (issue #22)
 		return &TradeResult{
-			Success:   true,
-			OrderHash: string(respBody),
+			Success:  false,
+			ErrorMsg: fmt.Sprintf("unparseable order response: %s", truncateString(string(respBody), 200)),
 		}, nil
 	}
 
-	return &TradeResult{
+	base := &TradeResult{
 		Success:   result.Success,
 		OrderID:   result.OrderID,
 		OrderHash: strings.Join(result.OrderHashes, ","),
 		ErrorMsg:  result.ErrorMsg,
-	}, nil
+	}
+
+	// Success is per order type. For FOK it must mean a CONFIRMED FILL — an
+	// accepted-but-killed order (in-play bet delay) is a failure, not a partial
+	// anything. GTC/GTD keep acceptance semantics: a resting order is success,
+	// so they return unchanged. (issue #22)
+	if orderType == OrderTypeFOK {
+		return tc.resolveFOKResult(ctx, creds, address, base,
+			result.Status, result.TakingAmount, result.MakingAmount, signedOrder.Side)
+	}
+
+	return base, nil
+}
+
+// fokStatusClass classifies a CLOB order status for the FOK fill decision.
+type fokStatusClass int
+
+const (
+	fokPending fokStatusClass = iota // delayed / live / unknown → not yet resolved
+	fokFilled                        // matched → confirmed fill
+	fokDead                          // unmatched / canceled → killed, failure
+)
+
+// classifyFOKStatus maps a status string to its class. Comparison is
+// case-insensitive: the submit response uses lowercase ("matched"/"delayed"),
+// the data API may differ. Unknown statuses stay pending so the poll loop keeps
+// waiting until it sees a terminal state or times out.
+func classifyFOKStatus(status string) fokStatusClass {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "matched":
+		return fokFilled
+	case "unmatched", "canceled", "cancelled":
+		return fokDead
+	default:
+		return fokPending
+	}
+}
+
+// resolveFOKResult turns a FOK submit response into a fill-truthful result. A
+// rejected submit (success:false) is trusted as-is; an immediate "matched"
+// fills from the response amounts; "delayed"/"live"/unknown blocks and polls
+// the order until terminal or timeout.
+func (tc *TradingClient) resolveFOKResult(
+	ctx context.Context,
+	creds *APICredentials,
+	address common.Address,
+	base *TradeResult,
+	status, takingAmount, makingAmount string,
+	side orderv2.Side,
+) (*TradeResult, error) {
+	if !base.Success {
+		return base, nil
+	}
+	switch classifyFOKStatus(status) {
+	case fokFilled:
+		fillFromSubmit(base, takingAmount, makingAmount, side)
+		return base, nil
+	case fokDead:
+		base.Success = false
+		if base.ErrorMsg == "" {
+			base.ErrorMsg = fmt.Sprintf("FOK order not filled (status %q)", status)
+		}
+		return base, nil
+	default:
+		return tc.pollFOKUntilTerminal(ctx, creds, address, base, side)
+	}
+}
+
+// pollFOKUntilTerminal blocks polling GET /data/order/{orderID} every
+// fokPollInterval until the order is matched (success + fill fields), killed or
+// gone (failure), or fokConfirmTimeout elapses (failure — the safe direction: a
+// caller that keeps the arm and retries beats a false "sold"). Respects ctx
+// cancellation.
+func (tc *TradingClient) pollFOKUntilTerminal(
+	ctx context.Context,
+	creds *APICredentials,
+	address common.Address,
+	base *TradeResult,
+	side orderv2.Side,
+) (*TradeResult, error) {
+	if base.OrderID == "" {
+		base.Success = false
+		base.ErrorMsg = "FOK order delayed but response carried no order ID to confirm the fill"
+		return base, nil
+	}
+
+	deadline := time.Now().Add(tc.fokConfirmTimeout)
+	ticker := time.NewTicker(tc.fokPollInterval)
+	defer ticker.Stop()
+
+	for {
+		order, found, err := tc.getOrder(ctx, address, creds, base.OrderID)
+		switch {
+		case err != nil:
+			log.Printf("FOK poll: get order %s: %v (will retry)", base.OrderID, err)
+		case !found:
+			// The order no longer exists: killed after the bet delay and reaped.
+			base.Success = false
+			base.ErrorMsg = "FOK order no longer exists — killed after the bet delay"
+			return base, nil
+		default:
+			switch classifyFOKStatus(order.Status) {
+			case fokFilled:
+				fillFromPoll(base, order)
+				return base, nil
+			case fokDead:
+				base.Success = false
+				base.ErrorMsg = fmt.Sprintf("FOK order killed (status %q)", order.Status)
+				return base, nil
+			}
+			// pending → keep polling.
+		}
+
+		if time.Now().After(deadline) {
+			base.Success = false
+			base.ErrorMsg = fmt.Sprintf("FOK fill not confirmed within %s (order still delayed)", tc.fokConfirmTimeout)
+			return base, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			base.Success = false
+			base.ErrorMsg = fmt.Sprintf("FOK confirmation canceled: %v", ctx.Err())
+			return base, nil
+		case <-ticker.C:
+		}
+	}
+}
+
+// getOrder fetches a single order by ID via the L2-authed data API. Returns
+// (order, true, nil) when present, (nil, false, nil) on 404 or an empty body
+// (the order was killed and reaped), or an error on transport/decode failure.
+func (tc *TradingClient) getOrder(ctx context.Context, address common.Address, creds *APICredentials, orderID string) (*OpenOrder, bool, error) {
+	path := fmt.Sprintf("/data/order/%s", orderID)
+	req, err := http.NewRequestWithContext(ctx, "GET", tc.clobURL+path, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("create get-order request: %w", err)
+	}
+
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	signature := tc.signL2Request(creds.Secret, timestamp, "GET", path, "")
+	req.Header.Set("POLY_ADDRESS", address.Hex())
+	req.Header.Set("POLY_SIGNATURE", signature)
+	req.Header.Set("POLY_TIMESTAMP", timestamp)
+	req.Header.Set("POLY_API_KEY", creds.APIKey)
+	req.Header.Set("POLY_PASSPHRASE", creds.Passphrase)
+
+	resp, err := tc.httpClient.Do(req)
+	if err != nil {
+		return nil, false, fmt.Errorf("get order: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, false, fmt.Errorf("get order failed: %s - %s", resp.Status, string(body))
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	// A killed-and-reaped order can come back as an empty body / null / {}.
+	switch strings.TrimSpace(string(body)) {
+	case "", "null", "{}":
+		return nil, false, nil
+	}
+	var order OpenOrder
+	if err := json.Unmarshal(body, &order); err != nil {
+		return nil, false, fmt.Errorf("decode order: %w", err)
+	}
+	if order.ID == "" {
+		return nil, false, nil
+	}
+	return &order, true, nil
+}
+
+// fillFromSubmit populates FilledSize/AveragePrice from an immediate-match FOK
+// submit response, whose takingAmount/makingAmount are raw 6-decimal strings.
+// For a SELL the maker gives shares and takes USDC (size = making, avg =
+// taking/making); a BUY is mirrored (size = taking, avg = making/taking).
+func fillFromSubmit(res *TradeResult, takingAmount, makingAmount string, side orderv2.Side) {
+	taking, tErr := strconv.ParseFloat(takingAmount, 64)
+	making, mErr := strconv.ParseFloat(makingAmount, 64)
+	if tErr != nil || mErr != nil || taking <= 0 || making <= 0 {
+		return
+	}
+	if side == orderv2.SELL {
+		res.FilledSize = making / rawAmountScale
+		res.AveragePrice = taking / making
+	} else {
+		res.FilledSize = taking / rawAmountScale
+		res.AveragePrice = making / taking
+	}
+}
+
+// fillFromPoll approximates FilledSize/AveragePrice from a poll-confirmed match.
+// The data API reports human-decimal size_matched (already in shares, not raw)
+// and the order's limit price — not the executed VWAP. For a FOK that can only
+// fill at or through its limit, the limit is a close, slightly-conservative
+// stand-in for the true average.
+func fillFromPoll(res *TradeResult, order *OpenOrder) {
+	if size, err := strconv.ParseFloat(order.SizeMatched, 64); err == nil && size > 0 {
+		res.FilledSize = size
+	}
+	if price, err := strconv.ParseFloat(order.Price, 64); err == nil && price > 0 {
+		res.AveragePrice = price
+	}
 }
 
 // signL2Request creates HMAC-SHA256 signature for L2 requests

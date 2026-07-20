@@ -245,3 +245,41 @@ NOT deployed yet — deploy steps when user gives the go:
    down/up; existing arms restart DORMANT (hwm=avg).
 3. Smoke: arm a small position; first production FOK SELL — verify one
    live fire before trusting broadly.
+
+# FOK Fill Confirmation — delayed orders are not fills (issue #22, 2026-07-20)
+
+First live v0.11.0 FOK stop-loss fired on an in-play Dota 2 market: CLOB
+returned `success:true, status:"delayed"`, the bot read it as a fill,
+disarmed the position, and DM'd a false "stop fired" while zero shares
+sold. Root cause: `submitOrder` parsed only `success` and never `status`.
+
+- [x] TDD: FOK fill-confirmation tests (fake CLOB via httptest) — matched
+      immediately; delayed→matched on poll; delayed→unmatched (no further
+      polls); delayed→404/gone; delayed→timeout; ctx-cancel mid-poll;
+      GTC delayed/live stays accepted (never polls); unparseable 200 →
+      fail-closed (FOK + GTC)
+- [x] `submitOrder`: parse `status`/amounts; FOK Success = confirmed fill,
+      GTC/GTD unchanged (acceptance); flip unparseable-200 fallback to
+      failure for all order types
+- [x] Block-and-poll `GET /data/order/{id}` (L2-authed) every 2s / 60s
+      timeout inside the trading client; poll interval + timeout are
+      struct fields so tests shrink them; case-insensitive status;
+      respects ctx cancellation; timeout = failure (safe direction)
+- [x] Populate FilledSize/AveragePrice on every FOK fill (submit amounts,
+      or poll size_matched/price approximation); SL fired text shows the
+      avg fill price when known
+- [x] ADR 0005; CONTEXT.md glossary (Acceptance / Fill / Bet Delay);
+      lessons.md; `go test ./...`, `-race` (polymarket/live/telegram),
+      `go vet` all green
+
+## Review
+
+Fix is contained to the trading client: `TradeResult.Success` is now
+per order type — a killed delayed FOK returns `Success=false`, which the
+SL monitor already handles correctly (keep arm, one pending notice,
+retry ≥30s). No monitor change needed. TP/ceiling-TP untouched (still
+GTC acceptance). Known accepted edge: a resting unfilled TP sell can make
+a later SL under-sell by half — documented on issue #22, not fixed.
+
+NOT deployed — user gates tag/deploy. Smoke: first production FOK SELL on
+an in-play market must confirm one real fill before trusting broadly.
