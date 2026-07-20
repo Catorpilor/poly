@@ -30,25 +30,78 @@ func TestSLTPArm_TPTriggerPrice(t *testing.T) {
 	}
 }
 
+func TestSLTPArm_SLActive(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		avgPrice float64
+		hwm      float64
+		want     bool
+	}{
+		{"dormant at seed (hwm == avg)", 0.50, 0.50, false},
+		{"dormant just below activation", 0.50, 0.599, false},
+		{"active exactly at avg*1.20", 0.50, 0.60, true},
+		{"active well above activation", 0.50, 0.90, true},
+		{"low entry activates at 0.24", 0.20, 0.24, true},
+		{"low entry dormant at 0.23", 0.20, 0.23, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			a := &SLTPArm{AvgPrice: tt.avgPrice, HighWaterMark: tt.hwm}
+			if got := a.SLActive(); got != tt.want {
+				t.Errorf("SLActive(avg=%v, hwm=%v) = %v, want %v", tt.avgPrice, tt.hwm, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSLTPArm_SLTriggerPrice(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name     string
 		avgPrice float64
+		hwm      float64
 		want     float64
 	}{
-		{"20c entry floor at 14c", 0.20, 0.14},
-		{"50c entry floor at 35c", 0.50, 0.35},
-		{"10c entry floor at 7c", 0.10, 0.07},
+		{"hwm at entry floors at entry", 0.50, 0.50, 0.50},
+		{"hwm*trail below entry floors at entry", 0.50, 0.60, 0.50},
+		{"hwm*trail above entry trails", 0.50, 0.70, 0.56},
+		{"high peak ratchets trigger up", 0.50, 0.90, 0.72},
+		{"low entry trails from peak", 0.20, 0.30, 0.24},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			a := &SLTPArm{AvgPrice: tt.avgPrice}
+			a := &SLTPArm{AvgPrice: tt.avgPrice, HighWaterMark: tt.hwm}
 			got := a.SLTriggerPrice()
 			// Floating-point tolerance
 			if diff := got - tt.want; diff > 1e-9 || diff < -1e-9 {
-				t.Errorf("SLTriggerPrice(avg=%v) = %v, want %v", tt.avgPrice, got, tt.want)
+				t.Errorf("SLTriggerPrice(avg=%v, hwm=%v) = %v, want %v", tt.avgPrice, tt.hwm, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSLTPArm_SLFloorPrice(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		avgPrice float64
+		hwm      float64
+		want     float64
+	}{
+		{"floor is 90% of breakeven trigger", 0.50, 0.50, 0.45},
+		{"floor is 90% of trailing trigger", 0.50, 0.90, 0.648},
+		{"penny arm clamps at 0.001", 0.001, 0.001, 0.001},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			a := &SLTPArm{AvgPrice: tt.avgPrice, HighWaterMark: tt.hwm}
+			got := a.SLFloorPrice()
+			if diff := got - tt.want; diff > 1e-9 || diff < -1e-9 {
+				t.Errorf("SLFloorPrice(avg=%v, hwm=%v) = %v, want %v", tt.avgPrice, tt.hwm, got, tt.want)
 			}
 		})
 	}

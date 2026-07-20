@@ -22,6 +22,9 @@ type SLTPArmStore interface {
 	ListArmedByToken(ctx context.Context, tokenID string) ([]*database.SLTPArm, error)
 	ClearTP(ctx context.Context, telegramID int64, tokenID string) error
 	Disarm(ctx context.Context, telegramID int64, tokenID string) error
+	// UpdateHWM raises high_water_mark; a no-op when the stored value is
+	// already >= hwm (monotonic ratchet, guarded in SQL).
+	UpdateHWM(ctx context.Context, telegramID int64, tokenID string, hwm float64) error
 }
 
 // PriceFeedSubscriber is the subset of PriceFeedManager the monitor needs.
@@ -44,7 +47,11 @@ type PriceFeedSubscriber interface {
 // Implementations resolve wallet, proxy address, API credentials, and fee
 // parameters from the arm.
 type TradeExecutor interface {
-	ExecuteSell(ctx context.Context, arm *database.SLTPArm, sharesRaw int64) *polymarket.TradeResult
+	// ExecuteSell sells sharesRaw of arm's token. limitPrice 0 = market-style
+	// order (priced from the book); nonzero = exact limit. orderType is passed
+	// through to the CLOB (GTC for market-style, FOK for floored SL exits).
+	ExecuteSell(ctx context.Context, arm *database.SLTPArm, sharesRaw int64,
+		limitPrice float64, orderType polymarket.OrderType) *polymarket.TradeResult
 
 	// ExecuteLotteryBuy attempts a FOK BUY of otherTokenID at price <=
 	// maxPrice for at most maxSpend USDC. Used by the ceiling-TP fire path
@@ -69,6 +76,10 @@ var ErrMultiOutcome = errors.New("multi-outcome market: no single other side")
 // Notifier sends SL/TP fire and pause notifications to users.
 type Notifier interface {
 	NotifySLTPFired(telegramID int64, kind string, arm *database.SLTPArm, bid float64, result *polymarket.TradeResult)
+	// NotifySLExitPending is sent at most once per breach episode when the
+	// floored FOK exit can't fill; the monitor keeps retrying while the
+	// breach persists.
+	NotifySLExitPending(telegramID int64, arm *database.SLTPArm, bid, trigger, floor float64)
 	// NotifySLTPPaused is sent at most once per user while the pause window is
 	// active, so users understand why their arms aren't firing.
 	NotifySLTPPaused(telegramID int64, arm *database.SLTPArm)
@@ -95,6 +106,28 @@ const sltpTickInterval = 20 * time.Second
 // tick to trust the cached bid; older = HTTP fallback.
 const sltpFreshnessMaxAge = 30 * time.Second
 
+// slConfirmWindowDefault is how long the bid must stay at/below the trailing
+// trigger before the SL fires. The 20s tick guarantees at least one
+// re-evaluation lands inside any 30s window, so a breach is always confirmed
+// or reset by live data — never by a single gapped observation.
+const slConfirmWindowDefault = 30 * time.Second
+
+// slRetryIntervalDefault is the minimum spacing between FOK exit attempts
+// while a confirmed breach persists.
+const slRetryIntervalDefault = 30 * time.Second
+
+// slArmState is the in-memory (restart-resettable) SL breach state for one arm
+// epoch, keyed by arm.ID. A disarm→re-arm normally produces a new ID; the
+// upsert path can reuse an ID, but it also resets the HWM to entry, so the
+// dormant branch wipes any stale state before it could fire.
+type slArmState struct {
+	breachStart     time.Time // first observation of bid <= trigger this episode
+	lastAttempt     time.Time // last sell submission (rate limit)
+	inFlight        bool      // a sell attempt is currently running
+	sold            bool      // sell filled; only the disarm retry remains
+	pendingNotified bool      // "exit pending" notice sent for this episode
+}
+
 // SLTPMonitor evaluates armed TP/SL thresholds on each price update and fires
 // SELL orders when thresholds are crossed. Safe to call Start once per process.
 type SLTPMonitor struct {
@@ -112,9 +145,14 @@ type SLTPMonitor struct {
 	tickInterval time.Duration
 	// freshnessMaxAge is the per-token WS staleness threshold used by the tick.
 	freshnessMaxAge time.Duration
+	// slConfirmWindow / slRetryInterval are test-overridable copies of the
+	// trailing-SL timing defaults.
+	slConfirmWindow time.Duration
+	slRetryInterval time.Duration
 
-	mu           sync.Mutex
-	pauseNotified map[int64]bool // telegramID -> notified at window start
+	mu            sync.Mutex
+	pauseNotified map[int64]bool      // telegramID -> notified at window start
+	slState       map[int]*slArmState // arm.ID -> breach/attempt state
 }
 
 // NewSLTPMonitor builds the monitor. paused may be nil (no pause window).
@@ -137,7 +175,10 @@ func NewSLTPMonitor(
 		now:             time.Now,
 		tickInterval:    sltpTickInterval,
 		freshnessMaxAge: sltpFreshnessMaxAge,
+		slConfirmWindow: slConfirmWindowDefault,
+		slRetryInterval: slRetryIntervalDefault,
 		pauseNotified:   make(map[int64]bool),
+		slState:         make(map[int]*slArmState),
 	}
 }
 
@@ -249,22 +290,48 @@ func (m *SLTPMonitor) tickEvaluateAll() {
 	}
 }
 
-// evaluateArm checks ceiling-TP, then 2× TP, then SL. At most one fires per
-// call. Ceiling check goes first so it supersedes the 50%-sell standard TP for
-// arms where both thresholds are close (e.g., avg_price ≈ 0.475 makes 2× ≈
-// 0.95 = ceiling).
+// evaluateArm ratchets the high-water mark, then checks ceiling-TP, 2× TP, and
+// SL. At most one fires per call. Ceiling check goes first so it supersedes the
+// 50%-sell standard TP for arms where both thresholds are close (e.g.,
+// avg_price ≈ 0.475 makes 2× ≈ 0.95 = ceiling).
 func (m *SLTPMonitor) evaluateArm(arm *database.SLTPArm, bid float64) {
+	// An SL sell already filled but the disarm errored: the ONLY valid action
+	// is retrying the disarm. Guarded first so a TP/ceiling branch can never
+	// sell shares that are already gone.
+	if m.isSLSold(arm.ID) {
+		m.retrySLDisarm(arm)
+		return
+	}
+	m.ratchetHWM(arm, bid)
 	if bid >= database.CeilingTPPrice {
+		m.clearSLState(arm.ID)
 		m.fireCeilingTP(arm, bid)
 		return
 	}
 	if arm.TPArmed && bid >= arm.TPTriggerPrice() {
+		m.clearSLState(arm.ID)
 		m.fireTP(arm, bid)
 		return
 	}
-	if arm.SLArmed && bid <= arm.SLTriggerPrice() {
-		m.fireSL(arm, bid)
+	if arm.SLArmed {
+		m.evaluateSL(arm, bid)
 	}
+}
+
+// ratchetHWM raises the arm's high-water mark to bid when bid is a new high.
+// The DB write is monotonic (WHERE high_water_mark < $n); the in-memory field
+// is updated regardless so this evaluation stays self-consistent even if the
+// write raced or failed. A new high can never itself be an SL breach
+// (trigger = max(avg, HWM*trail) < bid when bid > HWM), so ratchet-then-check
+// in one pass is safe.
+func (m *SLTPMonitor) ratchetHWM(arm *database.SLTPArm, bid float64) {
+	if bid <= arm.HighWaterMark {
+		return
+	}
+	if err := m.store.UpdateHWM(m.ctx, arm.TelegramID, arm.TokenID, bid); err != nil {
+		log.Printf("SLTPMonitor: update hwm for %d/%s: %v", arm.TelegramID, arm.TokenID, err)
+	}
+	arm.HighWaterMark = bid
 }
 
 // notifyPauseOnce sends one pause message per (user) for the lifetime of the
@@ -308,21 +375,66 @@ func (m *SLTPMonitor) fireTP(arm *database.SLTPArm, bid float64) {
 
 	log.Printf("SLTPMonitor: TP fire user=%d token=%s bid=%.4f sharesRaw=%d",
 		arm.TelegramID, arm.TokenID, bid, sharesRaw)
-	result := m.executor.ExecuteSell(m.ctx, arm, sharesRaw)
+	result := m.executor.ExecuteSell(m.ctx, arm, sharesRaw, 0, polymarket.OrderTypeGTC)
 	m.notifier.NotifySLTPFired(arm.TelegramID, "TP", arm, bid, result)
 }
 
-// fireSL deletes the arm row (double-fire guard), sells 100% of remaining shares,
-// notifies the user, and unsubscribes from the feed if no other users remain
-// armed on this token.
-func (m *SLTPMonitor) fireSL(arm *database.SLTPArm, bid float64) {
-	if err := m.store.Disarm(m.ctx, arm.TelegramID, arm.TokenID); err != nil {
-		if !errors.Is(err, repositories.ErrSLTPArmNotFound) {
-			log.Printf("SLTPMonitor: disarm for %d/%s: %v", arm.TelegramID, arm.TokenID, err)
-		}
+// evaluateSL runs the breakeven-trailing stop for one arm. Dormant arms (HWM
+// below activation) have no stop at all — the position rides and max loss is
+// the stake. Once active, a breach must persist for slConfirmWindow before a
+// floored FOK exit is attempted.
+func (m *SLTPMonitor) evaluateSL(arm *database.SLTPArm, bid float64) {
+	if !arm.SLActive() {
+		// Dormant. Also covers a re-arm that reset the HWM to entry: any
+		// stale breach state from the previous arm epoch is wiped here.
+		m.clearSLState(arm.ID)
 		return
 	}
+	trigger := arm.SLTriggerPrice()
+	if bid > trigger {
+		m.clearSLState(arm.ID) // recovery resets the confirmation debounce
+		return
+	}
+	if !m.slGate(arm.ID, m.now()) {
+		return
+	}
+	m.attemptSLExit(arm, bid, trigger)
+}
 
+// slGate implements the confirmation debounce plus single-flight/rate-limit
+// gating for a breached, active SL. Returns true when this evaluation should
+// attempt the sell (and has claimed the attempt slot).
+func (m *SLTPMonitor) slGate(armID int, now time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st := m.slState[armID]
+	if st == nil {
+		st = &slArmState{}
+		m.slState[armID] = st
+	}
+	if st.breachStart.IsZero() {
+		st.breachStart = now
+		return false
+	}
+	if now.Sub(st.breachStart) < m.slConfirmWindow {
+		return false
+	}
+	if st.inFlight {
+		return false
+	}
+	if !st.lastAttempt.IsZero() && now.Sub(st.lastAttempt) < m.slRetryInterval {
+		return false
+	}
+	st.inFlight = true
+	st.lastAttempt = now
+	return true
+}
+
+// attemptSLExit sells all remaining shares as a FOK limit at the floor —
+// never a market order into a gapped book. On no-fill the arm stays armed and
+// the gate retries after slRetryInterval; the arm row is deleted only after a
+// successful sell.
+func (m *SLTPMonitor) attemptSLExit(arm *database.SLTPArm, bid, trigger float64) {
 	// If TP already fired, only half the snapshot remains; otherwise the full amount.
 	remaining := arm.SharesAtArm
 	if !arm.TPArmed {
@@ -330,18 +442,104 @@ func (m *SLTPMonitor) fireSL(arm *database.SLTPArm, bid float64) {
 	}
 	sharesRaw := int64(remaining * 1e6)
 	if sharesRaw <= 0 {
+		m.finishSLAttempt(arm.ID)
 		return
 	}
 
-	log.Printf("SLTPMonitor: SL fire user=%d token=%s bid=%.4f sharesRaw=%d",
-		arm.TelegramID, arm.TokenID, bid, sharesRaw)
-	result := m.executor.ExecuteSell(m.ctx, arm, sharesRaw)
-	m.notifier.NotifySLTPFired(arm.TelegramID, "SL", arm, bid, result)
+	floor := arm.SLFloorPrice()
+	log.Printf("SLTPMonitor: SL attempt user=%d token=%s bid=%.4f trigger=%.4f floor=%.4f sharesRaw=%d",
+		arm.TelegramID, arm.TokenID, bid, trigger, floor, sharesRaw)
+	result := m.executor.ExecuteSell(m.ctx, arm, sharesRaw, floor, polymarket.OrderTypeFOK)
+	if result == nil || !result.Success {
+		m.finishSLAttempt(arm.ID)
+		m.notifySLPendingOnce(arm, bid, trigger, floor)
+		return
+	}
 
-	// If no other users are armed on this token, drop the feed subscription.
-	rest, err := m.store.ListArmedByToken(m.ctx, arm.TokenID)
+	m.markSLSold(arm.ID)
+	log.Printf("SLTPMonitor: SL fire user=%d token=%s bid=%.4f floor=%.4f sharesRaw=%d",
+		arm.TelegramID, arm.TokenID, bid, floor, sharesRaw)
+	if err := m.store.Disarm(m.ctx, arm.TelegramID, arm.TokenID); err != nil && !errors.Is(err, repositories.ErrSLTPArmNotFound) {
+		// Keep the sold state; a later evaluation retries the disarm only.
+		log.Printf("SLTPMonitor: disarm after SL sell for %d/%s: %v (will retry)",
+			arm.TelegramID, arm.TokenID, err)
+	} else {
+		m.clearSLState(arm.ID)
+		m.unsubscribeIfLast(arm.TokenID)
+	}
+	m.notifier.NotifySLTPFired(arm.TelegramID, "SL", arm, bid, result)
+}
+
+// retrySLDisarm finishes an SL exit whose sell filled but whose disarm errored.
+func (m *SLTPMonitor) retrySLDisarm(arm *database.SLTPArm) {
+	if err := m.store.Disarm(m.ctx, arm.TelegramID, arm.TokenID); err != nil {
+		if !errors.Is(err, repositories.ErrSLTPArmNotFound) {
+			log.Printf("SLTPMonitor: retry disarm for %d/%s: %v", arm.TelegramID, arm.TokenID, err)
+			return // keep sold state; retry again on the next evaluation
+		}
+	}
+	m.clearSLState(arm.ID)
+	m.unsubscribeIfLast(arm.TokenID)
+}
+
+func (m *SLTPMonitor) isSLSold(armID int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st := m.slState[armID]
+	return st != nil && st.sold
+}
+
+func (m *SLTPMonitor) clearSLState(armID int) {
+	m.mu.Lock()
+	delete(m.slState, armID)
+	m.mu.Unlock()
+}
+
+// finishSLAttempt releases the single-flight slot after a failed attempt,
+// preserving breachStart (episode continues) and pendingNotified (dedup).
+func (m *SLTPMonitor) finishSLAttempt(armID int) {
+	m.mu.Lock()
+	if st := m.slState[armID]; st != nil {
+		st.inFlight = false
+	}
+	m.mu.Unlock()
+}
+
+// markSLSold latches the sold flag: from here on the arm can only retry its
+// disarm, never sell again.
+func (m *SLTPMonitor) markSLSold(armID int) {
+	m.mu.Lock()
+	st := m.slState[armID]
+	if st == nil {
+		st = &slArmState{}
+		m.slState[armID] = st
+	}
+	st.sold = true
+	st.inFlight = false
+	m.mu.Unlock()
+}
+
+// notifySLPendingOnce sends the "exit pending, book too thin" notice at most
+// once per breach episode.
+func (m *SLTPMonitor) notifySLPendingOnce(arm *database.SLTPArm, bid, trigger, floor float64) {
+	m.mu.Lock()
+	st := m.slState[arm.ID]
+	send := st != nil && !st.pendingNotified
+	if send {
+		st.pendingNotified = true
+	}
+	m.mu.Unlock()
+	if send {
+		m.notifier.NotifySLExitPending(arm.TelegramID, arm, bid, trigger, floor)
+	}
+}
+
+// unsubscribeIfLast drops the feed subscription when no armed rows remain on
+// the token.
+func (m *SLTPMonitor) unsubscribeIfLast(tokenID string) {
+	rest, err := m.store.ListArmedByToken(m.ctx, tokenID)
 	if err == nil && len(rest) == 0 {
-		m.feed.Unsubscribe(arm.TokenID)
+		m.feed.Unsubscribe(tokenID)
 	}
 }
 
@@ -368,7 +566,7 @@ func (m *SLTPMonitor) fireCeilingTP(arm *database.SLTPArm, bid float64) {
 
 	log.Printf("SLTPMonitor: TP-ceiling fire user=%d token=%s bid=%.4f sharesRaw=%d",
 		arm.TelegramID, arm.TokenID, bid, sharesRaw)
-	result := m.executor.ExecuteSell(m.ctx, arm, sharesRaw)
+	result := m.executor.ExecuteSell(m.ctx, arm, sharesRaw, 0, polymarket.OrderTypeGTC)
 	m.notifier.NotifySLTPFired(arm.TelegramID, "TP-ceiling", arm, bid, result)
 
 	// Lottery ticket: cheap insurance on the losing side. Only attempt when
@@ -378,10 +576,7 @@ func (m *SLTPMonitor) fireCeilingTP(arm *database.SLTPArm, bid float64) {
 		m.tryLotteryBuy(arm)
 	}
 
-	rest, err := m.store.ListArmedByToken(m.ctx, arm.TokenID)
-	if err == nil && len(rest) == 0 {
-		m.feed.Unsubscribe(arm.TokenID)
-	}
+	m.unsubscribeIfLast(arm.TokenID)
 }
 
 // tryLotteryBuy is invoked after a successful ceiling-TP SELL. Resolves the

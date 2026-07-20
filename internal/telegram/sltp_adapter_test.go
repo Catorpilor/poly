@@ -196,3 +196,79 @@ func TestNormalizeOutcome(t *testing.T) {
 		}
 	}
 }
+
+func TestSLTPFiredText(t *testing.T) {
+	t.Parallel()
+	// Post-TP-fire arm: entry 0.50, peak ratcheted to 1.00 → stop 0.80.
+	arm := &database.SLTPArm{AvgPrice: 0.50, HighWaterMark: 1.00, Outcome: "KNICKS"}
+	ok := &polymarket.TradeResult{Success: true}
+	fail := &polymarket.TradeResult{Success: false, ErrorMsg: "boom"}
+
+	tests := []struct {
+		name    string
+		kind    string
+		result  *polymarket.TradeResult
+		want    []string
+		wantNot []string
+	}{
+		{
+			name:   "TP mentions trailing stop on remainder",
+			kind:   "TP",
+			result: ok,
+			want:   []string{"TP hit", "Trailing stop", "$0.8000", "KNICKS"},
+		},
+		{
+			name:   "ceiling unchanged",
+			kind:   "TP-ceiling",
+			result: ok,
+			want:   []string{"TP ceiling", "fully disarmed"},
+		},
+		{
+			name:   "SL describes peak, stop and floor",
+			kind:   "SL",
+			result: ok,
+			want:   []string{"Trailing stop hit", "$1.0000", "$0.8000", "$0.7200", "fully disarmed"},
+		},
+		{
+			name:   "failure branch for TP kinds",
+			kind:   "TP",
+			result: fail,
+			want:   []string{"sell failed", "boom"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := sltpFiredText(tt.kind, arm, 0.80, tt.result)
+			for _, w := range tt.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("text missing %q:\n%s", w, got)
+				}
+			}
+			for _, w := range tt.wantNot {
+				if strings.Contains(got, w) {
+					t.Errorf("text should not contain %q:\n%s", w, got)
+				}
+			}
+		})
+	}
+}
+
+func TestSLTPArmedText(t *testing.T) {
+	t.Parallel()
+	// Fresh arm: HWM == entry (dormant).
+	arm := &database.SLTPArm{AvgPrice: 0.50, HighWaterMark: 0.50, Outcome: "KNICKS"}
+	got := sltpArmedText("Knicks vs. Spurs", "KNICKS", arm)
+
+	for _, w := range []string{
+		"$0.5000",       // entry
+		"$0.6000",       // activation = entry × 1.20
+		"20%",           // trail distance below peak
+		"max loss",      // explicit no-stop-below-activation caveat
+		"$0.9900",       // TP trigger (capped)
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("armed text missing %q:\n%s", w, got)
+		}
+	}
+}

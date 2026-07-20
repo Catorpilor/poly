@@ -73,12 +73,14 @@ func (b *Bot) handleSLTPList(ctx context.Context, update *tgbotapi.Update) {
 	header := fmt.Sprintf(
 		"🎯 *SL/TP Auto-Sell* (%d positions)\n\n"+
 			"• *TP:* bid ≥ entry × %.1f → sell %.0f%%\n"+
-			"• *SL:* bid ≤ entry × %.2f → sell 100%%\n\n"+
+			"• *SL:* trailing — activates once bid ≥ entry × %.2f, then\n"+
+			"  stop = max(entry, peak × %.2f) → sell 100%%\n\n"+
 			"Tap a position to arm or disarm.\n\n",
 		len(positions),
 		database.TPMultiplier,
 		database.TPSellFraction*100,
-		database.SLMultiplier,
+		database.SLActivationMult,
+		database.SLTrailMult,
 	)
 
 	var rows [][]tgbotapi.InlineKeyboardButton
@@ -242,17 +244,7 @@ func (b *Bot) handleSLTPArmCallback(ctx context.Context, update *tgbotapi.Update
 		b.sltpMonitor.SubscribeFor(saved.TokenID)
 	}
 
-	msg := fmt.Sprintf(
-		"🎯 *Armed* %s %s\n\n"+
-			"• Entry: $%.4f\n"+
-			"• TP: bid ≥ $%.4f → sell %.0f%%\n"+
-			"• SL: bid ≤ $%.4f → sell 100%%",
-		pos.MarketTitle, pos.Outcome,
-		saved.AvgPrice,
-		saved.TPTriggerPrice(), database.TPSellFraction*100,
-		saved.SLTriggerPrice(),
-	)
-	b.sendMessage(chatID, msg)
+	b.sendMessage(chatID, sltpArmedText(pos.MarketTitle, pos.Outcome, saved))
 
 	// Re-render the list so the button flips to disarm.
 	b.handleSLTPList(ctx, update)
@@ -379,7 +371,8 @@ func normalizeOutcome(s string) database.Outcome {
 // reuses the existing sell-from-position path, synthesizing a minimal Position
 // from the arm's snapshot. limitPrice=0 makes this a market order with the same
 // 2% slippage guard that manual sells use.
-func (b *Bot) ExecuteSell(ctx context.Context, arm *database.SLTPArm, sharesRaw int64) *polymarket.TradeResult {
+func (b *Bot) ExecuteSell(ctx context.Context, arm *database.SLTPArm, sharesRaw int64,
+	limitPrice float64, orderType polymarket.OrderType) *polymarket.TradeResult {
 	user, err := b.userRepo.GetByTelegramID(ctx, arm.TelegramID)
 	if err != nil || user == nil {
 		return &polymarket.TradeResult{
@@ -402,7 +395,21 @@ func (b *Bot) ExecuteSell(ctx context.Context, arm *database.SLTPArm, sharesRaw 
 		NegativeRisk: arm.NegRisk,
 	}
 
-	return b.executeSellOrderFromPosition(ctx, user, pos, 0, sharesRaw, 0)
+	return b.executeSellOrderFromPosition(ctx, user, pos, 0, sharesRaw, limitPrice, orderType)
+}
+
+// NotifySLExitPending implements live.Notifier. Sent at most once per breach
+// episode when the floored FOK exit can't fill; the monitor keeps retrying
+// while the price stays below the stop.
+func (b *Bot) NotifySLExitPending(telegramID int64, arm *database.SLTPArm, bid, trigger, floor float64) {
+	text := fmt.Sprintf(
+		"⏳ *Trailing stop hit — exit pending*\n\n"+
+			"*%s* bid $%.3f is below your stop $%.3f, but the book is too thin "+
+			"to sell at ≥ $%.3f (floor).\n\n"+
+			"Holding and retrying while the price stays below the stop — "+
+			"never selling below the floor.",
+		arm.Outcome, bid, trigger, floor)
+	b.sendMessage(telegramID, text)
 }
 
 // NotifySLTPPaused implements live.Notifier. Sent once per user when the monitor
@@ -422,44 +429,68 @@ func (b *Bot) NotifySLTPPaused(telegramID int64, arm *database.SLTPArm) {
 // NotifySLTPFired implements live.Notifier. Sends a Telegram DM describing the
 // fire outcome.
 func (b *Bot) NotifySLTPFired(telegramID int64, kind string, arm *database.SLTPArm, bid float64, result *polymarket.TradeResult) {
-	var text string
-	if result != nil && result.Success {
-		switch kind {
-		case "TP":
-			text = fmt.Sprintf(
-				"✅ *TP hit* at $%.4f\n\n"+
-					"Sold %.0f%% of %s position.\n"+
-					"SL (≤ $%.4f) still watching remainder.",
-				bid, database.TPSellFraction*100, arm.Outcome, arm.SLTriggerPrice(),
-			)
-		case "TP-ceiling":
-			text = fmt.Sprintf(
-				"🏁 *TP ceiling hit* at $%.4f (≥ $%.2f)\n\n"+
-					"Sold remaining %s shares — locking in upside, no point holding for the last few cents.\n"+
-					"Position fully disarmed.",
-				bid, database.CeilingTPPrice, arm.Outcome,
-			)
-		case "SL":
-			text = fmt.Sprintf(
-				"🛑 *SL hit* at $%.4f\n\n"+
-					"Sold remaining %s shares. Position fully disarmed.",
-				bid, arm.Outcome,
-			)
-		default:
-			text = fmt.Sprintf("ℹ️ %s fired at $%.4f", kind, bid)
-		}
-	} else {
+	b.sendMessage(telegramID, sltpFiredText(kind, arm, bid, result))
+}
+
+// sltpFiredText builds the fire notification body. Pure — table-tested.
+// SL failures never reach the failure branch: the monitor sends the pending
+// notice instead and keeps the arm; the branch remains for TP kinds.
+func sltpFiredText(kind string, arm *database.SLTPArm, bid float64, result *polymarket.TradeResult) string {
+	if result == nil || !result.Success {
 		errMsg := "(no result)"
 		if result != nil && result.ErrorMsg != "" {
 			errMsg = result.ErrorMsg
 		}
-		text = fmt.Sprintf(
+		return fmt.Sprintf(
 			"⚠️ *%s trigger fired* at $%.4f but sell failed:\n`%s`\n\n"+
 				"Position remains unsold. Check /positions.",
 			kind, bid, errMsg,
 		)
 	}
-	b.sendMessage(telegramID, text)
+	switch kind {
+	case "TP":
+		// By TP time the bid reached 2× entry, so the trailing stop is
+		// necessarily active; show where it protects the remainder.
+		return fmt.Sprintf(
+			"✅ *TP hit* at $%.4f\n\n"+
+				"Sold %.0f%% of %s position.\n"+
+				"Trailing stop ($%.4f, follows the peak) watching the remainder.",
+			bid, database.TPSellFraction*100, arm.Outcome, arm.SLTriggerPrice(),
+		)
+	case "TP-ceiling":
+		return fmt.Sprintf(
+			"🏁 *TP ceiling hit* at $%.4f (≥ $%.2f)\n\n"+
+				"Sold remaining %s shares — locking in upside, no point holding for the last few cents.\n"+
+				"Position fully disarmed.",
+			bid, database.CeilingTPPrice, arm.Outcome,
+		)
+	case "SL":
+		return fmt.Sprintf(
+			"🛑 *Trailing stop hit* at $%.4f\n\n"+
+				"Peak was $%.4f, stop $%.4f — sold remaining %s shares at ≥ $%.4f (FOK floor).\n"+
+				"Position fully disarmed.",
+			bid, arm.HighWaterMark, arm.SLTriggerPrice(), arm.Outcome, arm.SLFloorPrice(),
+		)
+	default:
+		return fmt.Sprintf("ℹ️ %s fired at $%.4f", kind, bid)
+	}
+}
+
+// sltpArmedText builds the arm-confirmation message. Pure — table-tested.
+func sltpArmedText(title, outcome string, arm *database.SLTPArm) string {
+	activation := arm.AvgPrice * database.SLActivationMult
+	return fmt.Sprintf(
+		"🎯 *Armed* %s %s\n\n"+
+			"• Entry: $%.4f\n"+
+			"• TP: bid ≥ $%.4f → sell %.0f%%\n"+
+			"• SL: trailing — wakes once bid ≥ $%.4f, then stops at\n"+
+			"  max(entry, peak − 20%%) → sell 100%% (FOK, floored)\n\n"+
+			"⚠️ No stop until the bid reaches $%.4f — max loss is your stake.",
+		title, outcome,
+		arm.AvgPrice,
+		arm.TPTriggerPrice(), database.TPSellFraction*100,
+		activation, activation,
+	)
 }
 
 // ResolveOtherToken implements live.TradeExecutor. Returns the second CTF
