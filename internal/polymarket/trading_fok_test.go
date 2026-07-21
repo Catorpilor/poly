@@ -21,6 +21,7 @@ import (
 // body, and a scripted sequence of GET /data/order/{id} poll responses.
 type fokFakeCLOB struct {
 	orderBody    string // raw JSON body returned by POST /order
+	orderStatus  int    // HTTP status for POST /order; 0 = 200 OK
 	ordersPlaced atomic.Int64
 
 	// pollStatuses drives successive GET /data/order/{id} responses. Each
@@ -45,6 +46,9 @@ func (f *fokFakeCLOB) handler() http.HandlerFunc {
 			json.NewEncoder(w).Encode(map[string]any{"minimum_tick_size": 0.01})
 		case r.URL.Path == "/order":
 			f.ordersPlaced.Add(1)
+			if f.orderStatus != 0 {
+				w.WriteHeader(f.orderStatus)
+			}
 			io.WriteString(w, f.orderBody)
 		case strings.HasPrefix(r.URL.Path, "/data/order/"):
 			n := int(f.pollCount.Add(1)) - 1
@@ -293,6 +297,66 @@ func TestGTCDelayedIsAccepted(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestOrderBalanceShortfallAnnotated: the CLOB's balance-shortfall rejection
+// must be classified on the TradeResult so the SL/TP monitor can clamp the
+// sell to the wallet's actual balance instead of retrying a doomed order
+// forever (issue #24: arm snapshot 450 shares, 225 manually sold outside the
+// bot, every FOK retry rejected with the exact body below).
+func TestOrderBalanceShortfallAnnotated(t *testing.T) {
+	t.Parallel()
+	const shortfallBody = `{"error":"not enough balance / allowance: the balance is not enough -> balance: 225000000, order amount: 450000000"}`
+
+	for _, tt := range []struct {
+		name   string
+		status int
+	}{
+		{"rejected with 400", http.StatusBadRequest},
+		{"rejected with 200 error body", http.StatusOK},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			clob := &fokFakeCLOB{orderBody: shortfallBody, orderStatus: tt.status}
+			tc, key, creds := newFOKFixture(t, clob)
+
+			res, err := tc.ExecuteTrade(context.Background(), key, fokProxy, creds, fokSellRequest())
+			if err != nil {
+				t.Fatalf("ExecuteTrade: %v", err)
+			}
+			if res.Success {
+				t.Fatalf("Success = true, want false: %+v", res)
+			}
+			if !res.InsufficientBalance {
+				t.Error("InsufficientBalance = false, want true")
+			}
+			if res.AvailableSharesRaw != 225_000_000 {
+				t.Errorf("AvailableSharesRaw = %d, want 225000000", res.AvailableSharesRaw)
+			}
+		})
+	}
+
+	t.Run("other rejections are not annotated", func(t *testing.T) {
+		t.Parallel()
+		clob := &fokFakeCLOB{
+			orderBody:   `{"error":"order is invalid. Price breaks minimum tick size rules"}`,
+			orderStatus: http.StatusBadRequest,
+		}
+		tc, key, creds := newFOKFixture(t, clob)
+
+		res, err := tc.ExecuteTrade(context.Background(), key, fokProxy, creds, fokSellRequest())
+		if err != nil {
+			t.Fatalf("ExecuteTrade: %v", err)
+		}
+		if res.Success {
+			t.Fatalf("Success = true, want false: %+v", res)
+		}
+		if res.InsufficientBalance || res.AvailableSharesRaw != 0 {
+			t.Errorf("unrelated rejection annotated: InsufficientBalance=%v AvailableSharesRaw=%d",
+				res.InsufficientBalance, res.AvailableSharesRaw)
+		}
+	})
 }
 
 // TestUnparseableResponseFailsClosed: a 200 whose body doesn't parse is not a

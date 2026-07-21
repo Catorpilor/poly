@@ -428,6 +428,33 @@ func (b *Bot) NotifySLExitPending(telegramID int64, arm *database.SLTPArm, bid, 
 	b.sendMessage(telegramID, text)
 }
 
+// NotifySLTPStaleSize implements live.Notifier. Sent when a sell was rejected
+// because the wallet holds fewer shares than the arm-time snapshot (a manual
+// sell outside the bot, issue #24).
+func (b *Bot) NotifySLTPStaleSize(telegramID int64, arm *database.SLTPArm, availableRaw int64) {
+	b.sendMessage(telegramID, sltpStaleSizeText(arm, availableRaw))
+}
+
+// sltpStaleSizeText builds the stale-size notification body. Pure —
+// table-tested. availableRaw is the wallet's actual conditional-token balance
+// in 6-decimal raw units; 0 means the position is gone entirely.
+func sltpStaleSizeText(arm *database.SLTPArm, availableRaw int64) string {
+	if availableRaw <= 0 {
+		return fmt.Sprintf(
+			"⏹ *Position closed outside the bot — auto-disarmed*\n\n"+
+				"Your %s position no longer exists (sold or transferred outside the bot), "+
+				"so SL/TP was disarmed automatically. Nothing left to protect.",
+			arm.Outcome)
+	}
+	available := float64(availableRaw) / 1e6
+	return fmt.Sprintf(
+		"⚠️ *Position is smaller than when armed*\n\n"+
+			"Your %s wallet holds %.2f shares, but SL/TP was armed on %.2f — "+
+			"part was sold outside the bot. The stop now covers %.2f shares (was %.2f).\n\n"+
+			"Disarm and re-arm to refresh the snapshot.",
+		arm.Outcome, available, arm.SharesAtArm, available, arm.SharesAtArm)
+}
+
 // NotifySLTPPaused implements live.Notifier. Sent once per user when the monitor
 // enters the V2 cutover (or any other) pause window, so users know why their
 // arms aren't firing.

@@ -80,6 +80,11 @@ type Notifier interface {
 	// floored FOK exit can't fill; the monitor keeps retrying while the
 	// breach persists.
 	NotifySLExitPending(telegramID int64, arm *database.SLTPArm, bid, trigger, floor float64)
+	// NotifySLTPStaleSize reports that the arm's share snapshot no longer
+	// matches the wallet balance (shares sold outside the bot, issue #24).
+	// availableRaw == 0: the position is gone and the arm was auto-disarmed.
+	// > 0: later exits are clamped to the actual balance (6-decimal raw).
+	NotifySLTPStaleSize(telegramID int64, arm *database.SLTPArm, availableRaw int64)
 	// NotifySLTPPaused is sent at most once per user while the pause window is
 	// active, so users understand why their arms aren't firing.
 	NotifySLTPPaused(telegramID int64, arm *database.SLTPArm)
@@ -90,7 +95,6 @@ type Notifier interface {
 	NotifyLottery(telegramID int64, arm *database.SLTPArm, otherOutcome string,
 		reason string, detail string, result *polymarket.TradeResult)
 }
-
 
 // PauseWindow returns true when the monitor must skip evaluation (e.g., V2 cutover).
 type PauseWindow func(now time.Time) bool
@@ -126,6 +130,11 @@ type slArmState struct {
 	inFlight        bool      // a sell attempt is currently running
 	sold            bool      // sell filled; only the disarm retry remains
 	pendingNotified bool      // "exit pending" notice sent for this episode
+	// clampedSharesRaw is the wallet's actual balance reported by a
+	// balance-shortfall rejection (issue #24); later attempts in this episode
+	// sell min(snapshot, clamped) instead of the stale arm-time snapshot.
+	clampedSharesRaw int64
+	staleNotified    bool // stale-size notice sent for this episode
 }
 
 // SLTPMonitor evaluates armed TP/SL thresholds on each price update and fires
@@ -376,7 +385,46 @@ func (m *SLTPMonitor) fireTP(arm *database.SLTPArm, bid float64) {
 	log.Printf("SLTPMonitor: TP fire user=%d token=%s bid=%.4f sharesRaw=%d",
 		arm.TelegramID, arm.TokenID, bid, sharesRaw)
 	result := m.executor.ExecuteSell(m.ctx, arm, sharesRaw, 0, polymarket.OrderTypeGTC)
+	result, handled := m.retryTPShortfall("TP", arm, sharesRaw, result)
+	if handled {
+		return
+	}
 	m.notifier.NotifySLTPFired(arm.TelegramID, "TP", arm, bid, result)
+}
+
+// retryTPShortfall handles a balance-shortfall rejection on a TP or
+// ceiling-TP sell (issue #24). Zero balance → the position was closed outside
+// the bot: fully disarm, tell the user, and report handled=true so the caller
+// skips its fired notice. Nonzero → one immediate retry clamped to the
+// wallet's actual balance; the retry's result replaces the original.
+func (m *SLTPMonitor) retryTPShortfall(kind string, arm *database.SLTPArm, intendedRaw int64,
+	result *polymarket.TradeResult) (*polymarket.TradeResult, bool) {
+	if result == nil || result.Success || !result.InsufficientBalance {
+		return result, false
+	}
+	if result.AvailableSharesRaw <= 0 {
+		m.disarmGonePosition(arm)
+		return result, true
+	}
+	sharesRaw := result.AvailableSharesRaw
+	if intendedRaw < sharesRaw {
+		sharesRaw = intendedRaw
+	}
+	log.Printf("SLTPMonitor: %s clamped retry user=%d token=%s sharesRaw=%d (was %d)",
+		kind, arm.TelegramID, arm.TokenID, sharesRaw, intendedRaw)
+	return m.executor.ExecuteSell(m.ctx, arm, sharesRaw, 0, polymarket.OrderTypeGTC), false
+}
+
+// disarmGonePosition removes an arm whose position no longer exists on-chain
+// (zero-balance rejection): the user closed it outside the bot (issue #24).
+// ErrSLTPArmNotFound is tolerated — the ceiling path disarms before selling.
+func (m *SLTPMonitor) disarmGonePosition(arm *database.SLTPArm) {
+	m.clearSLState(arm.ID)
+	if err := m.store.Disarm(m.ctx, arm.TelegramID, arm.TokenID); err != nil && !errors.Is(err, repositories.ErrSLTPArmNotFound) {
+		log.Printf("SLTPMonitor: disarm gone position for %d/%s: %v", arm.TelegramID, arm.TokenID, err)
+	}
+	m.notifier.NotifySLTPStaleSize(arm.TelegramID, arm, 0)
+	m.unsubscribeIfLast(arm.TokenID)
 }
 
 // evaluateSL runs the breakeven-trailing stop for one arm. Dormant arms (HWM
@@ -441,6 +489,9 @@ func (m *SLTPMonitor) attemptSLExit(arm *database.SLTPArm, bid, trigger float64)
 		remaining = arm.SharesAtArm * (1 - database.TPSellFraction)
 	}
 	sharesRaw := int64(remaining * 1e6)
+	if clamped := m.slClampedShares(arm.ID); clamped > 0 && clamped < sharesRaw {
+		sharesRaw = clamped
+	}
 	if sharesRaw <= 0 {
 		m.finishSLAttempt(arm.ID)
 		return
@@ -452,6 +503,10 @@ func (m *SLTPMonitor) attemptSLExit(arm *database.SLTPArm, bid, trigger float64)
 	result := m.executor.ExecuteSell(m.ctx, arm, sharesRaw, floor, polymarket.OrderTypeFOK)
 	if result == nil || !result.Success {
 		m.finishSLAttempt(arm.ID)
+		if result != nil && result.InsufficientBalance {
+			m.handleSLShortfall(arm, result.AvailableSharesRaw)
+			return
+		}
 		m.notifySLPendingOnce(arm, bid, trigger, floor)
 		return
 	}
@@ -468,6 +523,50 @@ func (m *SLTPMonitor) attemptSLExit(arm *database.SLTPArm, bid, trigger float64)
 		m.unsubscribeIfLast(arm.TokenID)
 	}
 	m.notifier.NotifySLTPFired(arm.TelegramID, "SL", arm, bid, result)
+}
+
+// handleSLShortfall reacts to a balance-shortfall rejection of an SL exit:
+// the arm-time share snapshot no longer matches the wallet (shares sold
+// outside the bot, issue #24). Zero balance → the position is gone: latch the
+// sold state (only the disarm remains, never another sell), disarm, and tell
+// the user. Nonzero → clamp every later attempt in this episode to the actual
+// balance and tell the user once — INSTEAD of the misleading thin-book notice.
+func (m *SLTPMonitor) handleSLShortfall(arm *database.SLTPArm, availableRaw int64) {
+	if availableRaw <= 0 {
+		m.markSLSold(arm.ID)
+		m.notifier.NotifySLTPStaleSize(arm.TelegramID, arm, 0)
+		if err := m.store.Disarm(m.ctx, arm.TelegramID, arm.TokenID); err != nil && !errors.Is(err, repositories.ErrSLTPArmNotFound) {
+			// Keep the sold state; a later evaluation retries the disarm only.
+			log.Printf("SLTPMonitor: disarm gone position for %d/%s: %v (will retry)",
+				arm.TelegramID, arm.TokenID, err)
+			return
+		}
+		m.clearSLState(arm.ID)
+		m.unsubscribeIfLast(arm.TokenID)
+		return
+	}
+
+	m.mu.Lock()
+	st := m.slState[arm.ID]
+	notify := st != nil && !st.staleNotified
+	if st != nil {
+		st.clampedSharesRaw = availableRaw
+		st.staleNotified = true
+	}
+	m.mu.Unlock()
+	if notify {
+		m.notifier.NotifySLTPStaleSize(arm.TelegramID, arm, availableRaw)
+	}
+}
+
+// slClampedShares returns the episode's clamped sell size (0 = no clamp).
+func (m *SLTPMonitor) slClampedShares(armID int) int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if st := m.slState[armID]; st != nil {
+		return st.clampedSharesRaw
+	}
+	return 0
 }
 
 // retrySLDisarm finishes an SL exit whose sell filled but whose disarm errored.
@@ -567,6 +666,10 @@ func (m *SLTPMonitor) fireCeilingTP(arm *database.SLTPArm, bid float64) {
 	log.Printf("SLTPMonitor: TP-ceiling fire user=%d token=%s bid=%.4f sharesRaw=%d",
 		arm.TelegramID, arm.TokenID, bid, sharesRaw)
 	result := m.executor.ExecuteSell(m.ctx, arm, sharesRaw, 0, polymarket.OrderTypeGTC)
+	result, handled := m.retryTPShortfall("TP-ceiling", arm, sharesRaw, result)
+	if handled {
+		return
+	}
 	m.notifier.NotifySLTPFired(arm.TelegramID, "TP-ceiling", arm, bid, result)
 
 	// Lottery ticket: cheap insurance on the losing side. Only attempt when

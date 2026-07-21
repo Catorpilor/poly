@@ -309,6 +309,51 @@ func TestSLTPFiredText(t *testing.T) {
 	}
 }
 
+// TestSLTPStaleSizeText covers the issue #24 notices: a balance-shortfall
+// rejection means the arm's snapshot is stale — either the position is gone
+// entirely (auto-disarm) or the stop now covers fewer shares.
+func TestSLTPStaleSizeText(t *testing.T) {
+	t.Parallel()
+	arm := &database.SLTPArm{SharesAtArm: 450, Outcome: "NONGSHIM RED FORCE"}
+
+	tests := []struct {
+		name         string
+		availableRaw int64
+		want         []string
+		wantNot      []string
+	}{
+		{
+			name:         "zero balance renders auto-disarm",
+			availableRaw: 0,
+			want:         []string{"closed outside the bot", "auto-disarmed", "NONGSHIM RED FORCE"},
+			wantNot:      []string{"smaller"},
+		},
+		{
+			name:         "partial balance renders clamped coverage",
+			availableRaw: 225_000_000,
+			want: []string{"smaller than when armed", "225.00", "450.00",
+				"NONGSHIM RED FORCE", "re-arm"},
+			wantNot: []string{"auto-disarmed"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := sltpStaleSizeText(arm, tt.availableRaw)
+			for _, w := range tt.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("text missing %q:\n%s", w, got)
+				}
+			}
+			for _, w := range tt.wantNot {
+				if strings.Contains(got, w) {
+					t.Errorf("text should not contain %q:\n%s", w, got)
+				}
+			}
+		})
+	}
+}
+
 func TestSLTPArmedText(t *testing.T) {
 	t.Parallel()
 	// Fresh arm: HWM == entry (dormant).
