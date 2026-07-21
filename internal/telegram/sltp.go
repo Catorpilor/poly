@@ -227,6 +227,7 @@ func (b *Bot) handleSLTPArmCallback(ctx context.Context, update *tgbotapi.Update
 		Outcome:     normalizeOutcome(pos.Outcome),
 		AvgPrice:    pos.AveragePrice,
 		SharesAtArm: sharesFloat,
+		TickSize:    b.armTickSize(ctx, pos.TokenID),
 		NegRisk:     pos.NegativeRisk,
 	}
 
@@ -248,6 +249,21 @@ func (b *Bot) handleSLTPArmCallback(ctx context.Context, update *tgbotapi.Update
 
 	// Re-render the list so the button flips to disarm.
 	b.handleSLTPList(ctx, update)
+}
+
+// armTickSize fetches the market's minimum tick size at arm time so the TP
+// trigger can be floored to the tick grid (issue #25). Any failure falls back
+// to the CLOB-wide default of 0.01 — a fetch hiccup must never block arming.
+func (b *Bot) armTickSize(ctx context.Context, tokenID string) float64 {
+	if b.tradingClient == nil {
+		return 0.01
+	}
+	tick, err := b.tradingClient.GetMinimumTickSize(ctx, tokenID)
+	if err != nil {
+		log.Printf("SLTP arm: tick size for %s: %v — defaulting to 0.01", tokenID, err)
+		return 0.01
+	}
+	return tick
 }
 
 // handleSLTPDisarmCallback clears a user's arm for the selected position. It
@@ -410,6 +426,33 @@ func (b *Bot) NotifySLExitPending(telegramID int64, arm *database.SLTPArm, bid, 
 			"never selling below the floor.",
 		arm.Outcome, bid, trigger, floor)
 	b.sendMessage(telegramID, text)
+}
+
+// NotifySLTPStaleSize implements live.Notifier. Sent when a sell was rejected
+// because the wallet holds fewer shares than the arm-time snapshot (a manual
+// sell outside the bot, issue #24).
+func (b *Bot) NotifySLTPStaleSize(telegramID int64, arm *database.SLTPArm, availableRaw int64) {
+	b.sendMessage(telegramID, sltpStaleSizeText(arm, availableRaw))
+}
+
+// sltpStaleSizeText builds the stale-size notification body. Pure —
+// table-tested. availableRaw is the wallet's actual conditional-token balance
+// in 6-decimal raw units; 0 means the position is gone entirely.
+func sltpStaleSizeText(arm *database.SLTPArm, availableRaw int64) string {
+	if availableRaw <= 0 {
+		return fmt.Sprintf(
+			"⏹ *Position closed outside the bot — auto-disarmed*\n\n"+
+				"Your %s position no longer exists (sold or transferred outside the bot), "+
+				"so SL/TP was disarmed automatically. Nothing left to protect.",
+			arm.Outcome)
+	}
+	available := float64(availableRaw) / 1e6
+	return fmt.Sprintf(
+		"⚠️ *Position is smaller than when armed*\n\n"+
+			"Your %s wallet holds %.2f shares, but SL/TP was armed on %.2f — "+
+			"part was sold outside the bot. The stop now covers %.2f shares (was %.2f).\n\n"+
+			"Disarm and re-arm to refresh the snapshot.",
+		arm.Outcome, available, arm.SharesAtArm, available, arm.SharesAtArm)
 }
 
 // NotifySLTPPaused implements live.Notifier. Sent once per user when the monitor

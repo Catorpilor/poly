@@ -2,7 +2,10 @@ package telegram
 
 import (
 	"context"
+	"io"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -82,6 +85,52 @@ func TestResolveSLTPArm(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestArmTickSize covers the arm-time tick capture (issue #25): the market's
+// minimum_tick_size flows from the CLOB into the arm; any failure falls back
+// to 0.01 and must never block arming.
+func TestArmTickSize(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil trading client defaults to 0.01", func(t *testing.T) {
+		t.Parallel()
+		b := &Bot{}
+		if got := b.armTickSize(context.Background(), "tok"); got != 0.01 {
+			t.Errorf("armTickSize = %v, want 0.01", got)
+		}
+	})
+
+	t.Run("fetches minimum tick from the CLOB", func(t *testing.T) {
+		t.Parallel()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/book":
+				io.WriteString(w, `{"market":"cond-1"}`)
+			case strings.HasPrefix(r.URL.Path, "/markets/"):
+				io.WriteString(w, `{"minimum_tick_size":0.001}`)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+		b := &Bot{tradingClient: polymarket.NewTradingClient(srv.URL, 137)}
+		if got := b.armTickSize(context.Background(), "tok"); got != 0.001 {
+			t.Errorf("armTickSize = %v, want 0.001", got)
+		}
+	})
+
+	t.Run("CLOB error defaults to 0.01", func(t *testing.T) {
+		t.Parallel()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+		b := &Bot{tradingClient: polymarket.NewTradingClient(srv.URL, 137)}
+		if got := b.armTickSize(context.Background(), "tok"); got != 0.01 {
+			t.Errorf("armTickSize = %v, want 0.01", got)
+		}
+	})
 }
 
 func TestSharesBigIntToFloat(t *testing.T) {
@@ -246,6 +295,51 @@ func TestSLTPFiredText(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			got := sltpFiredText(tt.kind, arm, 0.80, tt.result)
+			for _, w := range tt.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("text missing %q:\n%s", w, got)
+				}
+			}
+			for _, w := range tt.wantNot {
+				if strings.Contains(got, w) {
+					t.Errorf("text should not contain %q:\n%s", w, got)
+				}
+			}
+		})
+	}
+}
+
+// TestSLTPStaleSizeText covers the issue #24 notices: a balance-shortfall
+// rejection means the arm's snapshot is stale — either the position is gone
+// entirely (auto-disarm) or the stop now covers fewer shares.
+func TestSLTPStaleSizeText(t *testing.T) {
+	t.Parallel()
+	arm := &database.SLTPArm{SharesAtArm: 450, Outcome: "NONGSHIM RED FORCE"}
+
+	tests := []struct {
+		name         string
+		availableRaw int64
+		want         []string
+		wantNot      []string
+	}{
+		{
+			name:         "zero balance renders auto-disarm",
+			availableRaw: 0,
+			want:         []string{"closed outside the bot", "auto-disarmed", "NONGSHIM RED FORCE"},
+			wantNot:      []string{"smaller"},
+		},
+		{
+			name:         "partial balance renders clamped coverage",
+			availableRaw: 225_000_000,
+			want: []string{"smaller than when armed", "225.00", "450.00",
+				"NONGSHIM RED FORCE", "re-arm"},
+			wantNot: []string{"auto-disarmed"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := sltpStaleSizeText(arm, tt.availableRaw)
 			for _, w := range tt.want {
 				if !strings.Contains(got, w) {
 					t.Errorf("text missing %q:\n%s", w, got)

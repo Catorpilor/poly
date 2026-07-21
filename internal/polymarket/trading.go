@@ -15,6 +15,7 @@ import (
 	"math"
 	"math/big"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -97,6 +98,35 @@ type TradeResult struct {
 	ErrorMsg     string
 	FilledSize   float64
 	AveragePrice float64
+	// InsufficientBalance marks a CLOB rejection caused by the wallet holding
+	// fewer conditional tokens than the order size (e.g. a manual sell outside
+	// the bot after arming). AvailableSharesRaw is the wallet's actual balance
+	// reported in the rejection, in 6-decimal raw units — callers clamp
+	// retries to it instead of resubmitting a doomed order. (issue #24)
+	InsufficientBalance bool
+	AvailableSharesRaw  int64
+}
+
+// balanceShortfallRe matches the CLOB's balance-shortfall rejection, e.g.
+// "not enough balance / allowance: the balance is not enough -> balance:
+// 225000000, order amount: 450000000". The first capture is the wallet's
+// actual conditional-token balance in 6-decimal raw units.
+var balanceShortfallRe = regexp.MustCompile(`balance is not enough -> balance: (\d+), order amount: (\d+)`)
+
+// annotateBalanceShortfall inspects a failed order response body for the
+// CLOB's balance-shortfall rejection and, when present, marks the result so
+// the SL/TP monitor can react to a stale share snapshot. (issue #24)
+func annotateBalanceShortfall(res *TradeResult, body string) {
+	m := balanceShortfallRe.FindStringSubmatch(body)
+	if m == nil {
+		return
+	}
+	avail, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil {
+		return
+	}
+	res.InsufficientBalance = true
+	res.AvailableSharesRaw = avail
 }
 
 // OrderBookEntry represents an entry in the order book
@@ -824,7 +854,9 @@ func (tc *TradingClient) submitOrder(
 	log.Printf("Order response: %s", string(respBody))
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return &TradeResult{Success: false, ErrorMsg: fmt.Sprintf("Order failed: %s", string(respBody))}, nil
+		failed := &TradeResult{Success: false, ErrorMsg: fmt.Sprintf("Order failed: %s", string(respBody))}
+		annotateBalanceShortfall(failed, string(respBody))
+		return failed, nil
 	}
 
 	var result struct {
@@ -852,6 +884,11 @@ func (tc *TradingClient) submitOrder(
 		OrderID:   result.OrderID,
 		OrderHash: strings.Join(result.OrderHashes, ","),
 		ErrorMsg:  result.ErrorMsg,
+	}
+	if !base.Success {
+		// The CLOB has also been seen returning the balance-shortfall
+		// rejection in a 200 body ({"error": ...}); classify that path too.
+		annotateBalanceShortfall(base, string(respBody))
 	}
 
 	// Success is per order type. For FOK it must mean a CONFIRMED FILL — an

@@ -151,9 +151,9 @@ func (s *fakeStore) armedCount(tokenID string) int {
 }
 
 type fakeFeed struct {
-	mu            sync.Mutex
-	bids          map[string]float64
-	asks          map[string]float64
+	mu   sync.Mutex
+	bids map[string]float64
+	asks map[string]float64
 	// fallbackBids overrides the value returned by BidWithFallback when set.
 	// The string is the source returned ("ws"/"http"); empty means "use bids".
 	fallbackBids   map[string]float64
@@ -272,11 +272,11 @@ type fakeExecutor struct {
 
 	// Lottery-related fields. When unset, ResolveOtherToken returns the
 	// configured "<armToken>-other" stub and ExecuteLotteryBuy succeeds.
-	otherTokenID    string
-	otherOutcome    string
-	resolveErr      error
-	lotteryRet      *polymarket.TradeResult
-	lotteryCalls    []lotteryCall
+	otherTokenID string
+	otherOutcome string
+	resolveErr   error
+	lotteryRet   *polymarket.TradeResult
+	lotteryCalls []lotteryCall
 }
 
 type executorCall struct {
@@ -347,11 +347,18 @@ func (e *fakeExecutor) ExecuteLotteryBuy(_ context.Context, arm *database.SLTPAr
 }
 
 type fakeNotifier struct {
-	mu       sync.Mutex
-	fires    []fireNotice
-	paused   []int64 // telegramIDs notified of pause
+	mu        sync.Mutex
+	fires     []fireNotice
+	paused    []int64 // telegramIDs notified of pause
 	lotteries []lotteryNotice
-	pendings []pendingNotice
+	pendings  []pendingNotice
+	stales    []staleNotice
+}
+
+type staleNotice struct {
+	telegramID   int64
+	armID        int
+	availableRaw int64
 }
 
 type pendingNotice struct {
@@ -388,6 +395,12 @@ func (n *fakeNotifier) NotifySLExitPending(telegramID int64, arm *database.SLTPA
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.pendings = append(n.pendings, pendingNotice{telegramID, arm.ID, bid, trigger, floor})
+}
+
+func (n *fakeNotifier) NotifySLTPStaleSize(telegramID int64, arm *database.SLTPArm, availableRaw int64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.stales = append(n.stales, staleNotice{telegramID, arm.ID, availableRaw})
 }
 
 func (n *fakeNotifier) NotifySLTPPaused(telegramID int64, _ *database.SLTPArm) {
@@ -536,6 +549,38 @@ func TestSLTPMonitor_TPFiresAt2x(t *testing.T) {
 	}
 	if !still.SLArmed {
 		t.Error("sl_armed should still be true")
+	}
+}
+
+// TestSLTPMonitor_TPFiresOnTickGridBid is the issue #25 regression: entry
+// 0.2355 doubles to 0.471, which a 0.01-tick book can never print. The bid
+// peaked at exactly 0.4700 twice in production and the TP never fired. With
+// the trigger floored to the arm's tick grid, bid 0.47 must fire.
+func TestSLTPMonitor_TPFiresOnTickGridBid(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 90, TelegramID: 71, TokenID: "G1", AvgPrice: 0.2355, SharesAtArm: 450,
+		TickSize: 0.01, TPArmed: true, SLArmed: true})
+
+	feed := newFakeFeed()
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	_ = m.Start()
+
+	feed.setBid("G1", 0.47)
+	feed.emit("G1")
+
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.fires) == 1
+	})
+
+	notif.mu.Lock()
+	defer notif.mu.Unlock()
+	if notif.fires[0].kind != "TP" {
+		t.Errorf("expected TP fire at grid bid 0.47, got kind=%q", notif.fires[0].kind)
 	}
 }
 
@@ -1691,6 +1736,13 @@ func TestSLTPMonitor_SL_FOKFailureKeepsArmAndNotifiesPendingOnce(t *testing.T) {
 	if diff := pending.floor - 0.468; diff > 1e-9 || diff < -1e-9 {
 		t.Errorf("pending floor = %v, want 0.468", pending.floor)
 	}
+	// A plain FOK kill is NOT a stale-size case (issue #24 regression guard).
+	notif.mu.Lock()
+	stales := len(notif.stales)
+	notif.mu.Unlock()
+	if stales != 0 {
+		t.Errorf("plain FOK kill must not send a stale-size notice, got %d", stales)
+	}
 
 	// More breach evaluations inside the retry interval: still exactly one
 	// attempt and one pending notice.
@@ -2009,5 +2061,261 @@ func TestSLTPMonitor_SL_RearmMidBreachResets(t *testing.T) {
 	exec.mu.Unlock()
 	if calls != 0 {
 		t.Errorf("re-armed (dormant) arm must not fire from stale breach state, got %d", calls)
+	}
+}
+
+// --- stale share snapshot (issue #24) ---
+
+// shortfallResult builds the failed TradeResult the trading client produces
+// for the CLOB's "not enough balance" rejection.
+func shortfallResult(availableRaw int64) *polymarket.TradeResult {
+	return &polymarket.TradeResult{
+		Success:             false,
+		ErrorMsg:            "Order failed: not enough balance / allowance",
+		InsufficientBalance: true,
+		AvailableSharesRaw:  availableRaw,
+	}
+}
+
+// TestSLTPMonitor_SL_ShortfallClampsRetryToBalance is the issue #24 core
+// case: arm snapshot 450 shares, 225 manually sold outside the bot. The
+// first SL attempt is rejected with the wallet's actual balance; the user
+// gets ONE stale-size notice (never the misleading thin-book pending), and
+// every later attempt sells the clamped size instead of the doomed 450.
+func TestSLTPMonitor_SL_ShortfallClampsRetryToBalance(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 100, TelegramID: 81, TokenID: "S1", AvgPrice: 0.50, SharesAtArm: 450,
+		HighWaterMark: 0.65, TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{ret: shortfallResult(225_000_000)}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("S1", 0.45)
+	feed.emit("S1")
+	waitFor(t, func() bool { return breachStamped(m, 100) })
+	clock.advance(31 * time.Second)
+	feed.emit("S1")
+
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.stales) == 1
+	})
+
+	notif.mu.Lock()
+	stale := notif.stales[0]
+	pendings := len(notif.pendings)
+	notif.mu.Unlock()
+	if stale.telegramID != 81 || stale.armID != 100 || stale.availableRaw != 225_000_000 {
+		t.Errorf("stale notice = %+v, want user 81 arm 100 available 225000000", stale)
+	}
+	if pendings != 0 {
+		t.Errorf("balance shortfall must not send the thin-book pending notice, got %d", pendings)
+	}
+	exec.mu.Lock()
+	first := exec.calls[0].sharesRaw
+	exec.mu.Unlock()
+	if first != int64(450*1e6) {
+		t.Errorf("first attempt sharesRaw = %d, want 450e6 (snapshot)", first)
+	}
+
+	// Arm survives; the next retry sells the clamped size.
+	if store.armedCount("S1") != 1 {
+		t.Errorf("arm should survive a shortfall, got %d armed", store.armedCount("S1"))
+	}
+	clock.advance(31 * time.Second)
+	feed.emit("S1")
+	waitFor(t, func() bool {
+		exec.mu.Lock()
+		defer exec.mu.Unlock()
+		return len(exec.calls) == 2
+	})
+	exec.mu.Lock()
+	second := exec.calls[1].sharesRaw
+	exec.mu.Unlock()
+	if second != 225_000_000 {
+		t.Errorf("retry sharesRaw = %d, want clamped 225000000", second)
+	}
+
+	// Second shortfall in the same episode: still exactly one stale notice.
+	time.Sleep(50 * time.Millisecond)
+	notif.mu.Lock()
+	stales := len(notif.stales)
+	notif.mu.Unlock()
+	if stales != 1 {
+		t.Errorf("expected 1 stale notice per episode, got %d", stales)
+	}
+}
+
+// TestSLTPMonitor_SL_ShortfallZeroDisarms: the wallet holds nothing — the
+// position was fully closed outside the bot. The arm is auto-disarmed, the
+// user told once, and no further sell attempts happen.
+func TestSLTPMonitor_SL_ShortfallZeroDisarms(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 101, TelegramID: 82, TokenID: "S2", AvgPrice: 0.50, SharesAtArm: 450,
+		HighWaterMark: 0.65, TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{ret: shortfallResult(0)}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("S2", 0.45)
+	feed.emit("S2")
+	waitFor(t, func() bool { return breachStamped(m, 101) })
+	clock.advance(31 * time.Second)
+	feed.emit("S2")
+
+	waitFor(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.disarmCalls == 1
+	})
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.stales) == 1
+	})
+
+	notif.mu.Lock()
+	stale := notif.stales[0]
+	pendings := len(notif.pendings)
+	fires := len(notif.fires)
+	notif.mu.Unlock()
+	if stale.availableRaw != 0 {
+		t.Errorf("stale notice availableRaw = %d, want 0", stale.availableRaw)
+	}
+	if pendings != 0 || fires != 0 {
+		t.Errorf("zero-balance shortfall must send only the stale notice, got %d pendings / %d fires", pendings, fires)
+	}
+	if store.armedCount("S2") != 0 {
+		t.Errorf("arm should be auto-disarmed, got %d armed", store.armedCount("S2"))
+	}
+	waitFor(t, func() bool {
+		feed.mu.Lock()
+		defer feed.mu.Unlock()
+		return len(feed.unsubscribes) == 1 && feed.unsubscribes[0] == "S2"
+	})
+
+	// Later evaluations must never sell again.
+	clock.advance(31 * time.Second)
+	feed.emit("S2")
+	time.Sleep(50 * time.Millisecond)
+	exec.mu.Lock()
+	calls := len(exec.calls)
+	exec.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("gone position must never be re-sold, got %d attempts", calls)
+	}
+}
+
+// TestSLTPMonitor_TP_ShortfallRetriesClamped: a TP half-sell rejected for
+// balance shortfall retries exactly once, immediately, clamped to the
+// wallet's actual balance.
+func TestSLTPMonitor_TP_ShortfallRetriesClamped(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	// TP trigger = 0.40; intended TP sell = 50% of 450 = 225e6 raw.
+	store.seed(&database.SLTPArm{ID: 102, TelegramID: 83, TokenID: "S3", AvgPrice: 0.20, SharesAtArm: 450,
+		TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{ret: shortfallResult(100_000_000)}
+	notif := &fakeNotifier{}
+	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	_ = m.Start()
+
+	feed.setBid("S3", 0.41)
+	feed.emit("S3")
+
+	waitFor(t, func() bool {
+		exec.mu.Lock()
+		defer exec.mu.Unlock()
+		return len(exec.calls) == 2
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	exec.mu.Lock()
+	calls := make([]executorCall, len(exec.calls))
+	copy(calls, exec.calls)
+	exec.mu.Unlock()
+	if len(calls) != 2 {
+		t.Fatalf("expected exactly 2 sell attempts (original + one clamped retry), got %d", len(calls))
+	}
+	if calls[0].sharesRaw != int64(450*0.50*1e6) {
+		t.Errorf("original TP sharesRaw = %d, want 225e6", calls[0].sharesRaw)
+	}
+	if calls[1].sharesRaw != 100_000_000 {
+		t.Errorf("retry sharesRaw = %d, want clamped 100000000", calls[1].sharesRaw)
+	}
+	if calls[1].orderType != polymarket.OrderTypeGTC || calls[1].limitPrice != 0 {
+		t.Errorf("retry should stay a market-style GTC, got (%v, %v)", calls[1].limitPrice, calls[1].orderType)
+	}
+
+	// The fire notice reflects the retry's outcome; the arm is not disarmed.
+	notif.mu.Lock()
+	fires := len(notif.fires)
+	notif.mu.Unlock()
+	if fires != 1 {
+		t.Errorf("expected 1 TP fire notice, got %d", fires)
+	}
+	store.mu.Lock()
+	disarms := store.disarmCalls
+	store.mu.Unlock()
+	if disarms != 0 {
+		t.Errorf("TP shortfall > 0 must not disarm, got %d", disarms)
+	}
+}
+
+// TestSLTPMonitor_TP_ShortfallZeroDisarms: a TP sell rejected with zero
+// balance means the whole position is gone — disarm the arm, tell the user,
+// and skip the fired notice.
+func TestSLTPMonitor_TP_ShortfallZeroDisarms(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 103, TelegramID: 84, TokenID: "S4", AvgPrice: 0.20, SharesAtArm: 450,
+		TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{ret: shortfallResult(0)}
+	notif := &fakeNotifier{}
+	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	_ = m.Start()
+
+	feed.setBid("S4", 0.41)
+	feed.emit("S4")
+
+	waitFor(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.disarmCalls == 1
+	})
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.stales) == 1
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	notif.mu.Lock()
+	stale := notif.stales[0]
+	fires := len(notif.fires)
+	notif.mu.Unlock()
+	if stale.telegramID != 84 || stale.availableRaw != 0 {
+		t.Errorf("stale notice = %+v, want user 84 available 0", stale)
+	}
+	if fires != 0 {
+		t.Errorf("gone position must not produce a fired notice, got %d", fires)
+	}
+	exec.mu.Lock()
+	calls := len(exec.calls)
+	exec.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("expected exactly 1 sell attempt (no retry at zero balance), got %d", calls)
+	}
+	if store.armedCount("S4") != 0 {
+		t.Errorf("arm should be auto-disarmed, got %d armed", store.armedCount("S4"))
 	}
 }

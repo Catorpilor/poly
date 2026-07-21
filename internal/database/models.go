@@ -4,6 +4,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -39,10 +40,10 @@ func (j *JSONB) Scan(src interface{}) error {
 
 // User represents a Telegram bot user
 type User struct {
-	TelegramID   int64     `json:"telegram_id" db:"telegram_id"`
-	Username     string    `json:"username" db:"username"`
-	EOAAddress   string    `json:"eoa_address" db:"eoa_address"`
-	ProxyAddress string    `json:"proxy_address" db:"proxy_address"`
+	TelegramID   int64  `json:"telegram_id" db:"telegram_id"`
+	Username     string `json:"username" db:"username"`
+	EOAAddress   string `json:"eoa_address" db:"eoa_address"`
+	ProxyAddress string `json:"proxy_address" db:"proxy_address"`
 	// AccountType classifies the trading account architecture
 	// (legacy_proxy | safe | deposit_wallet) so the order signer can pick the
 	// right signature type. Empty is treated as legacy_proxy by the repository.
@@ -60,21 +61,26 @@ type User struct {
 // avg_price and shares_at_arm are snapshotted at arm time so threshold evaluation is
 // deterministic and independent of later Data API drift.
 type SLTPArm struct {
-	ID                 int       `json:"id" db:"id"`
-	TelegramID         int64     `json:"telegram_id" db:"telegram_id"`
-	TokenID            string    `json:"token_id" db:"token_id"`
-	ConditionID        string    `json:"condition_id" db:"condition_id"`
-	MarketID           *string   `json:"market_id" db:"market_id"`
-	Outcome            Outcome   `json:"outcome" db:"outcome"`
-	AvgPrice           float64   `json:"avg_price" db:"avg_price"`
-	SharesAtArm        float64   `json:"shares_at_arm" db:"shares_at_arm"`
+	ID          int     `json:"id" db:"id"`
+	TelegramID  int64   `json:"telegram_id" db:"telegram_id"`
+	TokenID     string  `json:"token_id" db:"token_id"`
+	ConditionID string  `json:"condition_id" db:"condition_id"`
+	MarketID    *string `json:"market_id" db:"market_id"`
+	Outcome     Outcome `json:"outcome" db:"outcome"`
+	AvgPrice    float64 `json:"avg_price" db:"avg_price"`
+	SharesAtArm float64 `json:"shares_at_arm" db:"shares_at_arm"`
 	// HighWaterMark is the highest best-bid observed since arm/re-arm, seeded
 	// to AvgPrice. The trailing SL is dormant until it reaches
 	// AvgPrice*SLActivationMult; the monitor ratchets it monotonically.
-	HighWaterMark      float64   `json:"high_water_mark" db:"high_water_mark"`
-	TPArmed            bool      `json:"tp_armed" db:"tp_armed"`
-	SLArmed            bool      `json:"sl_armed" db:"sl_armed"`
-	NegRisk            bool      `json:"neg_risk" db:"neg_risk"`
+	HighWaterMark float64 `json:"high_water_mark" db:"high_water_mark"`
+	// TickSize is the market's minimum price increment, captured at arm time
+	// from the CLOB. The TP trigger is floored to this grid so it lands on a
+	// price the best bid can actually print (issue #25). Zero (legacy rows,
+	// fetch failures) falls back to 0.01.
+	TickSize float64 `json:"tick_size" db:"tick_size"`
+	TPArmed  bool    `json:"tp_armed" db:"tp_armed"`
+	SLArmed  bool    `json:"sl_armed" db:"sl_armed"`
+	NegRisk  bool    `json:"neg_risk" db:"neg_risk"`
 	// LotteryTicketArmed: when the ceiling-TP fires, optionally also attempt a
 	// FOK BUY of the OPPOSITE token at <= LotteryMaxPrice with up to
 	// LotteryMaxSpend USDC. Cheap "what if it flips" insurance.
@@ -116,11 +122,30 @@ const LotteryMaxPrice = 0.05
 // At LotteryMaxPrice this implies a 100-share max take.
 const LotteryMaxSpend = 5.0
 
-// TPTriggerPrice returns the bid threshold for TP on this arm, capped at 0.99.
+// TPTriggerPrice returns the bid threshold for TP on this arm: avg_price ×
+// TPMultiplier, capped at 0.99, then floored to the market's tick grid so the
+// trigger is a price the best bid can actually reach (issue #25: entry 0.2355
+// doubled to 0.471 on a 0.01-tick book, where only 0.47 or 0.48 can print —
+// the effective threshold was silently 0.48). The 1e-6 epsilon absorbs float
+// artifacts: an exactly-on-grid price like 0.47 divided by 0.01 can evaluate
+// just below 47.0 and would otherwise floor a full tick down.
 func (a *SLTPArm) TPTriggerPrice() float64 {
 	p := a.AvgPrice * TPMultiplier
 	if p > 0.99 {
-		return 0.99
+		p = 0.99
+	}
+	tick := a.TickSize
+	if tick <= 0 {
+		tick = 0.01
+	}
+	p = math.Floor(p/tick+1e-6) * tick
+	// n×tick can land a hair above the float the book actually prints
+	// (47×0.01 = 0.47000000000000003 > float64(0.47)), which would make the
+	// monitor's bid >= trigger comparison miss by ~5e-17. Prices are
+	// 6-decimal fixed point on the CLOB; snap to that precision.
+	p = math.Round(p*1e6) / 1e6
+	if p < tick {
+		p = tick
 	}
 	return p
 }
