@@ -227,6 +227,7 @@ func (b *Bot) handleSLTPArmCallback(ctx context.Context, update *tgbotapi.Update
 		Outcome:     normalizeOutcome(pos.Outcome),
 		AvgPrice:    pos.AveragePrice,
 		SharesAtArm: sharesFloat,
+		TickSize:    b.armTickSize(ctx, pos.TokenID),
 		NegRisk:     pos.NegativeRisk,
 	}
 
@@ -248,6 +249,21 @@ func (b *Bot) handleSLTPArmCallback(ctx context.Context, update *tgbotapi.Update
 
 	// Re-render the list so the button flips to disarm.
 	b.handleSLTPList(ctx, update)
+}
+
+// armTickSize fetches the market's minimum tick size at arm time so the TP
+// trigger can be floored to the tick grid (issue #25). Any failure falls back
+// to the CLOB-wide default of 0.01 — a fetch hiccup must never block arming.
+func (b *Bot) armTickSize(ctx context.Context, tokenID string) float64 {
+	if b.tradingClient == nil {
+		return 0.01
+	}
+	tick, err := b.tradingClient.GetMinimumTickSize(ctx, tokenID)
+	if err != nil {
+		log.Printf("SLTP arm: tick size for %s: %v — defaulting to 0.01", tokenID, err)
+		return 0.01
+	}
+	return tick
 }
 
 // handleSLTPDisarmCallback clears a user's arm for the selected position. It

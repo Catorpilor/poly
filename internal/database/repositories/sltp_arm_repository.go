@@ -66,14 +66,14 @@ func NewSLTPArmRepository(db *database.DB) SLTPArmRepository {
 }
 
 const sltpArmColumns = `id, telegram_id, token_id, condition_id, market_id, outcome,
-		avg_price, shares_at_arm, high_water_mark, tp_armed, sl_armed, neg_risk, lottery_ticket_armed,
+		avg_price, shares_at_arm, high_water_mark, tick_size, tp_armed, sl_armed, neg_risk, lottery_ticket_armed,
 		created_at, updated_at`
 
 func scanArm(row pgx.Row) (*database.SLTPArm, error) {
 	a := &database.SLTPArm{}
 	if err := row.Scan(
 		&a.ID, &a.TelegramID, &a.TokenID, &a.ConditionID, &a.MarketID, &a.Outcome,
-		&a.AvgPrice, &a.SharesAtArm, &a.HighWaterMark, &a.TPArmed, &a.SLArmed, &a.NegRisk, &a.LotteryTicketArmed,
+		&a.AvgPrice, &a.SharesAtArm, &a.HighWaterMark, &a.TickSize, &a.TPArmed, &a.SLArmed, &a.NegRisk, &a.LotteryTicketArmed,
 		&a.CreatedAt, &a.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -86,11 +86,18 @@ func (r *sltpArmRepo) Arm(ctx context.Context, arm *database.SLTPArm) (*database
 		return nil, fmt.Errorf("invalid arm: %w", err)
 	}
 
+	// Legacy callers may leave TickSize unset; the column's CHECK requires a
+	// positive tick, so normalize to the CLOB-wide default here.
+	tickSize := arm.TickSize
+	if tickSize <= 0 {
+		tickSize = 0.01
+	}
+
 	query := `
 		INSERT INTO sltp_arms (
 			telegram_id, token_id, condition_id, market_id, outcome,
-			avg_price, shares_at_arm, high_water_mark, tp_armed, sl_armed, neg_risk
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $6, TRUE, TRUE, $8)
+			avg_price, shares_at_arm, high_water_mark, tick_size, tp_armed, sl_armed, neg_risk
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $6, $8, TRUE, TRUE, $9)
 		ON CONFLICT (telegram_id, token_id) DO UPDATE SET
 			condition_id = EXCLUDED.condition_id,
 			market_id = EXCLUDED.market_id,
@@ -98,6 +105,7 @@ func (r *sltpArmRepo) Arm(ctx context.Context, arm *database.SLTPArm) (*database
 			avg_price = EXCLUDED.avg_price,
 			shares_at_arm = EXCLUDED.shares_at_arm,
 			high_water_mark = EXCLUDED.avg_price,
+			tick_size = EXCLUDED.tick_size,
 			tp_armed = TRUE,
 			sl_armed = TRUE,
 			neg_risk = EXCLUDED.neg_risk
@@ -105,7 +113,7 @@ func (r *sltpArmRepo) Arm(ctx context.Context, arm *database.SLTPArm) (*database
 
 	row := r.db.Pool.QueryRow(ctx, query,
 		arm.TelegramID, arm.TokenID, arm.ConditionID, arm.MarketID, arm.Outcome,
-		arm.AvgPrice, arm.SharesAtArm, arm.NegRisk,
+		arm.AvgPrice, arm.SharesAtArm, tickSize, arm.NegRisk,
 	)
 	result, err := scanArm(row)
 	if err != nil {

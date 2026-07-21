@@ -2,7 +2,10 @@ package telegram
 
 import (
 	"context"
+	"io"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -82,6 +85,52 @@ func TestResolveSLTPArm(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestArmTickSize covers the arm-time tick capture (issue #25): the market's
+// minimum_tick_size flows from the CLOB into the arm; any failure falls back
+// to 0.01 and must never block arming.
+func TestArmTickSize(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil trading client defaults to 0.01", func(t *testing.T) {
+		t.Parallel()
+		b := &Bot{}
+		if got := b.armTickSize(context.Background(), "tok"); got != 0.01 {
+			t.Errorf("armTickSize = %v, want 0.01", got)
+		}
+	})
+
+	t.Run("fetches minimum tick from the CLOB", func(t *testing.T) {
+		t.Parallel()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/book":
+				io.WriteString(w, `{"market":"cond-1"}`)
+			case strings.HasPrefix(r.URL.Path, "/markets/"):
+				io.WriteString(w, `{"minimum_tick_size":0.001}`)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+		b := &Bot{tradingClient: polymarket.NewTradingClient(srv.URL, 137)}
+		if got := b.armTickSize(context.Background(), "tok"); got != 0.001 {
+			t.Errorf("armTickSize = %v, want 0.001", got)
+		}
+	})
+
+	t.Run("CLOB error defaults to 0.01", func(t *testing.T) {
+		t.Parallel()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+		b := &Bot{tradingClient: polymarket.NewTradingClient(srv.URL, 137)}
+		if got := b.armTickSize(context.Background(), "tok"); got != 0.01 {
+			t.Errorf("armTickSize = %v, want 0.01", got)
+		}
+	})
 }
 
 func TestSharesBigIntToFloat(t *testing.T) {

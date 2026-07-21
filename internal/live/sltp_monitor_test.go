@@ -151,9 +151,9 @@ func (s *fakeStore) armedCount(tokenID string) int {
 }
 
 type fakeFeed struct {
-	mu            sync.Mutex
-	bids          map[string]float64
-	asks          map[string]float64
+	mu   sync.Mutex
+	bids map[string]float64
+	asks map[string]float64
 	// fallbackBids overrides the value returned by BidWithFallback when set.
 	// The string is the source returned ("ws"/"http"); empty means "use bids".
 	fallbackBids   map[string]float64
@@ -272,11 +272,11 @@ type fakeExecutor struct {
 
 	// Lottery-related fields. When unset, ResolveOtherToken returns the
 	// configured "<armToken>-other" stub and ExecuteLotteryBuy succeeds.
-	otherTokenID    string
-	otherOutcome    string
-	resolveErr      error
-	lotteryRet      *polymarket.TradeResult
-	lotteryCalls    []lotteryCall
+	otherTokenID string
+	otherOutcome string
+	resolveErr   error
+	lotteryRet   *polymarket.TradeResult
+	lotteryCalls []lotteryCall
 }
 
 type executorCall struct {
@@ -347,11 +347,11 @@ func (e *fakeExecutor) ExecuteLotteryBuy(_ context.Context, arm *database.SLTPAr
 }
 
 type fakeNotifier struct {
-	mu       sync.Mutex
-	fires    []fireNotice
-	paused   []int64 // telegramIDs notified of pause
+	mu        sync.Mutex
+	fires     []fireNotice
+	paused    []int64 // telegramIDs notified of pause
 	lotteries []lotteryNotice
-	pendings []pendingNotice
+	pendings  []pendingNotice
 }
 
 type pendingNotice struct {
@@ -536,6 +536,38 @@ func TestSLTPMonitor_TPFiresAt2x(t *testing.T) {
 	}
 	if !still.SLArmed {
 		t.Error("sl_armed should still be true")
+	}
+}
+
+// TestSLTPMonitor_TPFiresOnTickGridBid is the issue #25 regression: entry
+// 0.2355 doubles to 0.471, which a 0.01-tick book can never print. The bid
+// peaked at exactly 0.4700 twice in production and the TP never fired. With
+// the trigger floored to the arm's tick grid, bid 0.47 must fire.
+func TestSLTPMonitor_TPFiresOnTickGridBid(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 90, TelegramID: 71, TokenID: "G1", AvgPrice: 0.2355, SharesAtArm: 450,
+		TickSize: 0.01, TPArmed: true, SLArmed: true})
+
+	feed := newFakeFeed()
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	_ = m.Start()
+
+	feed.setBid("G1", 0.47)
+	feed.emit("G1")
+
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.fires) == 1
+	})
+
+	notif.mu.Lock()
+	defer notif.mu.Unlock()
+	if notif.fires[0].kind != "TP" {
+		t.Errorf("expected TP fire at grid bid 0.47, got kind=%q", notif.fires[0].kind)
 	}
 }
 

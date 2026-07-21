@@ -10,21 +10,34 @@ func TestSLTPArm_TPTriggerPrice(t *testing.T) {
 	tests := []struct {
 		name     string
 		avgPrice float64
+		tickSize float64
 		want     float64
 	}{
-		{"normal entry doubles", 0.20, 0.40},
-		{"low entry doubles fine", 0.05, 0.10},
-		{"mid entry caps at 0.99", 0.50, 0.99},
-		{"high entry caps at 0.99", 0.80, 0.99},
-		{"exactly half just below cap", 0.495, 0.99},
+		{"normal entry doubles", 0.20, 0.01, 0.40},
+		{"low entry doubles fine", 0.05, 0.01, 0.10},
+		{"mid entry caps at 0.99", 0.50, 0.01, 0.99},
+		{"high entry caps at 0.99", 0.80, 0.01, 0.99},
+		{"exactly half just below cap", 0.495, 0.01, 0.99},
+		// issue #25: entry 0.2355 doubles to 0.471, which a 0.01-tick book
+		// can never print — the bid peaked at exactly 0.47 in production and
+		// the TP never fired. The trigger must floor to the tick grid.
+		{"off-grid double floors to tick (production case)", 0.2355, 0.01, 0.47},
+		{"on-grid double unchanged", 0.34, 0.01, 0.68},
+		{"finer grid keeps 0.471", 0.2355, 0.001, 0.471},
+		// 0.47/0.01 evaluates just below 47.0 in float64; the 1e-6 epsilon
+		// must keep an exactly-on-grid trigger from flooring a full tick down.
+		{"float artifact stays on grid", 0.235, 0.01, 0.47},
+		{"cap applies before flooring", 0.60, 0.01, 0.99},
+		{"tiny entry clamps to one tick", 0.003, 0.01, 0.01},
+		{"zero tick falls back to 0.01 grid", 0.2355, 0, 0.47},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			a := &SLTPArm{AvgPrice: tt.avgPrice}
+			a := &SLTPArm{AvgPrice: tt.avgPrice, TickSize: tt.tickSize}
 			got := a.TPTriggerPrice()
 			if diff := got - tt.want; diff > 1e-9 || diff < -1e-9 {
-				t.Errorf("TPTriggerPrice(avg=%v) = %v, want %v", tt.avgPrice, got, tt.want)
+				t.Errorf("TPTriggerPrice(avg=%v, tick=%v) = %v, want %v", tt.avgPrice, tt.tickSize, got, tt.want)
 			}
 		})
 	}
