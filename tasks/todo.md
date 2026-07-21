@@ -283,3 +283,64 @@ a later SL under-sell by half — documented on issue #22, not fixed.
 
 NOT deployed — user gates tag/deploy. Smoke: first production FOK SELL on
 an in-play market must confirm one real fill before trusting broadly.
+
+---
+
+# SL/TP: tick-grid TP trigger (#25) + stale-size shortfall handling (#24) — 2026-07-21
+
+Branch `fix/sltp-stale-size-and-tick-grid`, TDD red→green per stage,
+one commit per issue.
+
+## Issue #25 — TP trigger lands off the tick grid
+- [x] TDD: TPTriggerPrice table extended — production case 0.2355→0.47
+      (tick 0.01), 0.34→0.68, 0.2355→0.471 (tick 0.001), float-artifact
+      0.235→0.47 (1e-6 epsilon), cap 0.60→0.99, tiny 0.003→0.01 clamp,
+      TickSize 0 → 0.01 fallback; monitor regression: avg 0.2355 +
+      bid 0.47 must fire TP (did not fire in production)
+- [x] migrations/009: sltp_arms.tick_size DECIMAL(6,4) NOT NULL
+      DEFAULT 0.01 CHECK (0, 0.1] (+ .down.sql)
+- [x] SLTPArm.TickSize; TPTriggerPrice caps at 0.99 then floors to the
+      grid; extra finding: n×tick can float above the book's price
+      (47×0.01 > float64(0.47)) — snapped to 6-decimal precision so the
+      monitor's bid >= trigger comparison is exact
+- [x] Repository: tick_size in columns/scan/INSERT + DO UPDATE SET;
+      repo normalizes tick <= 0 → 0.01 (column CHECK requires > 0)
+- [x] Arm flow: armTickSize() fetches CLOB minimum_tick_size at arm
+      time, defaults to 0.01 on any error (never blocks arming);
+      table-tested against httptest fake CLOB
+- [x] Display: armed/list text interpolates TPTriggerPrice() — shows
+      the effective grid price automatically; no expected-text changes
+      needed (0.99 cap case still renders $0.9900)
+
+## Issue #24 — doomed retries after manual partial sell
+- [x] TDD: exact production rejection body classified (400 and
+      200-error-body paths); unrelated rejections not annotated
+- [x] TradeResult.InsufficientBalance + AvailableSharesRaw (regexp on
+      "balance is not enough -> balance: (\d+), order amount: (\d+)")
+- [x] SL: shortfall > 0 → clamp later attempts to min(snapshot,
+      balance), one stale-size notice per episode INSTEAD of thin-book
+      pending; shortfall == 0 → latch sold-state (never resell),
+      auto-disarm, notify, unsubscribe-if-last
+- [x] TP + ceiling-TP: shared retryTPShortfall — one immediate clamped
+      retry (> 0) or full disarm + auto-disarm notice, fired notice
+      skipped (== 0)
+- [x] Notifier.NotifySLTPStaleSize + telegram impl + pure
+      sltpStaleSizeText (table-tested)
+- [x] Monitor tests: SL>0 (one stale, zero pendings, clamped retry),
+      SL=0 (one disarm, no further sells), TP>0 (exactly two executor
+      calls, second clamped, GTC), TP=0 (disarm, no fired notice);
+      regression: plain FOK kill still keeps arm + thin-book pending,
+      zero stale notices
+
+## Verification
+- [x] go test ./... green
+- [x] go test -race on live, polymarket, database, telegram (run
+      per-package — RPi)
+- [x] gofmt -l clean on all touched files
+
+## Review
+TP shortfall > 0 does not send the stale-size notice (spec only wires
+it into the SL episode path; the TP retry outcome is reported via the
+normal fired notice). SL trigger/floor deliberately unchanged — off-grid
+SL triggers fire earlier (safe), floor is a limit not a trigger.
+NOT deployed; migration 009 must be applied manually before rollout.
