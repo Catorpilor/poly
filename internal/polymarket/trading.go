@@ -36,10 +36,13 @@ type TradingClient struct {
 
 	// fokPollInterval / fokConfirmTimeout govern FOK fill confirmation: a
 	// delayed FOK (in-play bet delay) is polled every fokPollInterval until it
-	// reaches a terminal state or fokConfirmTimeout elapses. Fields (not bare
-	// consts) so tests can shrink them.
-	fokPollInterval   time.Duration
-	fokConfirmTimeout time.Duration
+	// reaches a terminal state or fokConfirmTimeout elapses. During the first
+	// fokGoneGraceWindow of polling a gone/404 order is treated as still
+	// pending, not dead — in-play delayed orders are not queryable during the
+	// bet delay (issue #27). Fields (not bare consts) so tests can shrink them.
+	fokPollInterval    time.Duration
+	fokGoneGraceWindow time.Duration
+	fokConfirmTimeout  time.Duration
 }
 
 // APICredentials holds L2 API credentials for authenticated requests
@@ -65,6 +68,13 @@ const (
 const (
 	fokPollIntervalDefault   = 2 * time.Second
 	fokConfirmTimeoutDefault = 60 * time.Second
+	// fokGoneGraceWindowDefault covers the bet delay during which an accepted
+	// order is not queryable on GET /data/order/{id} at all: production
+	// delayed orders polled "gone" ~1s after submission and then FILLED 3-4s
+	// later (issue #27). Observed delays are single-digit seconds; 15s is
+	// comfortably past them while still failing fast on genuinely reaped
+	// orders.
+	fokGoneGraceWindowDefault = 15 * time.Second
 )
 
 // rawAmountScale is the 6-decimal fixed-point scale the CLOB uses for share and
@@ -109,9 +119,12 @@ type TradeResult struct {
 
 // balanceShortfallRe matches the CLOB's balance-shortfall rejection, e.g.
 // "not enough balance / allowance: the balance is not enough -> balance:
-// 225000000, order amount: 450000000". The first capture is the wallet's
-// actual conditional-token balance in 6-decimal raw units.
-var balanceShortfallRe = regexp.MustCompile(`balance is not enough -> balance: (\d+), order amount: (\d+)`)
+// 225000000, order amount: 450000000". The raw HTTP body JSON-escapes the
+// arrow ("-\u003e"), so both the escaped and decoded forms are accepted
+// (issue #24 reopened: the literal-"->"-only pattern never matched a
+// production body). The first capture is the wallet's actual
+// conditional-token balance in 6-decimal raw units.
+var balanceShortfallRe = regexp.MustCompile(`balance is not enough -(?:>|\\u003e) balance: (\d+), order amount: (\d+)`)
 
 // annotateBalanceShortfall inspects a failed order response body for the
 // CLOB's balance-shortfall rejection and, when present, marks the result so
@@ -144,12 +157,13 @@ type OrderBook struct {
 // NewTradingClient creates a new trading client
 func NewTradingClient(clobURL string, chainID int64) *TradingClient {
 	return &TradingClient{
-		clobURL:           clobURL,
-		chainID:           big.NewInt(chainID),
-		httpClient:        &http.Client{Timeout: 30 * time.Second},
-		builder:           orderv2.NewBuilder(chainID),
-		fokPollInterval:   fokPollIntervalDefault,
-		fokConfirmTimeout: fokConfirmTimeoutDefault,
+		clobURL:            clobURL,
+		chainID:            big.NewInt(chainID),
+		httpClient:         &http.Client{Timeout: 30 * time.Second},
+		builder:            orderv2.NewBuilder(chainID),
+		fokPollInterval:    fokPollIntervalDefault,
+		fokGoneGraceWindow: fokGoneGraceWindowDefault,
+		fokConfirmTimeout:  fokConfirmTimeoutDefault,
 	}
 }
 
@@ -960,8 +974,12 @@ func (tc *TradingClient) resolveFOKResult(
 // pollFOKUntilTerminal blocks polling GET /data/order/{orderID} every
 // fokPollInterval until the order is matched (success + fill fields), killed or
 // gone (failure), or fokConfirmTimeout elapses (failure — the safe direction: a
-// caller that keeps the arm and retries beats a false "sold"). Respects ctx
-// cancellation.
+// caller that keeps the arm and retries beats a false "sold"). A gone/404
+// order within the first fokGoneGraceWindow of polling counts as still
+// pending: in-play delayed orders are not queryable during the bet delay, and
+// production orders have filled 3-4s after a premature gone verdict (issue
+// #27). Real terminal statuses (matched/unmatched/canceled) take effect
+// immediately at any time. Respects ctx cancellation.
 func (tc *TradingClient) pollFOKUntilTerminal(
 	ctx context.Context,
 	creds *APICredentials,
@@ -975,7 +993,8 @@ func (tc *TradingClient) pollFOKUntilTerminal(
 		return base, nil
 	}
 
-	deadline := time.Now().Add(tc.fokConfirmTimeout)
+	start := time.Now()
+	deadline := start.Add(tc.fokConfirmTimeout)
 	ticker := time.NewTicker(tc.fokPollInterval)
 	defer ticker.Stop()
 
@@ -985,9 +1004,16 @@ func (tc *TradingClient) pollFOKUntilTerminal(
 		case err != nil:
 			log.Printf("FOK poll: get order %s: %v (will retry)", base.OrderID, err)
 		case !found:
-			// The order no longer exists: killed after the bet delay and reaped.
+			if time.Since(start) < tc.fokGoneGraceWindow {
+				// Not queryable yet — indistinguishable from a pending order
+				// during the bet delay. Keep polling until the grace window
+				// has passed (issue #27).
+				log.Printf("FOK poll: order %s not queryable yet (bet-delay grace) — will retry", base.OrderID)
+				break
+			}
+			// Gone past the grace window: killed after the bet delay and reaped.
 			base.Success = false
-			base.ErrorMsg = "FOK order no longer exists — killed after the bet delay"
+			base.ErrorMsg = "FOK order no longer exists — unfilled and killed after the bet delay"
 			return base, nil
 		default:
 			switch classifyFOKStatus(order.Status) {

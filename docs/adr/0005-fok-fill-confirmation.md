@@ -61,3 +61,29 @@ FOK. Keeping the block inside the client leaves callers untouched.
   next evaluation reconciles — no double-sell, at worst a redundant attempt.
 - Confirmed fills now carry `FilledSize`/`AveragePrice`, so the SL notification
   and the lottery message can report the actual average price.
+
+## Amendment (2026-07-26): gone during the bet delay is pending, not dead
+
+Production falsified the "404/gone → failure" rule for freshly delayed
+orders: in-play delayed orders are not queryable via `GET /data/order/{id}`
+during the bet delay at all, so the first poll always saw "gone" and the
+loop returned dead ~1s after submission. Twice the order then FILLED 3–4
+seconds after the premature verdict (2026-07-23 18:00:16 accept → 18:00:19
+fill; 2026-07-26 15:50:56 accept → 15:51:00 fill), leaving a false "book too
+thin" notice and a stale arm (issue #27).
+
+Amended decision: within the first `fokGoneGraceWindow` (default 15s) of
+polling, a gone/404 result is treated as still-pending and polling
+continues; past the window, gone → dead as before. Real terminal statuses
+(matched / unmatched / canceled) keep their immediate effect at any time,
+and `fokConfirmTimeout` (60s) still bounds the whole confirmation — timeout
+remains failure.
+
+Deliberately NO Data-API cross-check (`/activity` / `/positions`) before
+declaring failure: the tape carries no order ID, so matching a fill to this
+order is fuzzy, and a wrong match produces a false "sold" report — exactly
+the bug issue #22 removed. If an order fills but never becomes queryable (an
+unproven case), the failure direction stays safe: the fill executed at ≥ the
+FOK floor, and the next retry self-heals through the balance-shortfall path
+(issue #24) — the stale arm is clamped to the real balance or auto-disarmed
+instead of retrying forever.

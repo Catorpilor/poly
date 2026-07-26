@@ -165,7 +165,9 @@ only follow a Fill, never mere Acceptance.
 markets the CLOB *accepts* an order (`status: delayed`) and matches or
 kills it only after the delay elapses. During the delay an order is
 neither filled nor dead — treating Acceptance as a Fill here is exactly
-the false-fire bug of issue #22.
+the false-fire bug of issue #22. During the delay the order is also not
+queryable on the order-status endpoint — Acceptance is the only signal
+the exchange gives until the delay elapses (issue #27).
 
 **Ceiling Take-Profit** — Trigger: bid reaches 0.95 → sell everything,
 taking precedence over the 2× rule.
