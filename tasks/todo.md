@@ -344,3 +344,54 @@ it into the SL episode path; the TP retry outcome is reported via the
 normal fired notice). SL trigger/floor deliberately unchanged — off-grid
 SL triggers fire earlier (safe), floor is a limit not a trigger.
 NOT deployed; migration 009 must be applied manually before rollout.
+
+---
+
+# FOK gone-grace (#27) + shortfall redux (#24 reopened) — 2026-07-27
+
+Branch `fix/fok-grace-and-shortfall-redux`, TDD red→green, one commit
+per issue.
+
+## Issue #24 reopened — shortfall classification inert in production
+- [x] TDD: byte-exact escaped-arrow production bodies (the CLOB
+      JSON-escapes ">" as a u003e escape in the raw HTTP body) served
+      by the fake CLOB (400 and 200-error-body paths); literal "->"
+      kept as belt and braces; negative case unchanged
+- [x] balanceShortfallRe tolerates both arrow forms
+- [x] Sellability rule shortfallGone(availableRaw, price): gone when
+      below 10_000 raw (0.01-share size precision) or value at price
+      under the $1 CLOB minimum (price = FOK floor on the SL path,
+      current bid on the TP/ceiling path)
+- [x] handleSLShortfall takes floor; retryTPShortfall takes bid;
+      gone → sold-latch + disarm + stale(0) notice (SL) or
+      disarmGonePosition (TP/ceiling); sellable → clamp unchanged
+- [x] Monitor tests: dust 16922 raw → auto-disarm, one stale notice,
+      no further sells; 1.5 shares at $0.702 floor ($1.05) → clamp,
+      retry sells 1_500_000; 1.4 shares at $0.702 ($0.98) → gone;
+      TP 2026-07-26 production regression (escaped zero-balance body →
+      disarm + stale notice, NO TP-failed fired notice)
+
+## Issue #27 — gone verdict premature during bet delay
+- [x] TDD: gone, gone, matched → Success with fill details (production
+      case, both 404 and empty-body forms); gone for the whole grace
+      window → dead, message mentions unfilled; existing gone subtests
+      updated to the new semantics (gone only terminal after grace)
+- [x] fokGoneGraceWindow field (default 15s, test-overridable like
+      fokPollInterval): gone within the grace = still pending; real
+      terminal statuses (matched/unmatched/canceled) unaffected; 60s
+      fokConfirmTimeout still bounds everything, timeout = failure
+- [x] Deliberately NO Data-API cross-check (fuzzy activity match risks
+      false "sold" — the exact bug #22 removed); rationale + unproven
+      fills-but-never-queryable case documented in ADR 0005 amendment
+
+## Docs
+- [x] ADR 0005 "Amendment (2026-07-26)": gone-during-grace is pending
+- [x] CONTEXT.md Bet Delay: order not queryable during the delay,
+      Acceptance is the only signal
+
+## Verification
+- [x] go test ./... green
+- [x] go test -race -count=1 on live + polymarket (per-package — RPi);
+      one unreproducible polymarket -race failure before widening the
+      test grace windows to 150ms, stable across 16 runs after
+- [x] gofmt -l clean on all touched files

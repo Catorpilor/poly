@@ -84,6 +84,7 @@ func newFOKFixture(t *testing.T, clob *fokFakeCLOB) (*TradingClient, *ecdsa.Priv
 
 	tc := NewTradingClient(srv.URL, 137)
 	tc.fokPollInterval = 2 * time.Millisecond
+	tc.fokGoneGraceWindow = 15 * time.Millisecond
 	tc.fokConfirmTimeout = 60 * time.Millisecond
 
 	key, err := crypto.GenerateKey()
@@ -190,8 +191,11 @@ func TestFOKDelayedThenUnmatched(t *testing.T) {
 	}
 }
 
-// TestFOKDelayedThenGone: a delayed FOK whose order 404s (killed and reaped) is
-// a failure.
+// TestFOKDelayedThenGone: a delayed FOK whose order stays 404/empty (killed
+// and reaped) past the gone-grace window is a failure. "Gone" is NOT terminal
+// on the first poll: during the in-play bet delay a freshly accepted order is
+// not queryable at all (issue #27), so the loop must poll through the grace
+// window before trusting gone as dead.
 func TestFOKDelayedThenGone(t *testing.T) {
 	t.Parallel()
 	for _, tc404 := range []string{"404", "gone"} {
@@ -203,6 +207,10 @@ func TestFOKDelayedThenGone(t *testing.T) {
 				pollStatuses: []string{tc404},
 			}
 			tc, key, creds := newFOKFixture(t, clob)
+			// Wide enough that a slow first poll (-race on a Pi) cannot land
+			// past the grace window and skew pollCount; still fast to run.
+			tc.fokGoneGraceWindow = 150 * time.Millisecond
+			tc.fokConfirmTimeout = 2 * time.Second // the gone verdict must end the loop, not this
 
 			res, err := tc.ExecuteTrade(context.Background(), key, fokProxy, creds, fokSellRequest())
 			if err != nil {
@@ -211,10 +219,85 @@ func TestFOKDelayedThenGone(t *testing.T) {
 			if res.Success {
 				t.Fatalf("Success = true, want false (order gone): %+v", res)
 			}
-			if clob.pollCount.Load() != 1 {
-				t.Errorf("pollCount = %d, want 1", clob.pollCount.Load())
+			if !strings.Contains(res.ErrorMsg, "unfilled") {
+				t.Errorf("ErrorMsg = %q, want mention of unfilled", res.ErrorMsg)
+			}
+			if clob.pollCount.Load() < 2 {
+				t.Errorf("pollCount = %d, want >= 2 (gone re-polled through the grace window)", clob.pollCount.Load())
 			}
 		})
+	}
+}
+
+// TestFOKDelayedGoneThenMatched is the issue #27 production case: an in-play
+// delayed order is not queryable during the bet delay (the poll sees gone),
+// then FILLS 3-4s after submission. Gone within the grace window must be
+// treated as still-pending so the later match is confirmed as the fill it is.
+func TestFOKDelayedGoneThenMatched(t *testing.T) {
+	t.Parallel()
+	for _, tc404 := range []string{"404", "gone"} {
+		tc404 := tc404
+		t.Run(tc404, func(t *testing.T) {
+			t.Parallel()
+			clob := &fokFakeCLOB{
+				orderBody:    `{"success":true,"orderId":"ord-fok","status":"delayed"}`,
+				pollStatuses: []string{tc404, tc404, "matched"},
+				matchedSize:  "49.99",
+				matchedPrice: "0.5400",
+			}
+			tc, key, creds := newFOKFixture(t, clob)
+			// Generous grace/timeout so a scheduler stall can never push the
+			// second gone poll past the window; "matched" terminates promptly.
+			tc.fokGoneGraceWindow = 5 * time.Second
+			tc.fokConfirmTimeout = 10 * time.Second
+
+			res, err := tc.ExecuteTrade(context.Background(), key, fokProxy, creds, fokSellRequest())
+			if err != nil {
+				t.Fatalf("ExecuteTrade: %v", err)
+			}
+			if !res.Success {
+				t.Fatalf("Success = false, want true (matched after gone-during-delay): %+v", res)
+			}
+			if clob.pollCount.Load() != 3 {
+				t.Errorf("pollCount = %d, want 3 (gone, gone, matched)", clob.pollCount.Load())
+			}
+			if res.FilledSize != 49.99 {
+				t.Errorf("FilledSize = %v, want 49.99", res.FilledSize)
+			}
+			if res.AveragePrice != 0.54 {
+				t.Errorf("AveragePrice = %v, want 0.54", res.AveragePrice)
+			}
+		})
+	}
+}
+
+// TestFOKDelayedGonePersists: an order that stays gone for the whole grace
+// window really was killed and reaped — failure, with an error message that
+// says so (not the timeout message: the verdict is the grace window's).
+func TestFOKDelayedGonePersists(t *testing.T) {
+	t.Parallel()
+	clob := &fokFakeCLOB{
+		orderBody:    `{"success":true,"orderId":"ord-fok","status":"delayed"}`,
+		pollStatuses: []string{"gone"},
+	}
+	tc, key, creds := newFOKFixture(t, clob)
+	// Wide enough that a slow first poll (-race on a Pi) cannot land past the
+	// grace window and skew pollCount; still fast to run.
+	tc.fokGoneGraceWindow = 150 * time.Millisecond
+	tc.fokConfirmTimeout = 2 * time.Second // must not be the reason the loop ends
+
+	res, err := tc.ExecuteTrade(context.Background(), key, fokProxy, creds, fokSellRequest())
+	if err != nil {
+		t.Fatalf("ExecuteTrade: %v", err)
+	}
+	if res.Success {
+		t.Fatalf("Success = true, want false (gone persisted past grace): %+v", res)
+	}
+	if !strings.Contains(res.ErrorMsg, "unfilled") && !strings.Contains(res.ErrorMsg, "killed") {
+		t.Errorf("ErrorMsg = %q, want mention of unfilled/killed", res.ErrorMsg)
+	}
+	if clob.pollCount.Load() < 2 {
+		t.Errorf("pollCount = %d, want >= 2 (kept polling through the grace window)", clob.pollCount.Load())
 	}
 }
 
