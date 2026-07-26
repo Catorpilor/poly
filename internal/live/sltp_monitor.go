@@ -120,6 +120,29 @@ const slConfirmWindowDefault = 30 * time.Second
 // while a confirmed breach persists.
 const slRetryIntervalDefault = 30 * time.Second
 
+// minSellSizeRaw is the smallest order size the CLOB can express, in 6-decimal
+// raw units: sizes are truncated to 2 decimals, so anything below 0.01 shares
+// can never be part of a valid order.
+const minSellSizeRaw = 10_000
+
+// minOrderValueUSD is the CLOB's minimum order value.
+const minOrderValueUSD = 1.0
+
+// shortfallGone reports whether the balance reported by a shortfall rejection
+// is unsellable at price: dust below the CLOB's 0.01-share size precision, or
+// under its $1 minimum order value. Clamping a retry to such a balance would
+// only collect more rejections, so the position is treated as gone (issue #24
+// reopened: 2-decimal size truncation leaves dust behind fractional positions,
+// so availableRaw == 0 almost never happens — production saw 16922 raw).
+// price is the attempt's sell price: the FOK floor for SL, the current bid for
+// TP/ceiling.
+func shortfallGone(availableRaw int64, price float64) bool {
+	if availableRaw < minSellSizeRaw {
+		return true
+	}
+	return float64(availableRaw)/1e6*price < minOrderValueUSD
+}
+
 // slArmState is the in-memory (restart-resettable) SL breach state for one arm
 // epoch, keyed by arm.ID. A disarm→re-arm normally produces a new ID; the
 // upsert path can reuse an ID, but it also resets the HWM to entry, so the
@@ -385,7 +408,7 @@ func (m *SLTPMonitor) fireTP(arm *database.SLTPArm, bid float64) {
 	log.Printf("SLTPMonitor: TP fire user=%d token=%s bid=%.4f sharesRaw=%d",
 		arm.TelegramID, arm.TokenID, bid, sharesRaw)
 	result := m.executor.ExecuteSell(m.ctx, arm, sharesRaw, 0, polymarket.OrderTypeGTC)
-	result, handled := m.retryTPShortfall("TP", arm, sharesRaw, result)
+	result, handled := m.retryTPShortfall("TP", arm, sharesRaw, bid, result)
 	if handled {
 		return
 	}
@@ -393,16 +416,17 @@ func (m *SLTPMonitor) fireTP(arm *database.SLTPArm, bid float64) {
 }
 
 // retryTPShortfall handles a balance-shortfall rejection on a TP or
-// ceiling-TP sell (issue #24). Zero balance → the position was closed outside
-// the bot: fully disarm, tell the user, and report handled=true so the caller
-// skips its fired notice. Nonzero → one immediate retry clamped to the
-// wallet's actual balance; the retry's result replaces the original.
+// ceiling-TP sell (issue #24). An unsellable balance at bid (dust or below
+// the CLOB's $1 minimum — shortfallGone) means the position was closed
+// outside the bot: fully disarm, tell the user, and report handled=true so
+// the caller skips its fired notice. Sellable → one immediate retry clamped
+// to the wallet's actual balance; the retry's result replaces the original.
 func (m *SLTPMonitor) retryTPShortfall(kind string, arm *database.SLTPArm, intendedRaw int64,
-	result *polymarket.TradeResult) (*polymarket.TradeResult, bool) {
+	bid float64, result *polymarket.TradeResult) (*polymarket.TradeResult, bool) {
 	if result == nil || result.Success || !result.InsufficientBalance {
 		return result, false
 	}
-	if result.AvailableSharesRaw <= 0 {
+	if shortfallGone(result.AvailableSharesRaw, bid) {
 		m.disarmGonePosition(arm)
 		return result, true
 	}
@@ -504,7 +528,7 @@ func (m *SLTPMonitor) attemptSLExit(arm *database.SLTPArm, bid, trigger float64)
 	if result == nil || !result.Success {
 		m.finishSLAttempt(arm.ID)
 		if result != nil && result.InsufficientBalance {
-			m.handleSLShortfall(arm, result.AvailableSharesRaw)
+			m.handleSLShortfall(arm, result.AvailableSharesRaw, floor)
 			return
 		}
 		m.notifySLPendingOnce(arm, bid, trigger, floor)
@@ -527,12 +551,14 @@ func (m *SLTPMonitor) attemptSLExit(arm *database.SLTPArm, bid, trigger float64)
 
 // handleSLShortfall reacts to a balance-shortfall rejection of an SL exit:
 // the arm-time share snapshot no longer matches the wallet (shares sold
-// outside the bot, issue #24). Zero balance → the position is gone: latch the
-// sold state (only the disarm remains, never another sell), disarm, and tell
-// the user. Nonzero → clamp every later attempt in this episode to the actual
-// balance and tell the user once — INSTEAD of the misleading thin-book notice.
-func (m *SLTPMonitor) handleSLShortfall(arm *database.SLTPArm, availableRaw int64) {
-	if availableRaw <= 0 {
+// outside the bot, issue #24). A balance unsellable at the FOK floor (dust or
+// below the CLOB's $1 minimum — shortfallGone) → the position is gone: latch
+// the sold state (only the disarm remains, never another sell), disarm, and
+// tell the user. Sellable → clamp every later attempt in this episode to the
+// actual balance and tell the user once — INSTEAD of the misleading
+// thin-book notice.
+func (m *SLTPMonitor) handleSLShortfall(arm *database.SLTPArm, availableRaw int64, floor float64) {
+	if shortfallGone(availableRaw, floor) {
 		m.markSLSold(arm.ID)
 		m.notifier.NotifySLTPStaleSize(arm.TelegramID, arm, 0)
 		if err := m.store.Disarm(m.ctx, arm.TelegramID, arm.TokenID); err != nil && !errors.Is(err, repositories.ErrSLTPArmNotFound) {
@@ -666,7 +692,7 @@ func (m *SLTPMonitor) fireCeilingTP(arm *database.SLTPArm, bid float64) {
 	log.Printf("SLTPMonitor: TP-ceiling fire user=%d token=%s bid=%.4f sharesRaw=%d",
 		arm.TelegramID, arm.TokenID, bid, sharesRaw)
 	result := m.executor.ExecuteSell(m.ctx, arm, sharesRaw, 0, polymarket.OrderTypeGTC)
-	result, handled := m.retryTPShortfall("TP-ceiling", arm, sharesRaw, result)
+	result, handled := m.retryTPShortfall("TP-ceiling", arm, sharesRaw, bid, result)
 	if handled {
 		return
 	}

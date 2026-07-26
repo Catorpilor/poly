@@ -302,23 +302,33 @@ func TestGTCDelayedIsAccepted(t *testing.T) {
 // TestOrderBalanceShortfallAnnotated: the CLOB's balance-shortfall rejection
 // must be classified on the TradeResult so the SL/TP monitor can clamp the
 // sell to the wallet's actual balance instead of retrying a doomed order
-// forever (issue #24: arm snapshot 450 shares, 225 manually sold outside the
-// bot, every FOK retry rejected with the exact body below).
+// forever (issue #24). The raw HTTP body JSON-escapes the arrow as \u003e —
+// the backtick literals below keep those six bytes verbatim, byte-exact with
+// production (issue #24 reopened: a literal-"->" fixture passed while the
+// escaped production body never matched). The decoded "->" form must also
+// classify, belt and braces.
 func TestOrderBalanceShortfallAnnotated(t *testing.T) {
 	t.Parallel()
-	const shortfallBody = `{"error":"not enough balance / allowance: the balance is not enough -> balance: 225000000, order amount: 450000000"}`
+	const escapedArrowBody = `{"error":"not enough balance / allowance: the balance is not enough -\u003e balance: 16922, order amount: 49990000"}`
+	const escapedZeroBody = `{"error":"not enough balance / allowance: the balance is not enough -\u003e balance: 0, order amount: 24990000"}`
+	const literalArrowBody = `{"error":"not enough balance / allowance: the balance is not enough -> balance: 225000000, order amount: 450000000"}`
 
 	for _, tt := range []struct {
-		name   string
-		status int
+		name      string
+		body      string
+		status    int
+		wantAvail int64
 	}{
-		{"rejected with 400", http.StatusBadRequest},
-		{"rejected with 200 error body", http.StatusOK},
+		{"escaped arrow rejected with 400", escapedArrowBody, http.StatusBadRequest, 16_922},
+		{"escaped arrow rejected with 200 error body", escapedArrowBody, http.StatusOK, 16_922},
+		{"escaped arrow zero balance", escapedZeroBody, http.StatusBadRequest, 0},
+		{"literal arrow rejected with 400", literalArrowBody, http.StatusBadRequest, 225_000_000},
+		{"literal arrow rejected with 200 error body", literalArrowBody, http.StatusOK, 225_000_000},
 	} {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			clob := &fokFakeCLOB{orderBody: shortfallBody, orderStatus: tt.status}
+			clob := &fokFakeCLOB{orderBody: tt.body, orderStatus: tt.status}
 			tc, key, creds := newFOKFixture(t, clob)
 
 			res, err := tc.ExecuteTrade(context.Background(), key, fokProxy, creds, fokSellRequest())
@@ -331,8 +341,8 @@ func TestOrderBalanceShortfallAnnotated(t *testing.T) {
 			if !res.InsufficientBalance {
 				t.Error("InsufficientBalance = false, want true")
 			}
-			if res.AvailableSharesRaw != 225_000_000 {
-				t.Errorf("AvailableSharesRaw = %d, want 225000000", res.AvailableSharesRaw)
+			if res.AvailableSharesRaw != tt.wantAvail {
+				t.Errorf("AvailableSharesRaw = %d, want %d", res.AvailableSharesRaw, tt.wantAvail)
 			}
 		})
 	}

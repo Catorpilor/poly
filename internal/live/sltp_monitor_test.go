@@ -2319,3 +2319,291 @@ func TestSLTPMonitor_TP_ShortfallZeroDisarms(t *testing.T) {
 		t.Errorf("arm should be auto-disarmed, got %d armed", store.armedCount("S4"))
 	}
 }
+
+// --- unsellable shortfall balances (issue #24 reopened) ---
+//
+// The CLOB truncates order sizes to 2 decimals, so fractional positions leave
+// dust and availableRaw == 0 almost never happens (production saw 16922 raw =
+// 0.0169 shares). A shortfall balance counts as GONE when the clamped sell
+// could not be a valid CLOB order: below the 0.01-share size precision, or
+// under the $1 minimum order value at the attempt's price (SL: FOK floor;
+// TP/ceiling: current bid).
+
+// TestShortfallGone pins the sellability rule itself.
+func TestShortfallGone(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name         string
+		availableRaw int64
+		price        float64
+		want         bool
+	}{
+		{"production dust 0.0169 shares", 16_922, 0.30, true},
+		{"below size precision", 9_999, 0.99, true},
+		{"zero balance", 0, 0.50, true},
+		{"just under $1 minimum", 1_400_000, 0.70, true},   // $0.98
+		{"just over $1 minimum", 1_500_000, 0.70, false},   // $1.05
+		{"exactly $1 is sellable", 2_000_000, 0.50, false}, // $1.00
+		{"issue #24 original clamp case", 225_000_000, 0.468, false},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := shortfallGone(tt.availableRaw, tt.price); got != tt.want {
+				t.Errorf("shortfallGone(%d, %v) = %v, want %v", tt.availableRaw, tt.price, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSLTPMonitor_SL_ShortfallDustAutoDisarms is the reopened issue #24 SL
+// case: the wallet holds 16922 raw (0.0169 shares) of dust after outside
+// sells. Clamping to it would be a doomed sub-$1 order, so the position is
+// treated as gone: sold-latch + auto-disarm + one stale notice, and never
+// another sell attempt.
+func TestSLTPMonitor_SL_ShortfallDustAutoDisarms(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 104, TelegramID: 85, TokenID: "S5", AvgPrice: 0.50, SharesAtArm: 99.9969,
+		HighWaterMark: 0.65, TPArmed: true, SLArmed: true}) // trigger 0.52, floor 0.468
+	feed := newFakeFeed()
+	exec := &fakeExecutor{ret: shortfallResult(16_922)}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("S5", 0.45)
+	feed.emit("S5")
+	waitFor(t, func() bool { return breachStamped(m, 104) })
+	clock.advance(31 * time.Second)
+	feed.emit("S5")
+
+	waitFor(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.disarmCalls == 1
+	})
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.stales) == 1
+	})
+
+	notif.mu.Lock()
+	stale := notif.stales[0]
+	pendings := len(notif.pendings)
+	fires := len(notif.fires)
+	notif.mu.Unlock()
+	if stale.telegramID != 85 || stale.armID != 104 || stale.availableRaw != 0 {
+		t.Errorf("stale notice = %+v, want user 85 arm 104 available 0 (gone)", stale)
+	}
+	if pendings != 0 || fires != 0 {
+		t.Errorf("dust shortfall must send only the stale notice, got %d pendings / %d fires", pendings, fires)
+	}
+	if store.armedCount("S5") != 0 {
+		t.Errorf("arm should be auto-disarmed, got %d armed", store.armedCount("S5"))
+	}
+
+	// Later evaluations must never try to sell the dust.
+	clock.advance(31 * time.Second)
+	feed.emit("S5")
+	time.Sleep(50 * time.Millisecond)
+	exec.mu.Lock()
+	calls := len(exec.calls)
+	exec.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("dust position must never be re-sold, got %d attempts", calls)
+	}
+}
+
+// TestSLTPMonitor_SL_ShortfallBelowMinValueDisarms: the balance is above the
+// size precision but the clamped sell would be worth less than the CLOB's $1
+// minimum at the FOK floor (1.4 shares x $0.702 = $0.98) — gone, not clamp.
+func TestSLTPMonitor_SL_ShortfallBelowMinValueDisarms(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 105, TelegramID: 86, TokenID: "S6", AvgPrice: 0.78, SharesAtArm: 50,
+		HighWaterMark: 0.975, TPArmed: true, SLArmed: true}) // trigger 0.78, floor 0.702
+	feed := newFakeFeed()
+	exec := &fakeExecutor{ret: shortfallResult(1_400_000)}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("S6", 0.60)
+	feed.emit("S6")
+	waitFor(t, func() bool { return breachStamped(m, 105) })
+	clock.advance(31 * time.Second)
+	feed.emit("S6")
+
+	waitFor(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.disarmCalls == 1
+	})
+	notif.mu.Lock()
+	staleZero := len(notif.stales) == 1 && notif.stales[0].availableRaw == 0
+	pendings := len(notif.pendings)
+	notif.mu.Unlock()
+	if !staleZero {
+		t.Errorf("want one stale notice with availableRaw 0 (gone), got %+v", notif.stales)
+	}
+	if pendings != 0 {
+		t.Errorf("below-minimum shortfall must not send the thin-book pending notice, got %d", pendings)
+	}
+	if store.armedCount("S6") != 0 {
+		t.Errorf("arm should be auto-disarmed, got %d armed", store.armedCount("S6"))
+	}
+}
+
+// TestSLTPMonitor_SL_ShortfallClampsWhenSellable: the same arm/floor with 1.5
+// shares ($1.05 at the floor) is a valid order — existing clamp behavior is
+// unchanged and the next attempt sells exactly the reported balance.
+func TestSLTPMonitor_SL_ShortfallClampsWhenSellable(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 106, TelegramID: 87, TokenID: "S7", AvgPrice: 0.78, SharesAtArm: 50,
+		HighWaterMark: 0.975, TPArmed: true, SLArmed: true}) // trigger 0.78, floor 0.702
+	feed := newFakeFeed()
+	exec := &fakeExecutor{ret: shortfallResult(1_500_000)}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("S7", 0.60)
+	feed.emit("S7")
+	waitFor(t, func() bool { return breachStamped(m, 106) })
+	clock.advance(31 * time.Second)
+	feed.emit("S7")
+
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.stales) == 1
+	})
+	notif.mu.Lock()
+	stale := notif.stales[0]
+	notif.mu.Unlock()
+	if stale.availableRaw != 1_500_000 {
+		t.Errorf("stale notice availableRaw = %d, want 1500000 (clamp, not gone)", stale.availableRaw)
+	}
+	if store.armedCount("S7") != 1 {
+		t.Errorf("sellable shortfall must keep the arm, got %d armed", store.armedCount("S7"))
+	}
+
+	clock.advance(31 * time.Second)
+	feed.emit("S7")
+	waitFor(t, func() bool {
+		exec.mu.Lock()
+		defer exec.mu.Unlock()
+		return len(exec.calls) == 2
+	})
+	exec.mu.Lock()
+	second := exec.calls[1].sharesRaw
+	exec.mu.Unlock()
+	if second != 1_500_000 {
+		t.Errorf("retry sharesRaw = %d, want clamped 1500000", second)
+	}
+}
+
+// TestSLTPMonitor_TP_ShortfallGoneProductionRegression is the exact
+// 2026-07-26 production case: TP fires, the sell is rejected with the
+// byte-exact escaped-arrow zero-balance body. The arm must be disarmed with a
+// stale notice — and NO "TP failed" fired notice (in production the regex
+// missed, InsufficientBalance stayed false, and the user got a failure DM
+// for a position that was already gone).
+func TestSLTPMonitor_TP_ShortfallGoneProductionRegression(t *testing.T) {
+	t.Parallel()
+	const tpShortfallZeroBody = `Order failed: {"error":"not enough balance / allowance: the balance is not enough -\u003e balance: 0, order amount: 24990000"}`
+	store := newFakeStore()
+	// TP trigger = 0.40; intended TP sell = 50% of 49.98 = 24.99 shares.
+	store.seed(&database.SLTPArm{ID: 107, TelegramID: 88, TokenID: "S8", AvgPrice: 0.20, SharesAtArm: 49.98,
+		TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{ret: &polymarket.TradeResult{
+		Success:             false,
+		ErrorMsg:            tpShortfallZeroBody,
+		InsufficientBalance: true,
+		AvailableSharesRaw:  0,
+	}}
+	notif := &fakeNotifier{}
+	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	_ = m.Start()
+
+	feed.setBid("S8", 0.41)
+	feed.emit("S8")
+
+	waitFor(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.disarmCalls == 1
+	})
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.stales) == 1
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	notif.mu.Lock()
+	stale := notif.stales[0]
+	fires := len(notif.fires)
+	notif.mu.Unlock()
+	if stale.telegramID != 88 || stale.availableRaw != 0 {
+		t.Errorf("stale notice = %+v, want user 88 available 0", stale)
+	}
+	if fires != 0 {
+		t.Errorf("gone position must not produce a TP-failed fired notice, got %d", fires)
+	}
+	exec.mu.Lock()
+	calls := len(exec.calls)
+	exec.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("expected exactly 1 sell attempt (no retry on a gone position), got %d", calls)
+	}
+	if store.armedCount("S8") != 0 {
+		t.Errorf("arm should be auto-disarmed, got %d armed", store.armedCount("S8"))
+	}
+}
+
+// TestSLTPMonitor_TP_ShortfallBelowMinValueDisarms: a TP shortfall balance of
+// 2 shares at bid $0.41 ($0.82) is under the $1 minimum — gone, no clamped
+// retry, no fired notice. (At a bid >= $0.50 the same balance would clamp.)
+func TestSLTPMonitor_TP_ShortfallBelowMinValueDisarms(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 108, TelegramID: 89, TokenID: "S9", AvgPrice: 0.20, SharesAtArm: 450,
+		TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{ret: shortfallResult(2_000_000)}
+	notif := &fakeNotifier{}
+	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	_ = m.Start()
+
+	feed.setBid("S9", 0.41)
+	feed.emit("S9")
+
+	waitFor(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.disarmCalls == 1
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	notif.mu.Lock()
+	staleZero := len(notif.stales) == 1 && notif.stales[0].availableRaw == 0
+	fires := len(notif.fires)
+	notif.mu.Unlock()
+	if !staleZero {
+		t.Errorf("want one stale notice with availableRaw 0 (gone), got %+v", notif.stales)
+	}
+	if fires != 0 {
+		t.Errorf("below-minimum TP shortfall must not produce a fired notice, got %d", fires)
+	}
+	exec.mu.Lock()
+	calls := len(exec.calls)
+	exec.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("expected exactly 1 sell attempt (no clamped retry), got %d", calls)
+	}
+}

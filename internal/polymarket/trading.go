@@ -109,9 +109,12 @@ type TradeResult struct {
 
 // balanceShortfallRe matches the CLOB's balance-shortfall rejection, e.g.
 // "not enough balance / allowance: the balance is not enough -> balance:
-// 225000000, order amount: 450000000". The first capture is the wallet's
-// actual conditional-token balance in 6-decimal raw units.
-var balanceShortfallRe = regexp.MustCompile(`balance is not enough -> balance: (\d+), order amount: (\d+)`)
+// 225000000, order amount: 450000000". The raw HTTP body JSON-escapes the
+// arrow ("-\u003e"), so both the escaped and decoded forms are accepted
+// (issue #24 reopened: the literal-"->"-only pattern never matched a
+// production body). The first capture is the wallet's actual
+// conditional-token balance in 6-decimal raw units.
+var balanceShortfallRe = regexp.MustCompile(`balance is not enough -(?:>|\\u003e) balance: (\d+), order amount: (\d+)`)
 
 // annotateBalanceShortfall inspects a failed order response body for the
 // CLOB's balance-shortfall rejection and, when present, marks the result so
