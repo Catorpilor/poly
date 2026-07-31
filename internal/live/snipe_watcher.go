@@ -180,7 +180,7 @@ func (w *SnipeWatcher) WatchEventMarkets(eventSlug string, markets []SnipeMarket
 // source are released.
 func (w *SnipeWatcher) UnwatchEventMarkets(eventSlug string) {
 	now := w.now()
-	var release []string
+	var unsub []string
 	w.mu.Lock()
 	for tokenID := range w.eventTokens[eventSlug] {
 		st := w.tokens[tokenID]
@@ -189,13 +189,15 @@ func (w *SnipeWatcher) UnwatchEventMarkets(eventSlug string) {
 		}
 		delete(st.events, eventSlug)
 		if !st.sourcesLive(now) {
-			release = append(release, tokenID)
+			if st.feedRef {
+				unsub = append(unsub, tokenID)
+			}
+			delete(w.tokens, tokenID)
 		}
 	}
 	delete(w.eventTokens, eventSlug)
-	w.releaseLocked(release)
 	w.mu.Unlock()
-	w.unsubscribeReleased(release)
+	w.unsubscribeReleased(unsub)
 }
 
 // WatchArmed registers a token watched because an SL/TP arm exists on it. The
@@ -213,20 +215,24 @@ func (w *SnipeWatcher) WatchArmed(m SnipeMarket) {
 }
 
 // UnwatchArmed drops the armed source (manual disarm). The token is released
-// when no other source remains.
+// when no other source remains; the feed ref is dropped only when the watcher
+// holds one (event/held) — armed tokens ride the SL/TP monitor's subscription
+// and Unsubscribing it here would steal the monitor's ref.
 func (w *SnipeWatcher) UnwatchArmed(tokenID string) {
 	now := w.now()
-	var release []string
+	var unsub []string
 	w.mu.Lock()
 	if st := w.tokens[tokenID]; st != nil {
 		st.armed = false
 		if !st.sourcesLive(now) {
-			release = append(release, tokenID)
+			if st.feedRef {
+				unsub = append(unsub, tokenID)
+			}
+			delete(w.tokens, tokenID)
 		}
 	}
-	w.releaseLocked(release)
 	w.mu.Unlock()
-	w.unsubscribeReleased(release)
+	w.unsubscribeReleased(unsub)
 }
 
 // WatchHeld registers a held position: chatID is alerted while the
@@ -301,18 +307,9 @@ func (w *SnipeWatcher) ensureStateLocked(m SnipeMarket) *snipeTokenState {
 	return st
 }
 
-// releaseLocked drops watcher state for tokens with no remaining source.
-// Callers pass the same slice to unsubscribeReleased after unlocking.
-func (w *SnipeWatcher) releaseLocked(tokenIDs []string) {
-	for _, id := range tokenIDs {
-		delete(w.tokens, id)
-	}
-}
-
 // unsubscribeReleased drops the watcher's feed refs for released tokens.
-// Only tokens the watcher subscribed itself (event/held sources) carry a ref;
-// releaseLocked already removed their state, so feedRef is checked by the
-// caller having collected them while locked.
+// Callers collect only tokens whose feedRef was set (event/held sources) —
+// armed tokens ride the SL/TP monitor's subscription and are never passed.
 func (w *SnipeWatcher) unsubscribeReleased(tokenIDs []string) {
 	for _, id := range tokenIDs {
 		w.feed.Unsubscribe(id)
@@ -389,9 +386,10 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		return
 	}
 	if !st.sourcesLive(now) {
-		w.releaseLocked([]string{tokenID})
+		hadFeedRef := st.feedRef
+		delete(w.tokens, tokenID)
 		w.mu.Unlock()
-		if st.feedRef {
+		if hadFeedRef {
 			w.unsubscribeReleased([]string{tokenID})
 		}
 		return
@@ -480,18 +478,19 @@ func (w *SnipeWatcher) janitorLoop() {
 // sweepExpired releases every token whose sources have all lapsed.
 func (w *SnipeWatcher) sweepExpired() {
 	now := w.now()
-	var release []string
+	var unsub []string
 	w.mu.Lock()
 	for tokenID, st := range w.tokens {
-		if !st.sourcesLive(now) && st.feedRef {
-			release = append(release, tokenID)
-		} else if !st.sourcesLive(now) {
-			delete(w.tokens, tokenID)
+		if st.sourcesLive(now) {
+			continue
 		}
+		if st.feedRef {
+			unsub = append(unsub, tokenID)
+		}
+		delete(w.tokens, tokenID)
 	}
-	w.releaseLocked(release)
 	w.mu.Unlock()
-	w.unsubscribeReleased(release)
+	w.unsubscribeReleased(unsub)
 }
 
 // snipeRecipientAdapter is the production SnipeRecipientResolver: event

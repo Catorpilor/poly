@@ -402,6 +402,15 @@ func TestSnipeWatcher_ArmedWatchDoesNotOwnFeedSubscription(t *testing.T) {
 	if notif.count() != 1 {
 		t.Errorf("alerts after UnwatchArmed = %d, want no new alert", notif.count())
 	}
+
+	// Releasing an armed-only token must not Unsubscribe either: the feed ref
+	// belongs to the SL/TP monitor, and stealing it would starve its arms.
+	feed.mu.Lock()
+	unsubs := len(feed.unsubscribes)
+	feed.mu.Unlock()
+	if unsubs != 0 {
+		t.Errorf("feed unsubscribes after UnwatchArmed = %d, want 0 (ref owned by the SL/TP monitor)", unsubs)
+	}
 }
 
 func TestSnipeWatcher_FeedDrivenEvaluation(t *testing.T) {
