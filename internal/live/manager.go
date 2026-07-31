@@ -194,6 +194,15 @@ func (r *SubscriptionRegistry) HasTelegramSubscribers(eventSlug string) bool {
 	return len(r.telegramSubs[eventSlug]) > 0
 }
 
+// HasAnySubscribers reports whether any telegram chat or web connection is
+// still subscribed to eventSlug. The snipe watcher keeps an event's tokens
+// watched while this holds and releases them with the last subscriber.
+func (r *SubscriptionRegistry) HasAnySubscribers(eventSlug string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.telegramSubs[eventSlug]) > 0 || len(r.webSubs[eventSlug]) > 0
+}
+
 func (r *SubscriptionRegistry) SubscribeWeb(conn *websocket.Conn, eventSlug string, allMarkets bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -392,6 +401,68 @@ type LiveTradeManager struct {
 	// Map asset ID to market short name (e.g., "WOL", "DRAW", "NEW" for 3-way)
 	assetToMarketName map[string]string
 	assetMu           sync.RWMutex
+
+	// snipeWatcher, when set, watches subscribed events' tokens for the
+	// comeback-snipe pattern. Nil-safe: every hook checks before calling.
+	snipeWatcher *SnipeWatcher
+}
+
+// SetSnipeWatcher wires the comeback-snipe watcher into the subscription
+// lifecycle: an event's tokens are watched while it has any subscriber
+// (telegram or web) and released with the last one.
+func (m *LiveTradeManager) SetSnipeWatcher(w *SnipeWatcher) {
+	m.snipeWatcher = w
+}
+
+// snipeMarketsFor flattens resolved markets into per-token snipe metadata.
+func snipeMarketsFor(markets []*MarketInfo) []SnipeMarket {
+	var out []SnipeMarket
+	for _, mkt := range markets {
+		outcomes := mkt.GetOutcomes()
+		start := mkt.GetGameStartTime()
+		for i, tokenID := range mkt.GetClobTokenIds() {
+			sm := SnipeMarket{
+				TokenID:   tokenID,
+				MarketID:  mkt.ID,
+				Question:  mkt.Question,
+				GameStart: start,
+			}
+			if i < len(outcomes) {
+				sm.Outcome = outcomes[i]
+			}
+			out = append(out, sm)
+		}
+	}
+	return out
+}
+
+// snipeWatchEvent registers the subscription's tokens with the snipe watcher,
+// mirroring the trade feed's market resolution: the pinned market for pinned
+// subscriptions, the Moneyline markets otherwise.
+func (m *LiveTradeManager) snipeWatchEvent(eventSlug string, eventInfo *EventInfo) {
+	if m.snipeWatcher == nil {
+		return
+	}
+	var markets []*MarketInfo
+	if pinned := pinnedMarket(m.resolver, eventInfo, eventSlug); pinned != nil {
+		markets = []*MarketInfo{pinned}
+	} else {
+		markets = m.resolver.GetAllMLMarkets(eventInfo)
+	}
+	m.snipeWatcher.WatchEventMarkets(eventSlug, snipeMarketsFor(markets))
+}
+
+// snipeUnwatchIfUnsubscribed releases an event's snipe watch when its last
+// subscriber (telegram or web) is gone.
+func (m *LiveTradeManager) snipeUnwatchIfUnsubscribed(eventSlugs ...string) {
+	if m.snipeWatcher == nil {
+		return
+	}
+	for _, slug := range eventSlugs {
+		if !m.subscriptions.HasAnySubscribers(slug) {
+			m.snipeWatcher.UnwatchEventMarkets(slug)
+		}
+	}
 }
 
 func NewLiveTradeManager() *LiveTradeManager {
@@ -517,8 +588,8 @@ func (m *LiveTradeManager) readLoop() {
 	staleCount := 0
 	matchedCount := 0
 	lastLogTime := time.Now()
-	sampleSlugs := make(map[string]int)          // Sample of incoming event slugs
-	unmatchedSamples := make(map[string]string)  // Sample of unmatched slugs with their full info
+	sampleSlugs := make(map[string]int)         // Sample of incoming event slugs
+	unmatchedSamples := make(map[string]string) // Sample of unmatched slugs with their full info
 
 	for {
 		m.mu.RLock()
@@ -612,8 +683,8 @@ func (m *LiveTradeManager) readLoop() {
 					log.Printf("  - %s: %s", slug, info)
 				}
 			}
-			sampleSlugs = make(map[string]int)          // Reset
-			unmatchedSamples = make(map[string]string)  // Reset
+			sampleSlugs = make(map[string]int)         // Reset
+			unmatchedSamples = make(map[string]string) // Reset
 			matchedCount = 0
 			staleCount = 0
 			lastLogTime = time.Now()
@@ -847,17 +918,24 @@ func (m *LiveTradeManager) SubscribeTelegram(ctx context.Context, chatID int64, 
 
 	if isNew {
 		m.trackEventAssets(eventSlug, eventInfo)
+		m.snipeWatchEvent(eventSlug, eventInfo)
 	}
 
 	return eventInfo, nil
 }
 
 func (m *LiveTradeManager) UnsubscribeTelegram(chatID int64, eventSlug string) bool {
-	return m.subscriptions.UnsubscribeTelegram(chatID, eventSlug)
+	ok := m.subscriptions.UnsubscribeTelegram(chatID, eventSlug)
+	if ok {
+		m.snipeUnwatchIfUnsubscribed(eventSlug)
+	}
+	return ok
 }
 
 func (m *LiveTradeManager) UnsubscribeAllTelegram(chatID int64) []string {
-	return m.subscriptions.UnsubscribeAllTelegram(chatID)
+	unsubscribed := m.subscriptions.UnsubscribeAllTelegram(chatID)
+	m.snipeUnwatchIfUnsubscribed(unsubscribed...)
+	return unsubscribed
 }
 
 func (m *LiveTradeManager) GetUserSubscriptions(chatID int64) []string {
@@ -881,6 +959,7 @@ func (m *LiveTradeManager) SubscribeWeb(conn *websocket.Conn, eventSlug string, 
 		} else {
 			m.trackEventAssets(eventSlug, eventInfo)
 		}
+		m.snipeWatchEvent(eventSlug, eventInfo)
 	}
 
 	return nil
@@ -1023,11 +1102,19 @@ func (m *LiveTradeManager) WriteWeb(conn *websocket.Conn, data []byte) error {
 }
 
 func (m *LiveTradeManager) UnsubscribeWeb(conn *websocket.Conn) {
+	// Snapshot the connection's events before removal so the snipe watch can
+	// be released for any event this disconnect leaves subscriber-less.
+	events := m.subscriptions.GetWebConnectionEvents(conn)
 	m.subscriptions.UnsubscribeWeb(conn)
+	m.snipeUnwatchIfUnsubscribed(events...)
 }
 
 func (m *LiveTradeManager) UnsubscribeWebFromEvent(conn *websocket.Conn, eventSlug string) bool {
-	return m.subscriptions.UnsubscribeWebFromEvent(conn, eventSlug)
+	ok := m.subscriptions.UnsubscribeWebFromEvent(conn, eventSlug)
+	if ok {
+		m.snipeUnwatchIfUnsubscribed(eventSlug)
+	}
+	return ok
 }
 
 func (m *LiveTradeManager) GetWebConnectionEvents(conn *websocket.Conn) []string {

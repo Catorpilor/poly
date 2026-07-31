@@ -176,5 +176,24 @@ taking precedence over the 2× rule.
 fill-or-kill buy of the *opposite* outcome token, only if it costs at most
 $0.05 per share, spending at most $5 — a cheap bet on a reversal.
 
+**Comeback Snipe** — An alert-then-buy on a token that was *formerly
+competitive, now priced as dead*: an in-play market whose token's
+Session High bid reached ≥ 0.40 and whose ask has since fallen to
+≤ 0.18. The bot never buys on its own — it sends an alert with a
+one-tap buy button; the human judges the game state. Alerts are
+episode-based: after alerting, a token re-alerts only once its ask has
+recovered above the midpoint of the crash threshold and the
+competitiveness bar (0.29 today) and then crashes again — a real
+recovery, not spread noise. Buying via the alert silences that token
+for the rest of the match. Distinct from a Lottery Ticket (which
+reacts to *our own* ceiling exit on the other side) and from pre-game
+value buys (not in-play, out of scope).
+
+**Session High** — The highest best bid the bot has observed on a token
+since it began watching that market. Restart-resettable, like SL breach
+state: after a restart the high rebuilds from zero, so a crash
+immediately after a restart cannot alert — fewer alerts, never wrong
+ones.
+
 These thresholds are product policy, deliberately global constants — not
 per-user configuration.

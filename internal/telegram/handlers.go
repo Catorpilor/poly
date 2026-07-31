@@ -7,12 +7,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/Catorpilor/poly/internal/blockchain"
 	"github.com/Catorpilor/poly/internal/database"
 	"github.com/Catorpilor/poly/internal/polymarket"
 	"github.com/Catorpilor/poly/internal/wallet"
+	"github.com/ethereum/go-ethereum/common"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 // handleStart handles the /start command
@@ -227,8 +227,8 @@ func (b *Bot) handleExport(ctx context.Context, bot *Bot, update *tgbotapi.Updat
 For security reasons, we don't directly export private keys through Telegram.
 
 *Your wallet addresses for reference:*
-EOA: `+"`%s`"+`
-Proxy: `+"`%s`"+`
+EOA: ` + "`%s`" + `
+Proxy: ` + "`%s`" + `
 
 ⚠️ *Important:*
 • Your private key is encrypted and stored securely
@@ -713,6 +713,9 @@ func (b *Bot) handlePositions(ctx context.Context, bot *Bot, update *tgbotapi.Up
 	if err != nil {
 		log.Printf("Unified position scan error: %v", err)
 	}
+
+	// Register held tokens with the snipe watcher, off the render path.
+	go b.snipeRegisterHeldForUser(update.Message.Chat.ID, proxyAddr)
 
 	// Build full message with footer
 	fullMessage := summary

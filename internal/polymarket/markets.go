@@ -54,6 +54,45 @@ type GammaMarket struct {
 	Events           []*GammaEvent `json:"events"`          // Parent events this market belongs to
 	FeeSchedule      *FeeSchedule  `json:"feeSchedule"`     // Dynamic fee config (nil = no fees / legacy)
 	FeeType          string        `json:"feeType"`         // Fee category (e.g., "sports_fees_v2", "crypto_fees_v2")
+	ClobTokenIdsRaw  string        `json:"clobTokenIds"`    // JSON string like "[\"123...\", \"456...\"]"
+	GameStartTimeRaw string        `json:"gameStartTime"`   // Scheduled game start (sports markets only)
+}
+
+// GetClobTokenIds parses the clobTokenIds JSON string. Returns nil when the
+// field is absent (non-CLOB or partial API responses).
+func (m *GammaMarket) GetClobTokenIds() []string {
+	var ids []string
+	if err := json.Unmarshal([]byte(m.ClobTokenIdsRaw), &ids); err != nil {
+		return nil
+	}
+	return ids
+}
+
+// GetGameStartTime parses the market's scheduled game start. Zero when absent
+// or unparseable (non-sports markets have no gameStartTime).
+func (m *GammaMarket) GetGameStartTime() time.Time {
+	return ParseGameStartTime(m.GameStartTimeRaw)
+}
+
+// ParseGameStartTime parses Gamma's gameStartTime formats: the event-level
+// startTime is RFC3339 ("2026-01-18T03:00:00Z") while the market-level
+// gameStartTime uses a space-separated layout with a short numeric offset
+// ("2026-01-18 03:00:00+00"). Returns the zero time for anything else — the
+// caller treats unknown starts as "never in-play".
+func ParseGameStartTime(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{
+		time.RFC3339,
+		"2006-01-02 15:04:05-07",
+		"2006-01-02 15:04:05Z07:00",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC()
+		}
+	}
+	return time.Time{}
 }
 
 // GetFeeRateBps returns the taker fee rate in basis points from the market's feeSchedule.

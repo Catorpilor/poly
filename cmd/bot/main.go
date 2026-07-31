@@ -67,6 +67,19 @@ func main() {
 	defer priceFeed.Stop()
 	defer sltpMonitor.Stop()
 
+	// Comeback Snipe: watch subscribed events, armed tokens, and held
+	// positions for the crashed-favorite pattern; alert with one-tap buy.
+	snipeWatcher := live.NewSnipeWatcher(
+		priceFeed,
+		live.NewSnipeRecipientResolver(bot.GetLiveManager(), bot.GetSLTPArmRepository()),
+		bot, // live.SnipeNotifier
+	)
+	snipeWatcher.Start()
+	defer snipeWatcher.Stop()
+	bot.GetLiveManager().SetSnipeWatcher(snipeWatcher)
+	bot.SetSnipe(snipeWatcher, priceFeed)
+	bot.SeedSnipeArmed()
+
 	// Start live monitoring web server
 	liveWebPort := 8081 // Default port for live monitoring web interface
 	if cfg.App.Port > 0 {
