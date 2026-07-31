@@ -11,8 +11,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/ethereum/go-ethereum/common"
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/Catorpilor/poly/internal/blockchain"
 	"github.com/Catorpilor/poly/internal/config"
 	"github.com/Catorpilor/poly/internal/database"
@@ -20,6 +18,8 @@ import (
 	"github.com/Catorpilor/poly/internal/live"
 	"github.com/Catorpilor/poly/internal/polymarket"
 	"github.com/Catorpilor/poly/internal/wallet"
+	"github.com/ethereum/go-ethereum/common"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 // Bot represents the Telegram bot
@@ -40,6 +40,12 @@ type Bot struct {
 	relayerClient  *polymarket.RelayerClient
 	liveManager    *live.LiveTradeManager
 	sltpMonitor    *live.SLTPMonitor
+	// Comeback Snipe: watcher + ask source wired via SetSnipe; alert registry
+	// maps short callback IDs to token/market info (token IDs are ~78 digits,
+	// far beyond Telegram's 64-byte callback data).
+	snipeWatcher *live.SnipeWatcher
+	snipeFeed    SnipeAskSource
+	snipeAlerts  *snipeAlertRegistry
 }
 
 // CommandHandler is a function that handles a command
@@ -115,6 +121,7 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 		tradingClient:  tradingClient,
 		relayerClient:  relayerClient,
 		liveManager:    liveManager,
+		snipeAlerts:    newSnipeAlertRegistry(),
 	}
 
 	// Set bot as telegram sender for live manager
@@ -1018,6 +1025,9 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, update *tgbotapi.Update) 
 	case strings.HasPrefix(data, "sltp:lot:"):
 		b.handleSLTPLotteryCallback(ctx, update)
 
+	case strings.HasPrefix(data, "snipe:"):
+		b.handleSnipeCallback(ctx, update)
+
 	default:
 		log.Printf("Unknown callback data: %s", data)
 	}
@@ -1370,14 +1380,14 @@ func (b *Bot) handleBuyLimitCallback(ctx context.Context, update *tgbotapi.Updat
 
 	// Store context for the limit price input
 	b.stateManager.SetState(userID, StateWaitingForBuyLimitPrice, map[string]interface{}{
-		"market_id":      marketID,
-		"outcome_index":  idx,
-		"outcome_name":   outcomeName,
-		"amount":         amount,
-		"market_name":    marketName,
-		"current_price":  currentPrice,
-		"chat_id":        chatID,
-		"message_id":     messageID,
+		"market_id":     marketID,
+		"outcome_index": idx,
+		"outcome_name":  outcomeName,
+		"amount":        amount,
+		"market_name":   marketName,
+		"current_price": currentPrice,
+		"chat_id":       chatID,
+		"message_id":    messageID,
 	}, 5*time.Minute)
 
 	// Show prompt for limit price
@@ -1549,6 +1559,9 @@ func (b *Bot) handleRefreshPositions(ctx context.Context, update *tgbotapi.Updat
 	if err != nil {
 		log.Printf("Unified position scan error: %v", err)
 	}
+
+	// Register held tokens with the snipe watcher, off the render path.
+	go b.snipeRegisterHeldForUser(chatID, proxyAddr)
 
 	// Build full message with footer
 	fullMessage := summary
@@ -2554,8 +2567,8 @@ func (b *Bot) executeSellOrderFromPosition(ctx context.Context, user *database.U
 		Side:         "SELL",
 		Outcome:      pos.Outcome,
 		Amount:       amount,
-		SharesRaw:    sharesRaw,   // Use exact shares from position
-		Price:        limitPrice,  // 0 means market order, >0 means limit order
+		SharesRaw:    sharesRaw,  // Use exact shares from position
+		Price:        limitPrice, // 0 means market order, >0 means limit order
 		OrderType:    orderType,
 		NegativeRisk: pos.NegativeRisk,
 		TakerFeeBps:  orderFeeBps,
@@ -2580,7 +2593,7 @@ func (b *Bot) executeSellOrderFromPosition(ctx context.Context, user *database.U
 			log.Printf("Exchange %s (%s) is NOT approved to transfer shares from proxy %s",
 				exchangeName, exchangeAddr.Hex(), proxyAddress.Hex())
 			return &polymarket.TradeResult{
-				Success: false,
+				Success:  false,
 				ErrorMsg: fmt.Sprintf("Exchange not approved. Please sell this position once on Polymarket.com to enable approval, then you can sell via bot. (Exchange: %s)", exchangeName),
 			}
 		} else {

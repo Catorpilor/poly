@@ -47,6 +47,9 @@ func (b *Bot) handleSLTPList(ctx context.Context, update *tgbotapi.Update) {
 		return
 	}
 
+	// Positions were just fetched: register them as held snipe watches.
+	go b.registerSnipeHeld(chatID, positions)
+
 	if len(positions) == 0 {
 		keyboard := tgbotapi.NewInlineKeyboardMarkup(
 			tgbotapi.NewInlineKeyboardRow(
@@ -245,6 +248,10 @@ func (b *Bot) handleSLTPArmCallback(ctx context.Context, update *tgbotapi.Update
 		b.sltpMonitor.SubscribeFor(saved.TokenID)
 	}
 
+	// Armed tokens join the snipe universe; metadata comes from Gamma
+	// (game start), so resolve it off the handler path.
+	go b.registerSnipeArmed(pos.MarketID, saved.TokenID, pos.Outcome)
+
 	b.sendMessage(chatID, sltpArmedText(pos.MarketTitle, pos.Outcome, saved))
 
 	// Re-render the list so the button flips to disarm.
@@ -301,6 +308,9 @@ func (b *Bot) handleSLTPDisarmCallback(ctx context.Context, update *tgbotapi.Upd
 
 	if b.sltpMonitor != nil {
 		b.sltpMonitor.UnsubscribeFor(arm.TokenID)
+	}
+	if b.snipeWatcher != nil {
+		b.snipeWatcher.UnwatchArmed(arm.TokenID)
 	}
 
 	b.sendMessage(chatID, fmt.Sprintf("⏹ *Disarmed* %s", b.sltpArmDisplay(userID, arm)))
