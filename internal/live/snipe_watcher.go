@@ -494,6 +494,40 @@ func (w *SnipeWatcher) sweepExpired() {
 	w.unsubscribeReleased(release)
 }
 
+// snipeRecipientAdapter is the production SnipeRecipientResolver: event
+// subscribers from the live manager's SubscriptionRegistry, arm owners from
+// the SL/TP arm store.
+type snipeRecipientAdapter struct {
+	manager *LiveTradeManager
+	store   SLTPArmStore
+}
+
+// NewSnipeRecipientResolver builds the production recipient resolver.
+func NewSnipeRecipientResolver(m *LiveTradeManager, store SLTPArmStore) SnipeRecipientResolver {
+	return &snipeRecipientAdapter{manager: m, store: store}
+}
+
+func (a *snipeRecipientAdapter) EventSubscribers(eventSlug string) []int64 {
+	return a.manager.subscriptions.GetTelegramSubscribers(eventSlug)
+}
+
+func (a *snipeRecipientAdapter) ArmOwners(tokenID string) []int64 {
+	arms, err := a.store.ListArmedByToken(context.Background(), tokenID)
+	if err != nil {
+		log.Printf("SnipeWatcher: list arm owners for %s: %v", tokenID, err)
+		return nil
+	}
+	seen := make(map[int64]bool)
+	var owners []int64
+	for _, arm := range arms {
+		if !seen[arm.TelegramID] {
+			seen[arm.TelegramID] = true
+			owners = append(owners, arm.TelegramID)
+		}
+	}
+	return owners
+}
+
 // sessionHigh exposes a token's current session high for tests.
 func (w *SnipeWatcher) sessionHigh(tokenID string) float64 {
 	w.mu.Lock()

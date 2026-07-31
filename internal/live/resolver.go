@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Catorpilor/poly/internal/polymarket"
 )
 
 // subMarketKeywords is the single source of truth for keywords that indicate a sub-market
@@ -50,18 +52,21 @@ type EventInfo struct {
 
 // MarketInfo contains information about a market within an event
 type MarketInfo struct {
-	ID             string   `json:"id"`
-	Question       string   `json:"question"`
-	ConditionID    string   `json:"conditionId"`
-	Slug           string   `json:"slug"`
-	Outcomes       []string `json:"-"` // Parsed from OutcomesRaw
-	OutcomesRaw    string   `json:"outcomes"`
-	ClobTokenIds   []string `json:"-"` // Parsed from ClobTokenIdsRaw
-	ClobTokenIdsRaw string  `json:"clobTokenIds"`
-	OutcomePrices  []string `json:"-"` // Parsed from OutcomePricesRaw
-	OutcomePricesRaw string `json:"outcomePrices"`
-	Active         bool     `json:"active"`
-	Closed         bool     `json:"closed"`
+	ID               string   `json:"id"`
+	Question         string   `json:"question"`
+	ConditionID      string   `json:"conditionId"`
+	Slug             string   `json:"slug"`
+	Outcomes         []string `json:"-"` // Parsed from OutcomesRaw
+	OutcomesRaw      string   `json:"outcomes"`
+	ClobTokenIds     []string `json:"-"` // Parsed from ClobTokenIdsRaw
+	ClobTokenIdsRaw  string   `json:"clobTokenIds"`
+	OutcomePrices    []string `json:"-"` // Parsed from OutcomePricesRaw
+	OutcomePricesRaw string   `json:"outcomePrices"`
+	Active           bool     `json:"active"`
+	Closed           bool     `json:"closed"`
+	// GameStartTimeRaw is Gamma's scheduled game start (sports markets only).
+	// Parsed on demand by GetGameStartTime, like the other raw fields.
+	GameStartTimeRaw string `json:"gameStartTime"`
 }
 
 // The accessors below parse their raw JSON on every call instead of
@@ -95,6 +100,13 @@ func (m *MarketInfo) GetOutcomePrices() []string {
 		return nil
 	}
 	return prices
+}
+
+// GetGameStartTime parses the market's scheduled game start. Zero when the
+// field is absent or unparseable — the snipe watcher treats unknown starts as
+// "never in-play".
+func (m *MarketInfo) GetGameStartTime() time.Time {
+	return polymarket.ParseGameStartTime(m.GameStartTimeRaw)
 }
 
 // GetClobTokenIds parses the clobTokenIds JSON string
