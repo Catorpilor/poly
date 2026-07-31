@@ -395,3 +395,77 @@ per issue.
       one unreproducible polymarket -race failure before widening the
       test grace windows to 150ms, stable across 16 runs after
 - [x] gofmt -l clean on all touched files
+
+---
+
+# Comeback Snipe v1 (#29) — 2026-08-01
+
+Branch `feat/comeback-snipe`, TDD red→green per stage, spec + staged plan
+in issue #29; glossary semantics (Comeback Snipe, Session High) binding
+from CONTEXT.md.
+
+## Stage 1 — SnipeWatcher core (internal/live/snipe_watcher.go)
+- [x] Constants SnipeCompetitiveBid=0.40, SnipeCrashAsk=0.18;
+      snipeResetAsk() derived midpoint (expression, not a 0.29 literal)
+- [x] Per-token {sessionHigh, alerted, boughtThisMatch} under a mutex,
+      in-memory, restart-resettable; MarkBought latches for the match
+- [x] evaluate(tokenID, bid, ask): ratchet high on bid; alert on
+      high ≥ 0.40 ∧ 0 < ask ≤ 0.18 ∧ !alerted ∧ !bought ∧ in-play;
+      episode reset when ask > midpoint
+- [x] In-play gate: Gamma market-level gameStartTime (startDate is the
+      listing date; acceptingOrders is true pre-game — neither works);
+      unknown start never alerts
+- [x] Recipient resolution injected (SnipeRecipientResolver: event
+      subscribers + arm owners); holders tracked internally with TTL
+- [x] Tests: exact boundaries (0.40/0.18), high 0.39 / ask 0.19 no-fire,
+      flap 0.17↔0.19↔0.17 → ONE alert, Kudermetova replay (recover >0.29,
+      re-crash → second alert), MarkBought silence, fresh-watcher restart,
+      pre-start gate, concurrent evaluate fires once
+
+## Stage 2 — Universe + feed wiring (internal/live)
+- [x] Subscribed events: tokens watched while any telegram/web subscriber
+      exists (new HasAnySubscribers), released with the last; pinned
+      subscriptions watch the pinned market, others the ML markets —
+      mirroring the trade feed's resolution
+- [x] Armed tokens ride the SL/TP monitor's existing feed subscription
+      (no watcher ref); held tokens Subscribe with SnipeHeldTTL=6h,
+      lazily pruned + 10-min janitor for quiet tokens
+- [x] polymarket.ParseGameStartTime (space-offset + RFC3339 layouts);
+      GammaMarket gains gameStartTime + clobTokenIds parsing; MarketInfo
+      gains GetGameStartTime
+- [x] NewSnipeRecipientResolver adapter (SubscriptionRegistry + arm store)
+- [x] Fixed in review: releasing an armed-only token must not Unsubscribe
+      the SL/TP monitor's feed ref — unsubscribes strictly by feedRef
+
+## Stage 3 — Alert + tap (internal/telegram/snipe.go)
+- [x] Pure builders (table-tested): alert text (was $high / now $ask,
+      payout multiple), repriced text, filled text; [Snipe $10][Snipe $25]
+- [x] In-memory alert registry: base36 sequential alertID → token/market
+      info, 12h TTL, lazy pruning; callback `snipe:<alertID>:<10|25>`
+      (token IDs ~78 digits can't ride 64-byte callback data)
+- [x] Tap: atomic claim (used/expired IDs answer and never buy twice);
+      repricing guard re-checks BestAsk, refuses > SnipeCrashAsk*1.5 or
+      unavailable with a "repriced — not buying" edit; buy through the
+      existing executeBuyOrderByIndex market path; MarkBought on fill;
+      Arm SL/TP offered via the existing sltp_list flow on the fill message
+- [x] Universe hooks: arm handler + boot seed register armed (Gamma
+      metadata off-path), disarm unwatches; positions fetches (/positions,
+      refresh, sell list, SL/TP list) register held with TTL
+- [x] Wired in cmd/bot/main.go
+
+## Verification
+- [x] go test ./... green
+- [x] go test -race -count=1 ./internal/live/ ./internal/telegram/ green
+      (per-package — RPi)
+- [x] gofmt -l clean on all touched files
+- [x] go vet ./... clean
+
+## Review
+Armed tokens auto-disarmed by the monitor (SL/TP fire, gone position)
+keep a stale armed-source entry in the watcher until restart — recipients
+resolve live via the arm store, so no wrong alerts, just idle state.
+Guard refusal consumes the alert (terminal "repriced" state by design);
+a fresh alert requires recovery above the midpoint and a re-crash.
+Web-panel subscribers keep tokens watched but alerts are Telegram DMs
+only (web has no chat identity) — matches issue #29's v1 scope.
+NOT deployed; no DB migration (all state in-memory by design).

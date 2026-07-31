@@ -1620,6 +1620,9 @@ func (b *Bot) handleSellPositions(ctx context.Context, update *tgbotapi.Update) 
 		return
 	}
 
+	// Positions were just fetched: register them as held snipe watches.
+	go b.registerSnipeHeld(chatID, positions)
+
 	if len(positions) == 0 {
 		keyboard := tgbotapi.NewInlineKeyboardMarkup(
 			tgbotapi.NewInlineKeyboardRow(
