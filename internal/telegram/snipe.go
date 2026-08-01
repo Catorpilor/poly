@@ -361,7 +361,7 @@ func (b *Bot) registerSnipeHeld(chatID int64, positions []*polymarket.Position) 
 		}
 		market := markets[pos.MarketID]
 		if market == nil {
-			m, err := marketClient.GetMarketByID(ctx, pos.MarketID)
+			m, err := fetchSnipeMarket(ctx, marketClient, pos.MarketID)
 			if err != nil {
 				log.Printf("Snipe: fetch market %s for held token: %v", pos.MarketID, err)
 				continue
@@ -371,6 +371,17 @@ func (b *Bot) registerSnipeHeld(chatID int64, positions []*polymarket.Position) 
 		}
 		b.snipeWatcher.WatchHeld(chatID, snipeMarketFromGamma(market, pos.TokenID, pos.Outcome), live.SnipeHeldTTL)
 	}
+}
+
+// fetchSnipeMarket fetches a Gamma market for a held position. The Data API's
+// position "market ID" is the 0x-prefixed condition ID, which Gamma's
+// /markets/{id} path form rejects with 422 (issue #33) — hashes must go
+// through the ?condition_id= query; numeric Gamma ids keep the path form.
+func fetchSnipeMarket(ctx context.Context, mc *polymarket.MarketClient, id string) (*polymarket.GammaMarket, error) {
+	if strings.HasPrefix(id, "0x") {
+		return mc.GetMarketByConditionID(ctx, id)
+	}
+	return mc.GetMarketByID(ctx, id)
 }
 
 // snipeRegisterHeldForUser fetches the user's positions and registers them as

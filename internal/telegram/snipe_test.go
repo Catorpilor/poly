@@ -1,11 +1,16 @@
 package telegram
 
 import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Catorpilor/poly/internal/live"
+	"github.com/Catorpilor/poly/internal/polymarket"
 )
 
 func TestSnipeAlertText(t *testing.T) {
@@ -184,5 +189,45 @@ func TestSnipeFilledText(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("snipeFilledText missing %q in:\n%s", want, got)
 		}
+	}
+}
+
+// TestFetchSnipeMarketRoutesByIDForm reproduces issue #33: the Data API's
+// position "market ID" is a 0x-prefixed condition ID, which must go through
+// Gamma's ?condition_id= query — the /markets/{id} path form 422s on it.
+func TestFetchSnipeMarketRoutesByIDForm(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/markets" && r.URL.Query().Get("condition_id") != "":
+			fmt.Fprint(w, `[{"id":"3080779","question":"Game 1 Winner","conditionId":"0x1cf1"}]`)
+		case r.URL.Path == "/markets/3080779":
+			fmt.Fprint(w, `{"id":"3080779","question":"Game 1 Winner"}`)
+		default:
+			// The path form with a 0x id — Gamma's real behavior is 422.
+			w.WriteHeader(http.StatusUnprocessableEntity)
+		}
+	}))
+	defer srv.Close()
+	mc := polymarket.NewMarketClientWithURL(srv.URL)
+
+	tests := []struct {
+		name string
+		id   string
+	}{
+		{name: "condition ID routes via query", id: "0x1cf14d0add6dfc90f2e3de1250cce7775cb5f5c909e9c81111f47c9ba5ce49a5"},
+		{name: "numeric gamma ID routes via path", id: "3080779"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, err := fetchSnipeMarket(context.Background(), mc, tt.id)
+			if err != nil {
+				t.Fatalf("fetchSnipeMarket(%q): %v", tt.id, err)
+			}
+			if m == nil || m.Question != "Game 1 Winner" {
+				t.Fatalf("fetchSnipeMarket(%q) = %+v, want Game 1 Winner", tt.id, m)
+			}
+		})
 	}
 }
