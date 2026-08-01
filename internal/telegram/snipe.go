@@ -378,10 +378,23 @@ func (b *Bot) registerSnipeHeld(chatID int64, positions []*polymarket.Position) 
 // /markets/{id} path form rejects with 422 (issue #33) — hashes must go
 // through the ?condition_id= query; numeric Gamma ids keep the path form.
 func fetchSnipeMarket(ctx context.Context, mc *polymarket.MarketClient, id string) (*polymarket.GammaMarket, error) {
-	if strings.HasPrefix(id, "0x") {
-		return mc.GetMarketByConditionID(ctx, id)
+	if !strings.HasPrefix(id, "0x") {
+		return mc.GetMarketByID(ctx, id)
 	}
-	return mc.GetMarketByID(ctx, id)
+	m, err := mc.GetMarketByConditionID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	// Gamma's ?condition_id= form omits gameStartTime entirely (the by-slug
+	// form has it). Without a game start the in-play gate never opens, so
+	// refetch by slug to enrich; on failure keep the unenriched market —
+	// watching without alerting still beats not watching.
+	if m.GetGameStartTime().IsZero() && m.Slug != "" {
+		if enriched, err := mc.GetMarketBySlug(ctx, m.Slug); err == nil && enriched != nil {
+			return enriched, nil
+		}
+	}
+	return m, nil
 }
 
 // snipeRegisterHeldForUser fetches the user's positions and registers them as

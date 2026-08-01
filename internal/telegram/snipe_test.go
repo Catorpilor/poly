@@ -231,3 +231,38 @@ func TestFetchSnipeMarketRoutesByIDForm(t *testing.T) {
 		})
 	}
 }
+
+// TestFetchSnipeMarketEnrichesGameStart reproduces the v0.12.3 gap: Gamma's
+// ?condition_id= responses omit gameStartTime entirely (the by-slug form has
+// it), which left armed tokens permanently outside the in-play gate. The
+// router must refetch by slug when the condition-ID response lacks a game
+// start but carries a slug.
+func TestFetchSnipeMarketEnrichesGameStart(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/markets" && r.URL.Query().Get("condition_id") != "":
+			// Real Gamma behavior: no gameStartTime key on this form.
+			fmt.Fprint(w, `[{"id":"3080779","question":"Game 2 Winner","conditionId":"0xf17e","slug":"lol-ns-fox1-game2"}]`)
+		case r.URL.Path == "/markets/slug/lol-ns-fox1-game2":
+			// The by-slug form returns a single object and includes the field.
+			fmt.Fprint(w, `{"id":"3080779","question":"Game 2 Winner","conditionId":"0xf17e","slug":"lol-ns-fox1-game2","gameStartTime":"2026-08-01 08:00:00+00"}`)
+		default:
+			w.WriteHeader(http.StatusUnprocessableEntity)
+		}
+	}))
+	defer srv.Close()
+	mc := polymarket.NewMarketClientWithURL(srv.URL)
+
+	m, err := fetchSnipeMarket(context.Background(), mc, "0xf17e3c60c7ca0094aec6f7db5bcf058d8b8da68d7e01e9675fc2493e451237ac")
+	if err != nil {
+		t.Fatalf("fetchSnipeMarket: %v", err)
+	}
+	if m.GetGameStartTime().IsZero() {
+		t.Fatalf("gameStartTime not enriched: %+v", m)
+	}
+	if got := m.GetGameStartTime().UTC().Hour(); got != 8 {
+		t.Errorf("gameStartTime hour = %d, want 8", got)
+	}
+}
