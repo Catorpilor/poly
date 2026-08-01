@@ -234,7 +234,7 @@ func (b *Bot) handleSnipeCallback(ctx context.Context, update *tgbotapi.Update) 
 	}
 
 	marketClient := polymarket.NewMarketClient()
-	market, err := marketClient.GetMarketByID(ctx, entry.marketID)
+	market, err := fetchSnipeMarket(ctx, marketClient, entry.marketID)
 	if err != nil {
 		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Snipe failed: couldn't fetch market: %v", err))
 		return
@@ -305,7 +305,7 @@ func (b *Bot) registerSnipeArmed(marketID, tokenID, fallbackOutcome string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	market, err := polymarket.NewMarketClient().GetMarketByID(ctx, marketID)
+	market, err := fetchSnipeMarket(ctx, polymarket.NewMarketClient(), marketID)
 	if err != nil {
 		log.Printf("Snipe: fetch market %s for armed token: %v", marketID, err)
 		return
