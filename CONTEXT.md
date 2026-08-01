@@ -134,7 +134,9 @@ auto-sell when a trigger fires. One Arm per user per Token ID. Thresholds
 are frozen from the position's average price and share count *at arm time*;
 buying more shares later does not move them until re-armed. All triggers
 evaluate the **best bid** — the price a sell would actually hit — never the
-last trade or the midpoint.
+last trade or the midpoint. Arms whose market has closed are swept
+automatically — auto-disarmed with a cleanup notice, since a finished
+market can never fire a trigger.
 
 **Take-Profit (TP)** — Trigger: bid reaches 2× the arm-time average price →
 sell half the arm-time shares.

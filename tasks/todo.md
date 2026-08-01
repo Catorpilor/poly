@@ -590,3 +590,61 @@ Snipe alert routing (GetTelegramSubscribers) and HasAnySubscribers are
 mode-blind by design. Seeder field is read unguarded — documented
 "set before Start", matching SetSnipeWatcher's wiring pattern.
 NOT deployed; NOT pushed (branch local, PR to follow as v0.12.2).
+
+---
+
+# Auto-sweep SL/TP arms on closed markets (issue #39, 2026-08-01)
+
+Branch feat/resolved-arm-sweeper, TDD red→green, one commit per layer.
+Verified sweep signal (live-tested, issue body): GET /markets?
+condition_ids=<id>&closed=true returns the market iff actually closed;
+empty for open/unresolved. Fail-safe: only positive, identity-matched
+closed:true evidence sweeps.
+
+## polymarket — closed-only condition-ID lookup
+- [x] Refactor GetMarketByConditionID into unexported helper with
+      closedOnly bool (URL gains &closed=true); exported
+      GetClosedMarketByConditionID; both keep the #38 identity check
+- [x] ErrMarketNotFound sentinel so callers can tell "empty response"
+      (open/unresolved — the common negative) from real lookup errors
+- [x] Table tests (httptest): closed variant sends closed=true and
+      returns the market; empty → not-found error (errors.Is sentinel);
+      ignore-and-default simulation → "filter not applied"; plain
+      lookup sends no closed param; existing tests unchanged
+
+## telegram — cleanup notice
+- [x] Pure sltpSweptText builder: "🧹 *Cleaned up N finished
+      position(s)*" + comma-joined outcomes + finished-markets-need-no-
+      SL/TP line; table-tested
+- [x] Bot.NotifyArmsSwept sends it (live.Notifier impl)
+
+## live — sweeper in SLTPMonitor
+- [x] ClosedMarketChecker interface + SetClosedMarketChecker (nil =
+      sweeper disabled; set before Start, matching SetHistorySeeder)
+- [x] sweepInitialDelay (~2 min) + sweepInterval (1h) fields,
+      test-overridable like tickInterval; goroutine from Start()
+- [x] Each sweep: snapshot armed rows via the existing listing
+      (ListArmedTokenIDs → ListArmedByToken), lookup once per
+      conditionID; market returned AND Closed → per arm: Disarm
+      (tolerate ErrSLTPArmNotFound), clear SL state, unsubscribe-if-
+      last; ONE NotifyArmsSwept per affected user with grouped
+      outcomes; lookup error/empty → keep (fail-safe)
+- [x] Summary log (swept/kept/errors) only when it did something or
+      errored; quiet no-op sweep logs nothing
+- [x] Notifier interface gains NotifyArmsSwept; fakeNotifier records
+- [x] Tests (fake store/notifier/checker): closed → all arms disarmed
+      + state cleared + one notice per user; open/not-found untouched;
+      checker error untouched; two users sharing a condition each
+      noticed; condition looked up once despite two arms; disarm
+      exactly once per arm; concurrent evals under -race
+
+## Wiring & docs
+- [x] cmd/bot/main.go: SetClosedMarketChecker(polymarket.NewMarketClient())
+- [x] CONTEXT.md Arm entry: one sentence — closed-market arms are swept
+      automatically (auto-disarm with a cleanup notice)
+
+## Verification
+- [x] go test -count=1 ./... green
+- [x] go test -race -count=1 ./internal/live/ ./internal/telegram/
+      ./internal/polymarket/ green (per-package — RPi)
+- [x] gofmt -l clean on touched files
