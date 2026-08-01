@@ -3,6 +3,7 @@ package polymarket
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -279,14 +280,36 @@ func (mc *MarketClient) GetMarketByID(ctx context.Context, id string) (*GammaMar
 	return &market, nil
 }
 
+// ErrMarketNotFound reports that a condition-ID lookup returned no market.
+// For the closed-only variant this is the common negative — the market exists
+// but Gamma does not consider it closed yet — so callers (the resolved-arm
+// sweeper) match it with errors.Is to tell "keep quietly" from a real error.
+var ErrMarketNotFound = errors.New("market not found")
+
 // GetMarketByConditionID fetches a specific market by its condition ID
 // This is useful for copy trading where signals provide conditionId.
-// The filter param is condition_ids (plural) — Gamma silently IGNORES
-// unknown params and returns the default market list, so the singular form
-// "worked" while returning arbitrary unrelated markets. The response's
-// conditionId is validated against the request for the same reason.
 func (mc *MarketClient) GetMarketByConditionID(ctx context.Context, conditionID string) (*GammaMarket, error) {
+	return mc.getMarketByConditionID(ctx, conditionID, false)
+}
+
+// GetClosedMarketByConditionID fetches the market for conditionID only if
+// Gamma reports it closed (resolved). Live-verified semantics (issue #39):
+// the closed=true filter returns the market iff it is actually closed; open
+// or finished-but-unresolved markets yield ErrMarketNotFound.
+func (mc *MarketClient) GetClosedMarketByConditionID(ctx context.Context, conditionID string) (*GammaMarket, error) {
+	return mc.getMarketByConditionID(ctx, conditionID, true)
+}
+
+// getMarketByConditionID implements both condition-ID lookups. The filter
+// param is condition_ids (plural) — Gamma silently IGNORES unknown params and
+// returns the default market list, so the singular form "worked" while
+// returning arbitrary unrelated markets (issue #38). The response's
+// conditionId is validated against the request for the same reason.
+func (mc *MarketClient) getMarketByConditionID(ctx context.Context, conditionID string, closedOnly bool) (*GammaMarket, error) {
 	url := fmt.Sprintf("%s/markets?condition_ids=%s", mc.gammaAPIURL, conditionID)
+	if closedOnly {
+		url += "&closed=true"
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -310,7 +333,7 @@ func (mc *MarketClient) GetMarketByConditionID(ctx context.Context, conditionID 
 	}
 
 	if len(markets) == 0 {
-		return nil, fmt.Errorf("market not found for conditionId: %s", conditionID)
+		return nil, fmt.Errorf("%w for conditionId: %s", ErrMarketNotFound, conditionID)
 	}
 
 	// Identity check: if Gamma ever ignores the filter again (unknown param,
