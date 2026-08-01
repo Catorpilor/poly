@@ -381,7 +381,9 @@ type LiveTradeManager struct {
 	subscriptions *SubscriptionRegistry
 	resolver      *EventSlugResolver
 	formatter     *TradeFormatter
-	telegramBot   TelegramSender
+	// feedBatcher coalesces the Telegram trade feed (issue #31); nil until
+	// SetTelegramBot wires a sender. Nil-safe: every hook checks first.
+	feedBatcher *FeedBatcher
 
 	mu              sync.RWMutex
 	conn            *websocket.Conn
@@ -480,7 +482,7 @@ func NewLiveTradeManager() *LiveTradeManager {
 }
 
 func (m *LiveTradeManager) SetTelegramBot(bot TelegramSender) {
-	m.telegramBot = bot
+	m.feedBatcher = NewFeedBatcher(bot)
 }
 
 func (m *LiveTradeManager) Start() error {
@@ -876,6 +878,11 @@ func (m *LiveTradeManager) handleTrade(payload *rtdsTradePayload) bool {
 }
 
 func (m *LiveTradeManager) Stop() error {
+	// Best-effort drain: pending feed batches go out before teardown.
+	if m.feedBatcher != nil {
+		m.feedBatcher.FlushAll()
+	}
+
 	m.cancel()
 
 	m.mu.Lock()
@@ -927,6 +934,9 @@ func (m *LiveTradeManager) SubscribeTelegram(ctx context.Context, chatID int64, 
 func (m *LiveTradeManager) UnsubscribeTelegram(chatID int64, eventSlug string) bool {
 	ok := m.subscriptions.UnsubscribeTelegram(chatID, eventSlug)
 	if ok {
+		if m.feedBatcher != nil {
+			m.feedBatcher.Flush(chatID, eventSlug)
+		}
 		m.snipeUnwatchIfUnsubscribed(eventSlug)
 	}
 	return ok
@@ -934,6 +944,11 @@ func (m *LiveTradeManager) UnsubscribeTelegram(chatID int64, eventSlug string) b
 
 func (m *LiveTradeManager) UnsubscribeAllTelegram(chatID int64) []string {
 	unsubscribed := m.subscriptions.UnsubscribeAllTelegram(chatID)
+	if m.feedBatcher != nil {
+		for _, eventSlug := range unsubscribed {
+			m.feedBatcher.Flush(chatID, eventSlug)
+		}
+	}
 	m.snipeUnwatchIfUnsubscribed(unsubscribed...)
 	return unsubscribed
 }
@@ -1125,8 +1140,13 @@ func (m *LiveTradeManager) IsWebSubscribed(conn *websocket.Conn, eventSlug strin
 	return m.subscriptions.IsWebSubscribed(conn, eventSlug)
 }
 
+// broadcastToTelegram relays one matched trade into the feed batcher:
+// sub-floor trades are dropped and the rest coalesce into one message per
+// (chat, subscription) per feedBatchWindow, so the feed can never crowd
+// SL/TP fires or snipe alerts (direct sends) out of the per-chat rate
+// budget. The web path (broadcastToWeb) stays unfiltered and unbatched.
 func (m *LiveTradeManager) broadcastToTelegram(eventSlug string, trade *TradeInfo) {
-	if m.telegramBot == nil {
+	if m.feedBatcher == nil {
 		return
 	}
 
@@ -1135,9 +1155,12 @@ func (m *LiveTradeManager) broadcastToTelegram(eventSlug string, trade *TradeInf
 		return
 	}
 
-	message := m.formatter.FormatForTelegram(trade)
+	// RTDS "size" is the trade's USDC value — both feeds display it as
+	// dollars — so it is the figure the relay floor applies to.
+	tradeUSD := trade.Size.InexactFloat64()
+	line := m.formatter.FormatTelegramLine(trade)
 	for _, chatID := range subscribers {
-		m.telegramBot.SendMessage(chatID, message)
+		m.feedBatcher.Add(chatID, eventSlug, tradeUSD, line)
 	}
 }
 

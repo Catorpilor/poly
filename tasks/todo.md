@@ -469,3 +469,57 @@ a fresh alert requires recovery above the midpoint and a re-crash.
 Web-panel subscribers keep tokens watched but alerts are Telegram DMs
 only (web has no chat identity) — matches issue #29's v1 scope.
 NOT deployed; no DB migration (all state in-memory by design).
+
+---
+
+# Telegram Feed Batching (issue #31, 2026-08-01)
+
+Live feed flooded Telegram (13 msgs/min of dust prints on the tennis
+sub) and shared the send path's rate budget with SL/TP + snipe alerts.
+
+## Batcher core (internal/live/feed_batcher.go)
+- [x] Policy constants: feedBatchWindow=5s, FeedMinTradeUSD=20.0,
+      feedBatchMaxLines=10 — package-level product policy, no config
+- [x] FeedBatcher: buffers per (chatID, eventSlug); first buffered trade
+      arms a one-shot flush timer (no idle ticks); flush sends ONE
+      message: "[SHORT-SLUG] Live trades" header + up to 10 lines newest
+      last + "+N more trades" tail; Flush (unsubscribe) delivers pending
+      immediately and stops the timer; FlushAll = shutdown drain
+- [x] feedTimer interface over time.AfterFunc — tests fire flushes
+      deterministically, no sleeps
+
+## Wiring (internal/live/manager.go, formatter.go)
+- [x] broadcastToTelegram → batcher.Add per subscriber; filters on
+      trade.Size (RTDS "size" is the USDC value both feeds show as $)
+- [x] FormatForTelegram → FormatTelegramLine (event prefix moved to the
+      batch header; per-line body unchanged)
+- [x] UnsubscribeTelegram / UnsubscribeAllTelegram flush pending;
+      Stop() drains best-effort
+- [x] Web path untouched: broadcastToWeb unfiltered, unbatched
+- [x] SL/TP + snipe stay direct: Notifier/SnipeNotifier implementations
+      call b.sendMessage / b.sendMessageWithKeyboard, never the batcher
+
+## Tests (feed_batcher_test.go, feed_batcher_wiring_test.go)
+- [x] Floor: 19.99 dropped (no timer), 20.00 kept
+- [x] Single flush keeps buffered line order; window value asserted
+- [x] Cap at 10 lines + "+3 more trades" count
+- [x] Separate chats / separate subscriptions never share a buffer
+- [x] Unsubscribe flushes immediately; stopped timer can't double-send
+- [x] Empty buffer sends nothing (Flush + FlushAll)
+- [x] New window after flush excludes old lines
+- [x] Concurrent adds during flush race-safe, every add accounted once
+- [x] Manager wiring: batched relay, sub-floor drop, unsubscribe flush,
+      web frame still immediate for a sub-floor trade
+
+## Verification
+- [x] go test ./... green
+- [x] go test -race -count=1 ./internal/live/ ./internal/telegram/ green
+      (per-package — RPi)
+- [x] gofmt -l clean on touched files; go vet ./internal/live/ clean
+
+## Review
+Flush sends outside the batcher mutex, so a slow Telegram send can't
+block new windows. Kept lines are the FIRST 10 of the window ("+N more"
+counts later overflow) — bounded memory during a flood. 429
+retry/backoff in sendMessage noted out of scope per the issue; not
+trivial from the batcher's side, left alone. NOT deployed.
