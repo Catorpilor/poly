@@ -29,17 +29,17 @@ func NewTradeFormatter() *TradeFormatter {
 	return &TradeFormatter{}
 }
 
-// FormatForTelegram formats a trade for Telegram display
-// Format: "[LAL-POR] Whale123 BUY YES $500.00 @ $0.65"
-// For 3-way ML: "[WOL-NEW] Whale123 BUY DRAW YES $500.00 @ $0.65"
-// For sub-markets: "[AST-EVE] Whale123 BUY Over 2.5 $500.00 @ $0.65"
-func (f *TradeFormatter) FormatForTelegram(trade *TradeInfo) string {
+// FormatTelegramLine formats a trade as one tape line for the batched
+// Telegram feed — no event prefix, the flushed message carries the
+// subscription context once in its header.
+// Format: "Whale123 BUY YES $500.00 @ $0.65"
+// For 3-way ML: "Whale123 BUY DRAW YES $500.00 @ $0.65"
+// For sub-markets: "Whale123 BUY Over 2.5 $500.00 @ $0.65"
+func (f *TradeFormatter) FormatTelegramLine(trade *TradeInfo) string {
 	trader := trade.Pseudonym
 	if trader == "" {
 		trader = truncateAddress(trade.ProxyWallet)
 	}
-
-	shortEvent := ShortenEventSlug(trade.EventSlug)
 
 	// Determine what to display as outcome
 	outcome := trade.Outcome
@@ -55,8 +55,7 @@ func (f *TradeFormatter) FormatForTelegram(trade *TradeInfo) string {
 		// Otherwise outcome is already a team name (e.g., "Grizzlies"), use as-is
 	}
 
-	return fmt.Sprintf("[%s] %s %s %s $%s @ $%s",
-		shortEvent,
+	return fmt.Sprintf("%s %s %s $%s @ $%s",
 		trader,
 		strings.ToUpper(trade.Side),
 		outcome,
