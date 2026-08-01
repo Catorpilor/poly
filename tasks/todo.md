@@ -523,3 +523,70 @@ block new windows. Kept lines are the FIRST 10 of the window ("+N more"
 counts later overflow) — bounded memory during a flood. 429
 retry/backoff in sendMessage noted out of scope per the issue; not
 trivial from the batcher's side, left alone. NOT deployed.
+
+---
+
+# v0.12.2 — Snipe threshold, quiet subscriptions, Session High seeding (2026-08-01)
+
+Branch feat/snipe-v0.12.2, three commits (one per change).
+
+## Change 1 — SnipeCrashAsk 0.18 → 0.20 (product policy)
+- [x] SnipeCrashAsk = 0.20; snipeResetAsk() midpoint 0.30 and telegram
+      guard SnipeCrashAsk*1.5 = 0.30 stay derived, never literals
+- [x] Boundary tests fire at ask 0.20, not at 0.21; reset above 0.30;
+      flap case moved to 0.19/0.21/0.19 around the new bar
+- [x] No stale 0.18/0.27/0.29 literals (remaining 0.18s are an
+      unrelated fee expectation and a history-series data point)
+- [x] CONTEXT.md "Comeback Snipe": crash ≤ 0.20, midpoint 0.30 today
+
+## Change 2 — Quiet-by-default subscriptions, /live <slug> tape opt-in
+- [x] Registry: telegramSubs/userEvents values = per-(chat, slug) tape
+      flag; SubscribeTelegram(chatID, slug, tape) applies the flag
+      unconditionally on re-subscribe (both directions) while keeping
+      the newly-subscribed bool; membership checks comma-ok
+- [x] New TapeSubscribers + IsTapeSubscribed; GetTelegramSubscribers
+      still returns ALL telegram subscribers (routes snipe alerts)
+- [x] broadcastToTelegram → TapeSubscribers only; unsubscribe paths,
+      batcher flushes, web path unchanged
+- [x] /live <slug> [tape]: case-insensitive keyword, usage on anything
+      else (pure parseLiveArgs, table-tested); confirmation states the
+      mode; /subs marks each subscription quiet/tape
+- [x] CONTEXT.md "Live Feed": telegram tape opt-in per subscription;
+      default = quiet (snipe watch + web tape only)
+- [x] Tests: flag toggle both directions; quiet + ≥$20 trade → no
+      batcher entry while web frame delivers; tape upgrade starts
+      delivery; quiet unsubscribe still reports success
+
+## Change 3 — Seed Session High from CLOB price history
+- [x] polymarket: TradingClient.MaxTradePriceSince — public GET
+      /prices-history?market=&interval=1d&fidelity=5, max p with
+      t >= since; (0,false) on error/empty/malformed/out-of-range;
+      httptest table tests incl. since cutoff + unreachable server
+- [x] live: SnipeHistorySeeder interface, SetHistorySeeder (nil = old
+      behavior); one seeding goroutine per NEW token state via
+      ensureStateLocked (event/armed/held all funnel through it);
+      since = GameStart−2h, else now−6h; seedSessionHigh raises only,
+      mutex-guarded, never touches episode latches
+- [x] cmd/bot/main.go: existing TradingClient wired as seeder
+- [x] CONTEXT.md "Session High": seeded at watch-start, ratcheted
+      live, restart re-seeds ("restart cannot alert" caveat removed)
+- [x] Tests: Nongshim late-watch replay (seed 0.495 → bid 0.10 /
+      ask 0.20 alerts); lower seed never lowers ratcheted high; late
+      seed after alert+MarkBought keeps latches; at most one seed per
+      token state; failed fetch leaves high untouched; nil seeder
+      unchanged; concurrent seed+evaluate under -race
+
+## Verification
+- [x] go test -count=1 ./... green
+- [x] go test -race -count=1 ./internal/live/ ./internal/telegram/
+      ./internal/polymarket/ green (per-package — RPi)
+- [x] gofmt -l clean on all touched files; go vet clean on touched pkgs
+
+## Review
+Registry bool values changed meaning (membership → tape flag): every
+membership check now uses comma-ok; UnsubscribeTelegram had relied on
+the value and would have broken for quiet subs — covered by test.
+Snipe alert routing (GetTelegramSubscribers) and HasAnySubscribers are
+mode-blind by design. Seeder field is read unguarded — documented
+"set before Start", matching SetSnipeWatcher's wiring pattern.
+NOT deployed; NOT pushed (branch local, PR to follow as v0.12.2).
