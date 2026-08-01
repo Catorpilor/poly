@@ -160,6 +160,7 @@ type fakeFeed struct {
 	fallbackSource map[string]string
 	fallbackOK     map[string]bool
 	fallbackCalls  []string
+	bidCalls       []string
 	subscribes     []string
 	unsubscribes   []string
 	listeners      []PriceUpdateListener
@@ -190,8 +191,29 @@ func (f *fakeFeed) Unsubscribe(tokenID string) {
 func (f *fakeFeed) BestBid(tokenID string) (float64, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.bidCalls = append(f.bidCalls, tokenID)
 	p, ok := f.bids[tokenID]
 	return p, ok
+}
+
+// bidCallCount returns how many BestBid reads the feed has served in total.
+func (f *fakeFeed) bidCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.bidCalls)
+}
+
+// bidCallsFor returns how many BestBid reads asked about tokenID.
+func (f *fakeFeed) bidCallsFor(tokenID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, id := range f.bidCalls {
+		if id == tokenID {
+			n++
+		}
+	}
+	return n
 }
 
 func (f *fakeFeed) BestAsk(tokenID string) (float64, bool) {

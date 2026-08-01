@@ -648,3 +648,40 @@ closed:true evidence sweeps.
 - [x] go test -race -count=1 ./internal/live/ ./internal/telegram/
       ./internal/polymarket/ green (per-package — RPi)
 - [x] gofmt -l clean on touched files
+
+---
+
+# Snipe watcher tick fallback (issue #41, 2026-08-01)
+
+## live — periodic tick in SnipeWatcher
+- [x] tickInterval field (default snipeTickInterval = 20s, set in
+      NewSnipeWatcher, test-overridable before Start like the SLTP tick)
+- [x] tickLoop goroutine from Start() alongside the janitor; exits on
+      w.ctx.Done() (Stop)
+- [x] tickEvaluateAll: snapshot watched token IDs under the mutex, then
+      one evaluateFromFeed goroutine per token (handleUpdate/SLTP-tick
+      pattern — BestAsk may fall back to a 5s HTTP fetch; one slow token
+      must not stall crash detection on the others); lock never held
+      across evaluations
+- [x] WS path untouched; double-fire safety = existing alerted latch
+      under the mutex
+- [x] Alert-fire log in evaluate brought to contract format:
+      token=%.12s… high=%.3f ask=%.3f recipients=%d (dispatch now
+      returns the deduped recipient count)
+
+## Tests (snipe_tick_test.go; fakeFeed gains BestBid call recording)
+- [x] FaZe replay: feed never invokes OnUpdate, seeded high 0.695,
+      in-play, crash-zone bid/ask → one tick fires exactly one alert;
+      latch holds across further ticks
+- [x] tick + WS racing on the same crashed token → exactly one alert
+      (-race clean)
+- [x] tick respects Stop(): feed reads frozen after cancel
+- [x] tick with zero watched tokens: no feed calls, no alerts, no panic
+- [x] tick skips released tokens: unwatched T1 never evaluated, held T2
+      still alerts
+- [x] default 20s interval guarded
+
+## Verification
+- [x] go test -count=1 ./... green
+- [x] go test -race -count=1 ./internal/live/ green (per-package — RPi)
+- [x] gofmt -l clean on touched files; go vet ./internal/live/ clean

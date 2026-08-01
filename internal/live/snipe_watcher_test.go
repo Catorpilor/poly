@@ -33,6 +33,12 @@ func (n *fakeSnipeNotifier) count() int {
 	return len(n.alerts)
 }
 
+func (n *fakeSnipeNotifier) alertAt(i int) snipeAlertRec {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.alerts[i]
+}
+
 func (n *fakeSnipeNotifier) recipients() []int64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
