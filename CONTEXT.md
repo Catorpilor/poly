@@ -40,7 +40,9 @@ is never a synonym for one.
 
 **Live Feed** — A spectator view of a market's tape: third-party Trades
 streamed to subscribed chats and web clients. Watch-only — it never places
-orders and is not copy trading.
+orders and is not copy trading. Telegram delivery of the tape is opt-in per
+subscription (`/live <slug> tape`); a default subscription is quiet — snipe
+watch and the web tape only.
 
 **Position** — A user's current holdings of one outcome token: share count
 plus average price. Lives on Polymarket, keyed by Token ID.
@@ -179,21 +181,22 @@ $0.05 per share, spending at most $5 — a cheap bet on a reversal.
 **Comeback Snipe** — An alert-then-buy on a token that was *formerly
 competitive, now priced as dead*: an in-play market whose token's
 Session High bid reached ≥ 0.40 and whose ask has since fallen to
-≤ 0.18. The bot never buys on its own — it sends an alert with a
+≤ 0.20. The bot never buys on its own — it sends an alert with a
 one-tap buy button; the human judges the game state. Alerts are
 episode-based: after alerting, a token re-alerts only once its ask has
 recovered above the midpoint of the crash threshold and the
-competitiveness bar (0.29 today) and then crashes again — a real
+competitiveness bar (0.30 today) and then crashes again — a real
 recovery, not spread noise. Buying via the alert silences that token
 for the rest of the match. Distinct from a Lottery Ticket (which
 reacts to *our own* ceiling exit on the other side) and from pre-game
 value buys (not in-play, out of scope).
 
-**Session High** — The highest best bid the bot has observed on a token
-since it began watching that market. Restart-resettable, like SL breach
-state: after a restart the high rebuilds from zero, so a crash
-immediately after a restart cannot alert — fewer alerts, never wrong
-ones.
+**Session High** — The highest trade-or-bid price the bot knows for a
+token in the current session: seeded at watch-start from the CLOB's
+recent trade history (since ~game start), then ratcheted live by
+observed bids — raised only, never lowered. In-memory: a restart
+re-seeds from history, so a watcher that joins (or rejoins) mid-game
+still knows a token was formerly competitive.
 
 These thresholds are product policy, deliberately global constants — not
 per-user configuration.

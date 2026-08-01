@@ -63,7 +63,11 @@ type rtdsEvent struct {
 
 // SubscriptionRegistry tracks all active subscriptions
 type SubscriptionRegistry struct {
-	mu           sync.RWMutex
+	mu sync.RWMutex
+	// telegramSubs / userEvents values carry the subscription's tape flag:
+	// presence means subscribed (snipe watch + web tape armed), true means
+	// the batched Telegram trade feed is delivered too. Membership must be
+	// checked with the comma-ok form, never the value.
 	telegramSubs map[string]map[int64]bool
 	userEvents   map[int64]map[string]bool
 	webSubs      map[string]map[*websocket.Conn]bool
@@ -83,27 +87,27 @@ func NewSubscriptionRegistry() *SubscriptionRegistry {
 	}
 }
 
-func (r *SubscriptionRegistry) SubscribeTelegram(chatID int64, eventSlug string) bool {
+// SubscribeTelegram records chatID's subscription to eventSlug and reports
+// whether it is newly subscribed. The tape flag (deliver the batched Telegram
+// trade feed) is applied unconditionally, so re-subscribing switches an
+// existing subscription's mode in either direction.
+func (r *SubscriptionRegistry) SubscribeTelegram(chatID int64, eventSlug string, tape bool) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if events, ok := r.userEvents[chatID]; ok {
-		if events[eventSlug] {
-			return false
-		}
-	}
+	_, existed := r.userEvents[chatID][eventSlug]
 
 	if r.telegramSubs[eventSlug] == nil {
 		r.telegramSubs[eventSlug] = make(map[int64]bool)
 	}
-	r.telegramSubs[eventSlug][chatID] = true
+	r.telegramSubs[eventSlug][chatID] = tape
 
 	if r.userEvents[chatID] == nil {
 		r.userEvents[chatID] = make(map[string]bool)
 	}
-	r.userEvents[chatID][eventSlug] = true
+	r.userEvents[chatID][eventSlug] = tape
 
-	return true
+	return !existed
 }
 
 func (r *SubscriptionRegistry) UnsubscribeTelegram(chatID int64, eventSlug string) bool {
@@ -118,7 +122,7 @@ func (r *SubscriptionRegistry) UnsubscribeTelegram(chatID int64, eventSlug strin
 	}
 
 	if events, ok := r.userEvents[chatID]; ok {
-		if !events[eventSlug] {
+		if _, subscribed := events[eventSlug]; !subscribed {
 			return false
 		}
 		delete(events, eventSlug)
@@ -172,6 +176,9 @@ func (r *SubscriptionRegistry) GetUserEvents(chatID int64) []string {
 	return result
 }
 
+// GetTelegramSubscribers returns ALL telegram subscribers of eventSlug,
+// whatever their tape mode — it routes snipe alerts, which every
+// subscription receives. The batched trade feed uses TapeSubscribers.
 func (r *SubscriptionRegistry) GetTelegramSubscribers(eventSlug string) []int64 {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -186,6 +193,34 @@ func (r *SubscriptionRegistry) GetTelegramSubscribers(eventSlug string) []int64 
 		result = append(result, chatID)
 	}
 	return result
+}
+
+// TapeSubscribers returns the telegram subscribers of eventSlug that opted
+// into the batched trade feed (`/live <slug> tape`).
+func (r *SubscriptionRegistry) TapeSubscribers(eventSlug string) []int64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	users, ok := r.telegramSubs[eventSlug]
+	if !ok {
+		return nil
+	}
+
+	result := make([]int64, 0, len(users))
+	for chatID, tape := range users {
+		if tape {
+			result = append(result, chatID)
+		}
+	}
+	return result
+}
+
+// IsTapeSubscribed reports whether chatID's subscription to eventSlug has the
+// tape flag. False for unknown subscriptions.
+func (r *SubscriptionRegistry) IsTapeSubscribed(chatID int64, eventSlug string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.userEvents[chatID][eventSlug]
 }
 
 func (r *SubscriptionRegistry) HasTelegramSubscribers(eventSlug string) bool {
@@ -915,13 +950,17 @@ func (m *LiveTradeManager) GetTrackedAssetCount() int {
 	return len(m.assetToEvent)
 }
 
-func (m *LiveTradeManager) SubscribeTelegram(ctx context.Context, chatID int64, eventSlug string) (*EventInfo, error) {
+// SubscribeTelegram subscribes chatID to eventSlug. tape opts into the
+// batched Telegram trade feed; a quiet subscription still arms the snipe
+// watch and the web tape. Re-subscribing switches an existing subscription's
+// mode without re-tracking assets.
+func (m *LiveTradeManager) SubscribeTelegram(ctx context.Context, chatID int64, eventSlug string, tape bool) (*EventInfo, error) {
 	eventInfo, err := m.resolver.GetEventInfo(ctx, eventSlug)
 	if err != nil {
 		return nil, err
 	}
 
-	isNew := m.subscriptions.SubscribeTelegram(chatID, eventSlug)
+	isNew := m.subscriptions.SubscribeTelegram(chatID, eventSlug, tape)
 
 	if isNew {
 		m.trackEventAssets(eventSlug, eventInfo)
@@ -929,6 +968,12 @@ func (m *LiveTradeManager) SubscribeTelegram(ctx context.Context, chatID int64, 
 	}
 
 	return eventInfo, nil
+}
+
+// IsTapeSubscription reports whether chatID's subscription to eventSlug
+// delivers the batched Telegram trade feed.
+func (m *LiveTradeManager) IsTapeSubscription(chatID int64, eventSlug string) bool {
+	return m.subscriptions.IsTapeSubscribed(chatID, eventSlug)
 }
 
 func (m *LiveTradeManager) UnsubscribeTelegram(chatID int64, eventSlug string) bool {
@@ -1140,9 +1185,10 @@ func (m *LiveTradeManager) IsWebSubscribed(conn *websocket.Conn, eventSlug strin
 	return m.subscriptions.IsWebSubscribed(conn, eventSlug)
 }
 
-// broadcastToTelegram relays one matched trade into the feed batcher:
-// sub-floor trades are dropped and the rest coalesce into one message per
-// (chat, subscription) per feedBatchWindow, so the feed can never crowd
+// broadcastToTelegram relays one matched trade into the feed batcher, for
+// tape subscribers only — quiet subscriptions get snipe alerts, never trade
+// prints. Sub-floor trades are dropped and the rest coalesce into one message
+// per (chat, subscription) per feedBatchWindow, so the feed can never crowd
 // SL/TP fires or snipe alerts (direct sends) out of the per-chat rate
 // budget. The web path (broadcastToWeb) stays unfiltered and unbatched.
 func (m *LiveTradeManager) broadcastToTelegram(eventSlug string, trade *TradeInfo) {
@@ -1150,7 +1196,7 @@ func (m *LiveTradeManager) broadcastToTelegram(eventSlug string, trade *TradeInf
 		return
 	}
 
-	subscribers := m.subscriptions.GetTelegramSubscribers(eventSlug)
+	subscribers := m.subscriptions.TapeSubscribers(eventSlug)
 	if len(subscribers) == 0 {
 		return
 	}

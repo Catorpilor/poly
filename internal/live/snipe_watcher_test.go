@@ -99,8 +99,8 @@ func TestSnipeResetAskIsDerivedMidpoint(t *testing.T) {
 	if got := snipeResetAsk(); got != want {
 		t.Errorf("snipeResetAsk() = %v, want derived midpoint %v", got, want)
 	}
-	if math.Abs(snipeResetAsk()-0.29) > 1e-9 {
-		t.Errorf("snipeResetAsk() = %v, want ~0.29", snipeResetAsk())
+	if math.Abs(snipeResetAsk()-0.30) > 1e-9 {
+		t.Errorf("snipeResetAsk() = %v, want ~0.30", snipeResetAsk())
 	}
 }
 
@@ -112,8 +112,8 @@ func TestSnipeWatcher_TriggerBoundaries(t *testing.T) {
 		want  int
 	}{
 		{
-			name:  "fires exactly at high 0.40 ask 0.18",
-			steps: [][2]float64{{0.40, 0.18}},
+			name:  "fires exactly at high 0.40 ask 0.20",
+			steps: [][2]float64{{0.40, 0.20}},
 			want:  1,
 		},
 		{
@@ -122,8 +122,8 @@ func TestSnipeWatcher_TriggerBoundaries(t *testing.T) {
 			want:  0,
 		},
 		{
-			name:  "no fire when ask 0.19",
-			steps: [][2]float64{{0.45, 0.19}},
+			name:  "no fire when ask 0.21",
+			steps: [][2]float64{{0.45, 0.21}},
 			want:  0,
 		},
 		{
@@ -137,8 +137,8 @@ func TestSnipeWatcher_TriggerBoundaries(t *testing.T) {
 			want:  1,
 		},
 		{
-			name:  "flap 0.17 / 0.19 / 0.17 produces one alert",
-			steps: [][2]float64{{0.45, 0.50}, {0.10, 0.17}, {0.10, 0.19}, {0.10, 0.17}},
+			name:  "flap 0.19 / 0.21 / 0.19 produces one alert",
+			steps: [][2]float64{{0.45, 0.50}, {0.10, 0.19}, {0.10, 0.21}, {0.10, 0.19}},
 			want:  1,
 		},
 		{
@@ -195,8 +195,10 @@ func TestSnipeWatcher_MarkBoughtSilencesForMatch(t *testing.T) {
 
 func TestSnipeWatcher_FreshWatcherHasNoSessionHigh(t *testing.T) {
 	t.Parallel()
-	// Simulates a restart: a new watcher never saw the pre-crash high, so a
-	// crash immediately after start cannot alert.
+	// No seeder wired (nil = seeding disabled): a fresh watcher never saw the
+	// pre-crash high, so a crash immediately after start cannot alert. With
+	// the production seeder the high re-seeds from trade history — see
+	// snipe_seed_test.go.
 	w, _, rec, notif, _ := snipeHarness()
 	rec.eventSubs["evt"] = []int64{101}
 	w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
