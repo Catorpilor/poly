@@ -102,3 +102,28 @@ func TestMaxTradePriceSinceUnreachableServer(t *testing.T) {
 		t.Fatalf("MaxTradePriceSince on unreachable server = (%v, %v), want (0, false)", price, ok)
 	}
 }
+
+// TestGetMarketByConditionIDRejectsUnfiltered locks in the identity check:
+// Gamma silently ignores unknown query params and returns its default market
+// list, so a wrong param name yields a plausible unrelated market instead of
+// an error (production 2026-08-01: a LoL condition ID "resolved" to a
+// politics market). The client must reject any response whose conditionId
+// does not match the request.
+func TestGetMarketByConditionIDRejectsUnfiltered(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Simulate the filter being ignored: unrelated market, HTTP 200.
+		fmt.Fprint(w, `[{"id":"9999","question":"Unrelated","conditionId":"0xdead","slug":"xi-jinping-out"}]`)
+	}))
+	defer srv.Close()
+
+	mc := NewMarketClientWithURL(srv.URL)
+	_, err := mc.GetMarketByConditionID(context.Background(), "0xf17e3c60c7ca0094aec6f7db5bcf058d8b8da68d7e01e9675fc2493e451237ac")
+	if err == nil {
+		t.Fatal("expected identity-mismatch error, got nil")
+	}
+	if !strings.Contains(err.Error(), "filter not applied") {
+		t.Errorf("error %q does not name the filter failure", err)
+	}
+}

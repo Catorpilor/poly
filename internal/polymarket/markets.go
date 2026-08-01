@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -279,9 +280,13 @@ func (mc *MarketClient) GetMarketByID(ctx context.Context, id string) (*GammaMar
 }
 
 // GetMarketByConditionID fetches a specific market by its condition ID
-// This is useful for copy trading where signals provide conditionId
+// This is useful for copy trading where signals provide conditionId.
+// The filter param is condition_ids (plural) — Gamma silently IGNORES
+// unknown params and returns the default market list, so the singular form
+// "worked" while returning arbitrary unrelated markets. The response's
+// conditionId is validated against the request for the same reason.
 func (mc *MarketClient) GetMarketByConditionID(ctx context.Context, conditionID string) (*GammaMarket, error) {
-	url := fmt.Sprintf("%s/markets?condition_id=%s", mc.gammaAPIURL, conditionID)
+	url := fmt.Sprintf("%s/markets?condition_ids=%s", mc.gammaAPIURL, conditionID)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -306,6 +311,14 @@ func (mc *MarketClient) GetMarketByConditionID(ctx context.Context, conditionID 
 
 	if len(markets) == 0 {
 		return nil, fmt.Errorf("market not found for conditionId: %s", conditionID)
+	}
+
+	// Identity check: if Gamma ever ignores the filter again (unknown param,
+	// API change), the first market of the default list must not pass as a
+	// lookup result.
+	if !strings.EqualFold(markets[0].ConditionID, conditionID) {
+		return nil, fmt.Errorf("gamma returned market %q (conditionId %s) for requested conditionId %s — filter not applied",
+			markets[0].Slug, markets[0].ConditionID, conditionID)
 	}
 
 	return markets[0], nil
