@@ -348,8 +348,11 @@ func (w *SnipeWatcher) seedFromHistory(m SnipeMarket) {
 	}
 	price, ok := w.seeder.MaxTradePriceSince(w.ctx, m.TokenID, since)
 	if !ok {
+		log.Printf("SnipeWatcher: seed unavailable token=%.12s…", m.TokenID)
 		return
 	}
+	log.Printf("SnipeWatcher: seeded token=%.12s… high=%.3f since=%s",
+		m.TokenID, price, since.UTC().Format("15:04"))
 	w.seedSessionHigh(m.TokenID, price)
 }
 

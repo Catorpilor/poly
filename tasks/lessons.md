@@ -25,3 +25,12 @@ matches or is reaped — "gone" 1s after submit is the *normal* pending state,
 not a kill verdict. Twice a "dead" FOK filled 3–4s later. Absence of
 evidence from a status endpoint is not evidence of a terminal state; gate
 "gone → dead" behind a grace window sized to the async process. (Issue #27)
+
+## 2026-08-01 — Fix the pattern, not the instance
+The #33 condition-ID bug was fixed only at the call site visibly erroring
+that day (held positions); the identical call in the armed-token path
+shipped broken and cost a live missed snipe alert (NS Game 2, 0.395→0.03
+unwatched). When the root cause is "wrong API form for this input", grep
+every caller of that API before closing — the silent ones are the ones
+that bite. Corollary: silent-success paths (the seeder) need one debug
+log line, or production verification is guesswork.
