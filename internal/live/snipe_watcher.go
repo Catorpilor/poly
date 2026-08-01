@@ -15,7 +15,7 @@ const (
 	SnipeCompetitiveBid = 0.40
 	// SnipeCrashAsk is the crash bar: an ask at or below this on a formerly
 	// competitive in-play token triggers the alert.
-	SnipeCrashAsk = 0.18
+	SnipeCrashAsk = 0.20
 )
 
 // snipeResetAsk is the episode reset level: after an alert, the token re-alerts

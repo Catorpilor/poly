@@ -36,8 +36,8 @@ func TestSnipeAlertText(t *testing.T) {
 			question:    "Lakers vs. Trail Blazers",
 			outcome:     "Lakers",
 			sessionHigh: 0.40,
-			ask:         0.18,
-			want:        []string{"Lakers", "was $0.40", "now $0.18", "5.6×"},
+			ask:         0.20,
+			want:        []string{"Lakers", "was $0.40", "now $0.20", "5.0×"},
 		},
 		{
 			name:        "non-ascii title survives",
@@ -73,7 +73,7 @@ func TestSnipeRefuseBuy(t *testing.T) {
 	}{
 		{name: "crash-level ask buys", ask: 0.17, ok: true, refuse: false},
 		{name: "ask exactly at the guard buys", ask: guard, ok: true, refuse: false},
-		{name: "ask just above the guard refuses", ask: 0.28, ok: true, refuse: true},
+		{name: "ask just above the guard refuses", ask: 0.31, ok: true, refuse: true},
 		{name: "fully repriced refuses", ask: 0.55, ok: true, refuse: true},
 		{name: "unavailable ask refuses", ask: 0, ok: false, refuse: true},
 		{name: "zero ask refuses even when ok", ask: 0, ok: true, refuse: true},
