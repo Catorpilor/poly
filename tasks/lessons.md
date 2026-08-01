@@ -34,3 +34,14 @@ unwatched). When the root cause is "wrong API form for this input", grep
 every caller of that API before closing — the silent ones are the ones
 that bite. Corollary: silent-success paths (the seeder) need one debug
 log line, or production verification is guesswork.
+
+## 2026-08-01 — An API that ignores unknown params returns plausible garbage
+Gamma /markets silently ignores unrecognized query params and serves the
+default market list: `?condition_id=` (wrong, singular) "worked" for weeks
+while resolving a LoL condition ID to a politics market. Two rules: (1)
+when adding an API call, prove the filter actually filters (query a known
+id, assert identity on the response); (2) lookup helpers must validate
+response identity against the request, so a filter regression fails loudly
+instead of propagating someone else's market. Corollary of the fixture
+lesson: a fixture that honors your parameter name can't catch you using
+the wrong one — model the API's ignore-and-default behavior in the fake.

@@ -200,8 +200,13 @@ func TestFetchSnipeMarketRoutesByIDForm(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/markets" && r.URL.Query().Get("condition_id") != "":
-			fmt.Fprint(w, `[{"id":"3080779","question":"Game 1 Winner","conditionId":"0x1cf1"}]`)
+		case r.URL.Path == "/markets" && r.URL.Query().Get("condition_ids") != "":
+			fmt.Fprint(w, `[{"id":"3080779","question":"Game 1 Winner","conditionId":"0x1cf14d0add6dfc90f2e3de1250cce7775cb5f5c909e9c81111f47c9ba5ce49a5"}]`)
+		case r.URL.Path == "/markets":
+			// Real Gamma behavior: unknown params are IGNORED and the default
+			// market list comes back — an unrelated market that must never
+			// pass as a lookup result.
+			fmt.Fprint(w, `[{"id":"9999","question":"Unrelated politics market","conditionId":"0xdead","slug":"xi-jinping-out"}]`)
 		case r.URL.Path == "/markets/3080779":
 			fmt.Fprint(w, `{"id":"3080779","question":"Game 1 Winner"}`)
 		default:
@@ -242,9 +247,12 @@ func TestFetchSnipeMarketEnrichesGameStart(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/markets" && r.URL.Query().Get("condition_id") != "":
-			// Real Gamma behavior: no gameStartTime key on this form.
-			fmt.Fprint(w, `[{"id":"3080779","question":"Game 2 Winner","conditionId":"0xf17e","slug":"lol-ns-fox1-game2"}]`)
+		case r.URL.Path == "/markets" && r.URL.Query().Get("condition_ids") != "":
+			// Sports markets can still omit gameStartTime on this form in
+			// odd cases; the router then enriches via slug.
+			fmt.Fprint(w, `[{"id":"3080779","question":"Game 2 Winner","conditionId":"0xf17e3c60c7ca0094aec6f7db5bcf058d8b8da68d7e01e9675fc2493e451237ac","slug":"lol-ns-fox1-game2"}]`)
+		case r.URL.Path == "/markets":
+			fmt.Fprint(w, `[{"id":"9999","question":"Unrelated politics market","conditionId":"0xdead","slug":"xi-jinping-out"}]`)
 		case r.URL.Path == "/markets/slug/lol-ns-fox1-game2":
 			// The by-slug form returns a single object and includes the field.
 			fmt.Fprint(w, `{"id":"3080779","question":"Game 2 Winner","conditionId":"0xf17e","slug":"lol-ns-fox1-game2","gameStartTime":"2026-08-01 08:00:00+00"}`)
