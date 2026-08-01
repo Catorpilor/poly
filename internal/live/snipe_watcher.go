@@ -53,6 +53,21 @@ type SnipeNotifier interface {
 	NotifySnipeAlert(chatID int64, market SnipeMarket, sessionHigh, ask float64)
 }
 
+// SnipeHistorySeeder supplies a token's recent trade high so a Session High
+// can be seeded at watch-start. Production: TradingClient.MaxTradePriceSince
+// over the CLOB's public price history. (0, false) means "no seed".
+type SnipeHistorySeeder interface {
+	MaxTradePriceSince(ctx context.Context, tokenID string, since time.Time) (float64, bool)
+}
+
+// Session High seeding windows: the fetch reaches back to 2h before the
+// scheduled game start (pre-game trading carries the competitive price), or
+// 6h from now when the start is unknown.
+const (
+	snipeSeedPreGameWindow  = 2 * time.Hour
+	snipeSeedFallbackWindow = 6 * time.Hour
+)
+
 // SnipeRecipientResolver resolves the externally-tracked alert audiences at
 // fire time: event subscribers (SubscriptionRegistry) and SL/TP arm owners
 // (arm store). Held-position holders are tracked by the watcher itself.
@@ -61,9 +76,9 @@ type SnipeRecipientResolver interface {
 	ArmOwners(tokenID string) []int64
 }
 
-// snipeTokenState is the in-memory, restart-resettable per-token state. After
-// a restart the session high rebuilds from zero, so a crash immediately after
-// a restart cannot alert.
+// snipeTokenState is the in-memory per-token state. The session high is
+// seeded asynchronously from recent trade history when a seeder is wired
+// (a restart re-seeds); without one it rebuilds from zero on live bids only.
 type snipeTokenState struct {
 	market      SnipeMarket
 	sessionHigh float64
@@ -108,6 +123,9 @@ type SnipeWatcher struct {
 	feed       PriceFeedSubscriber
 	recipients SnipeRecipientResolver
 	notifier   SnipeNotifier
+	// seeder, when set, seeds a new token state's Session High from recent
+	// trade history. Nil disables seeding. Set before Start.
+	seeder SnipeHistorySeeder
 	// now is the watcher's clock — overridable in tests.
 	now func() time.Time
 
@@ -131,6 +149,12 @@ func NewSnipeWatcher(feed PriceFeedSubscriber, recipients SnipeRecipientResolver
 		tokens:      make(map[string]*snipeTokenState),
 		eventTokens: make(map[string]map[string]bool),
 	}
+}
+
+// SetHistorySeeder wires the optional Session High seeder. Call before Start
+// (and before any registration) — the field is read unguarded.
+func (w *SnipeWatcher) SetHistorySeeder(s SnipeHistorySeeder) {
+	w.seeder = s
 }
 
 // Start registers the feed update handler and launches the expiry janitor.
@@ -283,13 +307,19 @@ func (w *SnipeWatcher) MarkBought(tokenID string) {
 }
 
 // ensureStateLocked returns the token's state, creating it from m when absent.
-// Existing state keeps its session high / episode flags; empty metadata fields
-// are backfilled so a later, richer registration can fill gaps.
+// A newly created state gets its Session High seeded asynchronously from
+// trade history (once per state — every registration path funnels through
+// here, and existing states never re-fetch). Existing state keeps its session
+// high / episode flags; empty metadata fields are backfilled so a later,
+// richer registration can fill gaps.
 func (w *SnipeWatcher) ensureStateLocked(m SnipeMarket) *snipeTokenState {
 	st, ok := w.tokens[m.TokenID]
 	if !ok {
 		st = newSnipeTokenState(m)
 		w.tokens[m.TokenID] = st
+		if w.seeder != nil {
+			go w.seedFromHistory(m)
+		}
 		return st
 	}
 	if st.market.MarketID == "" {
@@ -305,6 +335,38 @@ func (w *SnipeWatcher) ensureStateLocked(m SnipeMarket) *snipeTokenState {
 		st.market.GameStart = m.GameStart
 	}
 	return st
+}
+
+// seedFromHistory fetches the token's recent trade high and applies it as the
+// initial Session High, so a watch registered mid-game (late subscription or
+// restart) still knows the token was formerly competitive. Runs in its own
+// goroutine; w.ctx bounds the fetch.
+func (w *SnipeWatcher) seedFromHistory(m SnipeMarket) {
+	since := w.now().Add(-snipeSeedFallbackWindow)
+	if !m.GameStart.IsZero() {
+		since = m.GameStart.Add(-snipeSeedPreGameWindow)
+	}
+	price, ok := w.seeder.MaxTradePriceSince(w.ctx, m.TokenID, since)
+	if !ok {
+		return
+	}
+	w.seedSessionHigh(m.TokenID, price)
+}
+
+// seedSessionHigh raises tokenID's session high to price — never lowers it
+// (live bids may already have ratcheted higher while the fetch was in
+// flight) and never touches episode latches, so a late-arriving seed cannot
+// corrupt an alerted or bought token.
+func (w *SnipeWatcher) seedSessionHigh(tokenID string, price float64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	st := w.tokens[tokenID]
+	if st == nil {
+		return
+	}
+	if price > st.sessionHigh {
+		st.sessionHigh = price
+	}
 }
 
 // unsubscribeReleased drops the watcher's feed refs for released tokens.

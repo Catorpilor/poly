@@ -195,8 +195,10 @@ func TestSnipeWatcher_MarkBoughtSilencesForMatch(t *testing.T) {
 
 func TestSnipeWatcher_FreshWatcherHasNoSessionHigh(t *testing.T) {
 	t.Parallel()
-	// Simulates a restart: a new watcher never saw the pre-crash high, so a
-	// crash immediately after start cannot alert.
+	// No seeder wired (nil = seeding disabled): a fresh watcher never saw the
+	// pre-crash high, so a crash immediately after start cannot alert. With
+	// the production seeder the high re-seeds from trade history — see
+	// snipe_seed_test.go.
 	w, _, rec, notif, _ := snipeHarness()
 	rec.eventSubs["evt"] = []int64{101}
 	w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})

@@ -74,6 +74,9 @@ func main() {
 		live.NewSnipeRecipientResolver(bot.GetLiveManager(), bot.GetSLTPArmRepository()),
 		bot, // live.SnipeNotifier
 	)
+	// Seed Session Highs from CLOB trade history so tokens that join the
+	// watch mid-game (late subscription, restart) can still alert.
+	snipeWatcher.SetHistorySeeder(bot.GetTradingClient())
 	snipeWatcher.Start()
 	defer snipeWatcher.Stop()
 	bot.GetLiveManager().SetSnipeWatcher(snipeWatcher)

@@ -191,11 +191,12 @@ for the rest of the match. Distinct from a Lottery Ticket (which
 reacts to *our own* ceiling exit on the other side) and from pre-game
 value buys (not in-play, out of scope).
 
-**Session High** — The highest best bid the bot has observed on a token
-since it began watching that market. Restart-resettable, like SL breach
-state: after a restart the high rebuilds from zero, so a crash
-immediately after a restart cannot alert — fewer alerts, never wrong
-ones.
+**Session High** — The highest trade-or-bid price the bot knows for a
+token in the current session: seeded at watch-start from the CLOB's
+recent trade history (since ~game start), then ratcheted live by
+observed bids — raised only, never lowered. In-memory: a restart
+re-seeds from history, so a watcher that joins (or rejoins) mid-game
+still knows a token was formerly competitive.
 
 These thresholds are product policy, deliberately global constants — not
 per-user configuration.
