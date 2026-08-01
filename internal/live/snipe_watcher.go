@@ -16,6 +16,13 @@ const (
 	// SnipeCrashAsk is the crash bar: an ask at or below this on a formerly
 	// competitive in-play token triggers the alert.
 	SnipeCrashAsk = 0.20
+	// SnipeMinAsk is the corpse floor: an ask below this means the market is
+	// declaring death or settlement, not overreacting — there is no game-end
+	// signal in the metadata, so without this bound a finished game's loser
+	// token alerts at $0.001 with a fantasy 1000× payout (first live alert,
+	// 2026-08-01 MOUZ). Comeback snipes want panic pricing, not corpse
+	// pricing; every genuine studied case (0.125–0.195) clears this easily.
+	SnipeMinAsk = 0.03
 )
 
 // snipeResetAsk is the episode reset level: after an alert, the token re-alerts
@@ -481,7 +488,7 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 
 	fire := !st.alerted && !st.bought &&
 		st.sessionHigh >= SnipeCompetitiveBid &&
-		ask > 0 && ask <= SnipeCrashAsk &&
+		ask >= SnipeMinAsk && ask <= SnipeCrashAsk &&
 		w.inPlay(st.market, now)
 	if fire {
 		st.alerted = true

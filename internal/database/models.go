@@ -107,7 +107,13 @@ const SLTrailMult = 0.80
 const SLMaxSlip = 0.10
 
 // TPSellFraction is the fraction of current shares sold on a TP fire.
-const TPSellFraction = 0.50
+// Lowered from 0.50 on 2026-08-02: a 184-episode counterfactual over July's
+// realized price paths ranked lighter banking strictly better (no-TP +$92,
+// 25% +$46 vs 50%, ladders ≈ noise, heavier/earlier −$108) — the trailing
+// stop already insures positions past activation, so early banking mostly
+// sells winners cheap. 25% keeps a guaranteed bank against the stop's
+// observed no-fill risk in gapped in-play books.
+const TPSellFraction = 0.25
 
 // CeilingTPPrice is the bid threshold at which the monitor sells ALL remaining
 // shares regardless of avg_price. At this level the upside (resolve = $1.00)

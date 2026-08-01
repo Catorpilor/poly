@@ -138,6 +138,21 @@ func TestSnipeWatcher_TriggerBoundaries(t *testing.T) {
 			want:  0,
 		},
 		{
+			name:  "corpse floor: MOUZ replay ask 0.001 never fires",
+			steps: [][2]float64{{0.625, 0.60}, {0.01, 0.001}},
+			want:  0,
+		},
+		{
+			name:  "corpse floor: ask 0.029 just below the floor",
+			steps: [][2]float64{{0.45, 0.029}},
+			want:  0,
+		},
+		{
+			name:  "fires exactly at the corpse floor 0.03",
+			steps: [][2]float64{{0.45, 0.03}},
+			want:  1,
+		},
+		{
 			name:  "high latched earlier, crash later fires",
 			steps: [][2]float64{{0.55, 0.60}, {0.10, 0.17}},
 			want:  1,

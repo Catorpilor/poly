@@ -555,8 +555,8 @@ func TestSLTPMonitor_TPFiresAt2x(t *testing.T) {
 	})
 
 	exec.mu.Lock()
-	if exec.calls[0].sharesRaw != int64(100*0.50*1e6) {
-		t.Errorf("expected TP sell 50e6 shares, got %d", exec.calls[0].sharesRaw)
+	if exec.calls[0].sharesRaw != int64(100*database.TPSellFraction*1e6) {
+		t.Errorf("expected TP sell of the configured fraction, got %d", exec.calls[0].sharesRaw)
 	}
 	// TP execution is unchanged by the trailing-SL rework: market order (GTC).
 	if exec.calls[0].limitPrice != 0 || exec.calls[0].orderType != polymarket.OrderTypeGTC {
@@ -713,9 +713,9 @@ func TestSLTPMonitor_SLAfterTPSellsHalf(t *testing.T) {
 	exec.mu.Lock()
 	shares := exec.calls[0].sharesRaw
 	exec.mu.Unlock()
-	// TP already fired: SL sells remaining 50% of original snapshot
-	if shares != int64(100*0.50*1e6) {
-		t.Errorf("expected SL sell 50e6 (half remainder), got %d", shares)
+	// TP already fired: SL sells the remaining (1 - TPSellFraction) of snapshot
+	if shares != int64(100*(1-database.TPSellFraction)*1e6) {
+		t.Errorf("expected SL sell of the post-TP remainder, got %d", shares)
 	}
 }
 
@@ -1146,8 +1146,8 @@ func TestSLTPMonitor_CeilingTP_RemainingHalfWhenTPAlreadyFired(t *testing.T) {
 	exec.mu.Lock()
 	shares := exec.calls[0].sharesRaw
 	exec.mu.Unlock()
-	if shares != int64(300*0.50*1e6) {
-		t.Errorf("expected ceiling sell 150e6 shares (remaining half), got %d", shares)
+	if shares != int64(300*(1-database.TPSellFraction)*1e6) {
+		t.Errorf("expected ceiling sell of the post-TP remainder, got %d", shares)
 	}
 
 	notif.mu.Lock()
@@ -2029,9 +2029,9 @@ func TestSLTPMonitor_SL_TPFireDuringBreachClearsDebounce(t *testing.T) {
 	exec.mu.Lock()
 	slCall := exec.calls[1]
 	exec.mu.Unlock()
-	// TP already fired → SL sells the remaining half.
-	if slCall.sharesRaw != int64(100*0.50*1e6) {
-		t.Errorf("expected SL sell of remaining half (50e6), got %d", slCall.sharesRaw)
+	// TP already fired → SL sells the post-TP remainder.
+	if slCall.sharesRaw != int64(100*(1-database.TPSellFraction)*1e6) {
+		t.Errorf("expected SL sell of the post-TP remainder, got %d", slCall.sharesRaw)
 	}
 	if slCall.orderType != polymarket.OrderTypeFOK {
 		t.Errorf("expected FOK SL sell, got %v", slCall.orderType)
@@ -2279,8 +2279,8 @@ func TestSLTPMonitor_TP_ShortfallRetriesClamped(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("expected exactly 2 sell attempts (original + one clamped retry), got %d", len(calls))
 	}
-	if calls[0].sharesRaw != int64(450*0.50*1e6) {
-		t.Errorf("original TP sharesRaw = %d, want 225e6", calls[0].sharesRaw)
+	if calls[0].sharesRaw != int64(450*database.TPSellFraction*1e6) {
+		t.Errorf("original TP sharesRaw = %d, want the configured fraction of 450e6", calls[0].sharesRaw)
 	}
 	if calls[1].sharesRaw != 100_000_000 {
 		t.Errorf("retry sharesRaw = %d, want clamped 100000000", calls[1].sharesRaw)

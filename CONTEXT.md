@@ -139,7 +139,9 @@ automatically — auto-disarmed with a cleanup notice, since a finished
 market can never fire a trigger.
 
 **Take-Profit (TP)** — Trigger: bid reaches 2× the arm-time average price →
-sell half the arm-time shares.
+sell a quarter of the arm-time shares. Lightened from half in v0.12.8:
+counterfactual replay of realized price paths showed early banking mostly
+sells winners cheap once the trailing stop is insuring the position.
 
 **Stop-Loss (SL)** — Breakeven-trailing. Dormant until the High-Water Mark
 reaches 1.20× the arm-time average price (until then there is no stop —
@@ -182,8 +184,11 @@ $0.05 per share, spending at most $5 — a cheap bet on a reversal.
 
 **Comeback Snipe** — An alert-then-buy on a token that was *formerly
 competitive, now priced as dead*: an in-play market whose token's
-Session High bid reached ≥ 0.40 and whose ask has since fallen to
-≤ 0.20. The bot never buys on its own — it sends an alert with a
+Session High bid reached ≥ 0.40 and whose ask has since fallen into
+the 0.03–0.20 crash band. Below 0.03 the market is declaring death or
+settlement rather than overreacting — no game-end signal exists in the
+metadata, so the floor is what keeps a finished game's loser token
+from alerting. The bot never buys on its own — it sends an alert with a
 one-tap buy button; the human judges the game state. Alerts are
 episode-based: after alerting, a token re-alerts only once its ask has
 recovered above the midpoint of the crash threshold and the
