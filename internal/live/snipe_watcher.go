@@ -35,6 +35,12 @@ const SnipeHeldTTL = 6 * time.Hour
 // evaluate, so lazy pruning alone would leak the feed subscription).
 const snipeJanitorInterval = 10 * time.Minute
 
+// snipeTickInterval is the periodic re-evaluation cadence, mirroring the
+// SL/TP monitor's tick. The WS OnUpdate callback is the fast path; the tick
+// is the guarantee that a token whose WS subscription went silent (issue #42:
+// rejected mid-session resubscribes) is still evaluated (issue #41).
+const snipeTickInterval = 20 * time.Second
+
 // SnipeMarket is the market metadata the watcher carries per token — enough to
 // build an alert and to route the one-tap buy without re-deriving anything.
 type SnipeMarket struct {
@@ -128,6 +134,9 @@ type SnipeWatcher struct {
 	seeder SnipeHistorySeeder
 	// now is the watcher's clock — overridable in tests.
 	now func() time.Time
+	// tickInterval is the periodic re-evaluation cadence. Tests override it
+	// before Start() to make ticker-driven tests deterministic.
+	tickInterval time.Duration
 
 	mu     sync.Mutex
 	tokens map[string]*snipeTokenState
@@ -140,14 +149,15 @@ type SnipeWatcher struct {
 func NewSnipeWatcher(feed PriceFeedSubscriber, recipients SnipeRecipientResolver, notifier SnipeNotifier) *SnipeWatcher {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &SnipeWatcher{
-		ctx:         ctx,
-		cancel:      cancel,
-		feed:        feed,
-		recipients:  recipients,
-		notifier:    notifier,
-		now:         time.Now,
-		tokens:      make(map[string]*snipeTokenState),
-		eventTokens: make(map[string]map[string]bool),
+		ctx:          ctx,
+		cancel:       cancel,
+		feed:         feed,
+		recipients:   recipients,
+		notifier:     notifier,
+		now:          time.Now,
+		tickInterval: snipeTickInterval,
+		tokens:       make(map[string]*snipeTokenState),
+		eventTokens:  make(map[string]map[string]bool),
 	}
 }
 
@@ -157,10 +167,12 @@ func (w *SnipeWatcher) SetHistorySeeder(s SnipeHistorySeeder) {
 	w.seeder = s
 }
 
-// Start registers the feed update handler and launches the expiry janitor.
+// Start registers the feed update handler and launches the expiry janitor and
+// the periodic re-evaluation tick.
 func (w *SnipeWatcher) Start() {
 	w.feed.OnUpdate(w.handleUpdate)
 	go w.janitorLoop()
+	go w.tickLoop()
 	log.Println("SnipeWatcher: Started")
 }
 
@@ -489,8 +501,9 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 	w.mu.Unlock()
 
 	if fire {
-		log.Printf("SnipeWatcher: alert token=%s high=%.4f ask=%.4f", tokenID, high, ask)
-		w.dispatch(market, high, ask, eventSlugs, holders)
+		recipients := w.dispatch(market, high, ask, eventSlugs, holders)
+		log.Printf("SnipeWatcher: alert token=%.12s… high=%.3f ask=%.3f recipients=%d",
+			tokenID, high, ask, recipients)
 	}
 }
 
@@ -502,8 +515,8 @@ func (w *SnipeWatcher) inPlay(m SnipeMarket, now time.Time) bool {
 }
 
 // dispatch notifies the union of event subscribers, arm owners, and holders —
-// each recipient exactly once.
-func (w *SnipeWatcher) dispatch(market SnipeMarket, high, ask float64, eventSlugs []string, holders []int64) {
+// each recipient exactly once. Returns the number of recipients notified.
+func (w *SnipeWatcher) dispatch(market SnipeMarket, high, ask float64, eventSlugs []string, holders []int64) int {
 	seen := make(map[int64]bool)
 	var order []int64
 	add := func(ids []int64) {
@@ -522,6 +535,43 @@ func (w *SnipeWatcher) dispatch(market SnipeMarket, high, ask float64, eventSlug
 
 	for _, chatID := range order {
 		w.notifier.NotifySnipeAlert(chatID, market, high, ask)
+	}
+	return len(order)
+}
+
+// tickLoop runs the periodic re-evaluation. The WS OnUpdate callback is the
+// only other evaluation trigger, and a rejected resubscribe can silence it for
+// an entire game (issue #41: the 2026-08-01 FaZe crash printed through the
+// snipe zone with zero WS events). Exits when the watcher's context is
+// cancelled (Stop()).
+func (w *SnipeWatcher) tickLoop() {
+	t := time.NewTicker(w.tickInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case <-t.C:
+			w.tickEvaluateAll()
+		}
+	}
+}
+
+// tickEvaluateAll snapshots the watched tokens under the mutex, then fans out
+// one evaluation goroutine per token — the same pattern as handleUpdate and
+// the SL/TP tick — because BestBid/BestAsk may fall back to an HTTP fetch
+// (5s timeout) and one slow token must not delay crash detection on the
+// others. Double-fire safety against a racing WS evaluation rests on the
+// alerted latch flipping under the mutex in evaluate.
+func (w *SnipeWatcher) tickEvaluateAll() {
+	w.mu.Lock()
+	tokenIDs := make([]string, 0, len(w.tokens))
+	for id := range w.tokens {
+		tokenIDs = append(tokenIDs, id)
+	}
+	w.mu.Unlock()
+	for _, id := range tokenIDs {
+		go w.evaluateFromFeed(id)
 	}
 }
 
