@@ -73,6 +73,14 @@ type TradeExecutor interface {
 // market because there's no single "other side".
 var ErrMultiOutcome = errors.New("multi-outcome market: no single other side")
 
+// ClosedMarketChecker resolves a condition ID to its market only when Gamma
+// reports that market closed (resolved-arm sweeper, issue #39). A market that
+// is open or finished-but-unresolved yields polymarket.ErrMarketNotFound.
+// *polymarket.MarketClient satisfies this interface.
+type ClosedMarketChecker interface {
+	GetClosedMarketByConditionID(ctx context.Context, conditionID string) (*polymarket.GammaMarket, error)
+}
+
 // Notifier sends SL/TP fire and pause notifications to users.
 type Notifier interface {
 	NotifySLTPFired(telegramID int64, kind string, arm *database.SLTPArm, bid float64, result *polymarket.TradeResult)
@@ -94,6 +102,10 @@ type Notifier interface {
 	//   - reason="failed" with non-nil result: order rejected by exchange
 	NotifyLottery(telegramID int64, arm *database.SLTPArm, otherOutcome string,
 		reason string, detail string, result *polymarket.TradeResult)
+	// NotifyArmsSwept reports one sweep's cleanup for a user: the outcome
+	// labels of every arm auto-disarmed because its market closed. Sent at
+	// most once per user per sweep — never per-arm spam (issue #39).
+	NotifyArmsSwept(telegramID int64, outcomes []string)
 }
 
 // PauseWindow returns true when the monitor must skip evaluation (e.g., V2 cutover).
@@ -119,6 +131,15 @@ const slConfirmWindowDefault = 30 * time.Second
 // slRetryIntervalDefault is the minimum spacing between FOK exit attempts
 // while a confirmed breach persists.
 const slRetryIntervalDefault = 30 * time.Second
+
+// sltpSweepInitialDelay is how long after Start the first closed-market sweep
+// runs: soon enough that a deploy purges zombie arms immediately, late enough
+// to stay off the startup path.
+const sltpSweepInitialDelay = 2 * time.Minute
+
+// sltpSweepInterval is the cadence of closed-market sweeps after the first.
+// Resolution lags the game by minutes-to-hours, so hourly is plenty.
+const sltpSweepInterval = 1 * time.Hour
 
 // minSellSizeRaw is the smallest order size the CLOB can express, in 6-decimal
 // raw units: sizes are truncated to 2 decimals, so anything below 0.01 shares
@@ -181,6 +202,14 @@ type SLTPMonitor struct {
 	// trailing-SL timing defaults.
 	slConfirmWindow time.Duration
 	slRetryInterval time.Duration
+	// sweepInitialDelay / sweepInterval schedule the closed-market sweep.
+	// Tests override them before Start() like tickInterval.
+	sweepInitialDelay time.Duration
+	sweepInterval     time.Duration
+	// closedChecker resolves conditions to markets Gamma reports closed.
+	// nil (the default) disables the sweeper. Set before Start — read
+	// unguarded, matching the SetX wiring pattern.
+	closedChecker ClosedMarketChecker
 
 	mu            sync.Mutex
 	pauseNotified map[int64]bool      // telegramID -> notified at window start
@@ -197,21 +226,30 @@ func NewSLTPMonitor(
 ) *SLTPMonitor {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &SLTPMonitor{
-		ctx:             ctx,
-		cancel:          cancel,
-		store:           store,
-		feed:            feed,
-		executor:        executor,
-		notifier:        notifier,
-		paused:          paused,
-		now:             time.Now,
-		tickInterval:    sltpTickInterval,
-		freshnessMaxAge: sltpFreshnessMaxAge,
-		slConfirmWindow: slConfirmWindowDefault,
-		slRetryInterval: slRetryIntervalDefault,
-		pauseNotified:   make(map[int64]bool),
-		slState:         make(map[int]*slArmState),
+		ctx:               ctx,
+		cancel:            cancel,
+		store:             store,
+		feed:              feed,
+		executor:          executor,
+		notifier:          notifier,
+		paused:            paused,
+		now:               time.Now,
+		tickInterval:      sltpTickInterval,
+		freshnessMaxAge:   sltpFreshnessMaxAge,
+		slConfirmWindow:   slConfirmWindowDefault,
+		slRetryInterval:   slRetryIntervalDefault,
+		sweepInitialDelay: sltpSweepInitialDelay,
+		sweepInterval:     sltpSweepInterval,
+		pauseNotified:     make(map[int64]bool),
+		slState:           make(map[int]*slArmState),
 	}
+}
+
+// SetClosedMarketChecker wires the Gamma closed-market lookup used by the
+// resolved-arm sweeper (issue #39). nil keeps the sweeper disabled. Must be
+// called before Start.
+func (m *SLTPMonitor) SetClosedMarketChecker(c ClosedMarketChecker) {
+	m.closedChecker = c
 }
 
 // Start seeds WS subscriptions from the DB, registers the update handler, and
@@ -226,6 +264,9 @@ func (m *SLTPMonitor) Start() error {
 	}
 	m.feed.OnUpdate(m.handleUpdate)
 	go m.tickLoop()
+	if m.closedChecker != nil {
+		go m.sweepLoop()
+	}
 	log.Printf("SLTPMonitor: Started with %d armed token(s)", len(tokenIDs))
 	return nil
 }
@@ -320,6 +361,126 @@ func (m *SLTPMonitor) tickEvaluateAll() {
 			m.evaluateToken(id, bid, ok, "tick:"+src)
 		}()
 	}
+}
+
+// sweepLoop schedules closed-market sweeps: one shortly after start (so a
+// deploy purges zombie arms immediately), then every sweepInterval. Exits
+// when the monitor's context is cancelled (Stop()).
+func (m *SLTPMonitor) sweepLoop() {
+	first := time.NewTimer(m.sweepInitialDelay)
+	defer first.Stop()
+	select {
+	case <-m.ctx.Done():
+		return
+	case <-first.C:
+	}
+	m.sweepClosedArms()
+
+	t := time.NewTicker(m.sweepInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-t.C:
+			m.sweepClosedArms()
+		}
+	}
+}
+
+// sweepClosedArms auto-disarms every arm whose market Gamma reports closed
+// (issue #39): finished markets never fire and only spam book-fetch 404s.
+// Fail-safe by construction — only positive, identity-matched closed:true
+// evidence sweeps; empty responses (open/unresolved) and lookup errors keep
+// the arm for the next sweep. Each affected user gets ONE notification per
+// sweep, grouping all their swept outcomes.
+func (m *SLTPMonitor) sweepClosedArms() {
+	arms, errCount := m.snapshotArmedRows()
+
+	// One Gamma lookup per condition, however many arms share it.
+	closedByCondition := make(map[string]bool)
+	for _, arm := range arms {
+		id := arm.ConditionID
+		if id == "" {
+			continue // no lookup key: kept via the zero value below
+		}
+		if _, seen := closedByCondition[id]; seen {
+			continue
+		}
+		market, err := m.closedChecker.GetClosedMarketByConditionID(m.ctx, id)
+		switch {
+		case err == nil && market != nil && market.Closed:
+			closedByCondition[id] = true
+		case err == nil || errors.Is(err, polymarket.ErrMarketNotFound):
+			// Open or finished-but-unresolved (the common negative), or a
+			// market that came back without closed=true: keep quietly.
+			closedByCondition[id] = false
+		default:
+			log.Printf("SLTPMonitor sweep: closed lookup for %s: %v", id, err)
+			errCount++
+			closedByCondition[id] = false
+		}
+	}
+
+	swept, kept := 0, 0
+	sweptOutcomes := make(map[int64][]string)
+	var notifyOrder []int64
+	for _, arm := range arms {
+		if !closedByCondition[arm.ConditionID] {
+			kept++
+			continue
+		}
+		// ErrSLTPArmNotFound is tolerated: the row vanished under us (manual
+		// disarm, SL fire) — the goal state is already reached.
+		if err := m.store.Disarm(m.ctx, arm.TelegramID, arm.TokenID); err != nil &&
+			!errors.Is(err, repositories.ErrSLTPArmNotFound) {
+			log.Printf("SLTPMonitor sweep: disarm %d/%s: %v (kept, next sweep retries)",
+				arm.TelegramID, arm.TokenID, err)
+			errCount++
+			kept++
+			continue
+		}
+		m.clearSLState(arm.ID)
+		m.unsubscribeIfLast(arm.TokenID)
+		if _, seen := sweptOutcomes[arm.TelegramID]; !seen {
+			notifyOrder = append(notifyOrder, arm.TelegramID)
+		}
+		sweptOutcomes[arm.TelegramID] = append(sweptOutcomes[arm.TelegramID], string(arm.Outcome))
+		swept++
+	}
+
+	for _, telegramID := range notifyOrder {
+		m.notifier.NotifyArmsSwept(telegramID, sweptOutcomes[telegramID])
+	}
+
+	// A quiet no-op sweep (everything open, no errors) logs nothing.
+	if swept > 0 || errCount > 0 {
+		log.Printf("SLTPMonitor sweep: swept=%d kept=%d errors=%d", swept, kept, errCount)
+	}
+}
+
+// snapshotArmedRows loads every armed row through the same listing Start
+// seeds subscriptions from: armed token IDs first, then the rows per token.
+// Returns the rows plus how many listing calls failed (those tokens are
+// simply absent — their arms are kept until a later sweep sees them).
+func (m *SLTPMonitor) snapshotArmedRows() ([]*database.SLTPArm, int) {
+	tokenIDs, err := m.store.ListArmedTokenIDs(m.ctx)
+	if err != nil {
+		log.Printf("SLTPMonitor sweep: list armed tokens: %v", err)
+		return nil, 1
+	}
+	var arms []*database.SLTPArm
+	errCount := 0
+	for _, id := range tokenIDs {
+		rows, err := m.store.ListArmedByToken(m.ctx, id)
+		if err != nil {
+			log.Printf("SLTPMonitor sweep: list armed for %s: %v", id, err)
+			errCount++
+			continue
+		}
+		arms = append(arms, rows...)
+	}
+	return arms, errCount
 }
 
 // evaluateArm ratchets the high-water mark, then checks ceiling-TP, 2× TP, and

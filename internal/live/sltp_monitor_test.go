@@ -353,6 +353,12 @@ type fakeNotifier struct {
 	lotteries []lotteryNotice
 	pendings  []pendingNotice
 	stales    []staleNotice
+	swepts    []sweptNotice
+}
+
+type sweptNotice struct {
+	telegramID int64
+	outcomes   []string
 }
 
 type staleNotice struct {
@@ -407,6 +413,12 @@ func (n *fakeNotifier) NotifySLTPPaused(telegramID int64, _ *database.SLTPArm) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.paused = append(n.paused, telegramID)
+}
+
+func (n *fakeNotifier) NotifyArmsSwept(telegramID int64, outcomes []string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.swepts = append(n.swepts, sweptNotice{telegramID, append([]string(nil), outcomes...)})
 }
 
 func (n *fakeNotifier) NotifyLottery(telegramID int64, _ *database.SLTPArm, otherOutcome,

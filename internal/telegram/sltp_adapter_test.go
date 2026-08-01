@@ -354,6 +354,49 @@ func TestSLTPStaleSizeText(t *testing.T) {
 	}
 }
 
+// TestSLTPSweptText covers the issue #39 cleanup notice: one message per user
+// per sweep summarizing every arm auto-disarmed because its market closed.
+func TestSLTPSweptText(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		outcomes []string
+		want     []string
+	}{
+		{
+			name:     "single outcome",
+			outcomes: []string{"YES"},
+			want: []string{
+				"🧹 *Cleaned up 1 finished position(s)*",
+				"YES",
+				"don't need SL/TP",
+			},
+		},
+		{
+			name:     "multiple outcomes comma-joined",
+			outcomes: []string{"NONGSHIM RED FORCE", "NO", "KNICKS"},
+			want: []string{
+				"🧹 *Cleaned up 3 finished position(s)*",
+				"NONGSHIM RED FORCE, NO, KNICKS",
+				"don't need SL/TP",
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := sltpSweptText(tt.outcomes)
+			for _, w := range tt.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("text missing %q:\n%s", w, got)
+				}
+			}
+		})
+	}
+}
+
 func TestSLTPArmedText(t *testing.T) {
 	t.Parallel()
 	// Fresh arm: HWM == entry (dormant).

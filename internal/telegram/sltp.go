@@ -465,6 +465,24 @@ func sltpStaleSizeText(arm *database.SLTPArm, availableRaw int64) string {
 		arm.Outcome, available, arm.SharesAtArm, available, arm.SharesAtArm)
 }
 
+// NotifyArmsSwept implements live.Notifier. Sent at most once per user per
+// sweep when the monitor auto-disarms arms whose market has closed (issue #39).
+func (b *Bot) NotifyArmsSwept(telegramID int64, outcomes []string) {
+	b.sendMessage(telegramID, sltpSweptText(outcomes))
+}
+
+// sltpSweptText builds the sweep notification body. Pure — table-tested.
+// outcomes are the labels of every arm swept for this user in one pass,
+// comma-joined so the sweep never spams one message per arm.
+func sltpSweptText(outcomes []string) string {
+	return fmt.Sprintf(
+		"🧹 *Cleaned up %d finished position(s)*\n\n"+
+			"%s\n\n"+
+			"These markets have closed, so their SL/TP arms were removed automatically — "+
+			"finished markets don't need SL/TP. Nothing was sold.",
+		len(outcomes), strings.Join(outcomes, ", "))
+}
+
 // NotifySLTPPaused implements live.Notifier. Sent once per user when the monitor
 // enters the V2 cutover (or any other) pause window, so users know why their
 // arms aren't firing.

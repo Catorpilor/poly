@@ -11,6 +11,7 @@ import (
 	"github.com/Catorpilor/poly/internal/config"
 	"github.com/Catorpilor/poly/internal/database"
 	"github.com/Catorpilor/poly/internal/live"
+	"github.com/Catorpilor/poly/internal/polymarket"
 	"github.com/Catorpilor/poly/internal/telegram"
 )
 
@@ -61,6 +62,9 @@ func main() {
 		live.V2CutoverPause,
 	)
 	bot.SetSLTPMonitor(sltpMonitor)
+	// Resolved-arm sweeper: hourly Gamma closed-market check that auto-disarms
+	// arms on finished markets (issue #39). Must be set before Start.
+	sltpMonitor.SetClosedMarketChecker(polymarket.NewMarketClient())
 	if err := sltpMonitor.Start(); err != nil {
 		log.Printf("Warning: Failed to start SL/TP monitor: %v", err)
 	}
