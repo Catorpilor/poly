@@ -40,7 +40,9 @@ is never a synonym for one.
 
 **Live Feed** — A spectator view of a market's tape: third-party Trades
 streamed to subscribed chats and web clients. Watch-only — it never places
-orders and is not copy trading.
+orders and is not copy trading. Telegram delivery of the tape is opt-in per
+subscription (`/live <slug> tape`); a default subscription is quiet — snipe
+watch and the web tape only.
 
 **Position** — A user's current holdings of one outcome token: share count
 plus average price. Lives on Polymarket, keyed by Token ID.

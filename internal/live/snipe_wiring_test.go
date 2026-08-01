@@ -68,7 +68,7 @@ func TestRegistryHasAnySubscribers(t *testing.T) {
 	if r.HasAnySubscribers("evt") {
 		t.Fatal("empty registry reports subscribers")
 	}
-	r.SubscribeTelegram(7, "evt")
+	r.SubscribeTelegram(7, "evt", false)
 	if !r.HasAnySubscribers("evt") {
 		t.Fatal("telegram subscriber not reported")
 	}
@@ -104,7 +104,7 @@ func TestSnipeWiringTelegramSubscribeLifecycle(t *testing.T) {
 	m, w, _ := newSnipeWiredManager(t)
 	ctx := context.Background()
 
-	if _, err := m.SubscribeTelegram(ctx, 7, pinnedFeedEventSlug); err != nil {
+	if _, err := m.SubscribeTelegram(ctx, 7, pinnedFeedEventSlug, false); err != nil {
 		t.Fatalf("SubscribeTelegram: %v", err)
 	}
 	for _, tok := range []string{"ml-blg", "ml-hle"} {
@@ -117,7 +117,7 @@ func TestSnipeWiringTelegramSubscribeLifecycle(t *testing.T) {
 	}
 
 	// A second subscriber keeps the watch alive after the first leaves.
-	if _, err := m.SubscribeTelegram(ctx, 8, pinnedFeedEventSlug); err != nil {
+	if _, err := m.SubscribeTelegram(ctx, 8, pinnedFeedEventSlug, false); err != nil {
 		t.Fatalf("SubscribeTelegram(second): %v", err)
 	}
 	m.UnsubscribeTelegram(7, pinnedFeedEventSlug)
@@ -137,7 +137,7 @@ func TestSnipeWiringUnsubscribeAllTelegram(t *testing.T) {
 	m, w, _ := newSnipeWiredManager(t)
 	ctx := context.Background()
 
-	if _, err := m.SubscribeTelegram(ctx, 7, pinnedFeedEventSlug); err != nil {
+	if _, err := m.SubscribeTelegram(ctx, 7, pinnedFeedEventSlug, false); err != nil {
 		t.Fatalf("SubscribeTelegram: %v", err)
 	}
 	m.UnsubscribeAllTelegram(7)
@@ -181,7 +181,7 @@ func TestSnipeWiringWebKeepsTelegramWatchAlive(t *testing.T) {
 	if err := m.SubscribeWeb(server, pinnedFeedEventSlug, false); err != nil {
 		t.Fatalf("SubscribeWeb: %v", err)
 	}
-	if _, err := m.SubscribeTelegram(ctx, 7, pinnedFeedEventSlug); err != nil {
+	if _, err := m.SubscribeTelegram(ctx, 7, pinnedFeedEventSlug, false); err != nil {
 		t.Fatalf("SubscribeTelegram: %v", err)
 	}
 
@@ -202,8 +202,8 @@ func TestSnipeWiringWebKeepsTelegramWatchAlive(t *testing.T) {
 func TestSnipeRecipientResolverAdapter(t *testing.T) {
 	t.Parallel()
 	m := &LiveTradeManager{subscriptions: NewSubscriptionRegistry()}
-	m.subscriptions.SubscribeTelegram(7, "evt")
-	m.subscriptions.SubscribeTelegram(8, "evt")
+	m.subscriptions.SubscribeTelegram(7, "evt", false)
+	m.subscriptions.SubscribeTelegram(8, "evt", false)
 
 	store := newFakeStore()
 	store.seed(&database.SLTPArm{ID: 1, TelegramID: 42, TokenID: "T1", SLArmed: true})

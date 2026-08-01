@@ -48,7 +48,7 @@ func TestBroadcastToTelegramBatchesTrades(t *testing.T) {
 	t.Parallel()
 
 	m, sender, timers := newFeedWiredManager(t)
-	if _, err := m.SubscribeTelegram(context.Background(), feedTestChat, pinnedFeedEventSlug); err != nil {
+	if _, err := m.SubscribeTelegram(context.Background(), feedTestChat, pinnedFeedEventSlug, true); err != nil {
 		t.Fatalf("SubscribeTelegram: %v", err)
 	}
 
@@ -79,7 +79,7 @@ func TestBroadcastToTelegramDropsSubFloorTrades(t *testing.T) {
 	t.Parallel()
 
 	m, sender, timers := newFeedWiredManager(t)
-	if _, err := m.SubscribeTelegram(context.Background(), feedTestChat, pinnedFeedEventSlug); err != nil {
+	if _, err := m.SubscribeTelegram(context.Background(), feedTestChat, pinnedFeedEventSlug, true); err != nil {
 		t.Fatalf("SubscribeTelegram: %v", err)
 	}
 
@@ -98,7 +98,7 @@ func TestUnsubscribeTelegramFlushesPendingBatch(t *testing.T) {
 	t.Parallel()
 
 	m, sender, timers := newFeedWiredManager(t)
-	if _, err := m.SubscribeTelegram(context.Background(), feedTestChat, pinnedFeedEventSlug); err != nil {
+	if _, err := m.SubscribeTelegram(context.Background(), feedTestChat, pinnedFeedEventSlug, true); err != nil {
 		t.Fatalf("SubscribeTelegram: %v", err)
 	}
 
@@ -121,7 +121,7 @@ func TestUnsubscribeAllTelegramFlushesPendingBatches(t *testing.T) {
 	t.Parallel()
 
 	m, sender, _ := newFeedWiredManager(t)
-	if _, err := m.SubscribeTelegram(context.Background(), feedTestChat, pinnedFeedEventSlug); err != nil {
+	if _, err := m.SubscribeTelegram(context.Background(), feedTestChat, pinnedFeedEventSlug, true); err != nil {
 		t.Fatalf("SubscribeTelegram: %v", err)
 	}
 
@@ -145,7 +145,7 @@ func TestBroadcastToWebUnaffectedByBatcher(t *testing.T) {
 	if err := m.SubscribeWeb(server, pinnedFeedEventSlug, false); err != nil {
 		t.Fatalf("SubscribeWeb: %v", err)
 	}
-	if _, err := m.SubscribeTelegram(context.Background(), feedTestChat, pinnedFeedEventSlug); err != nil {
+	if _, err := m.SubscribeTelegram(context.Background(), feedTestChat, pinnedFeedEventSlug, true); err != nil {
 		t.Fatalf("SubscribeTelegram: %v", err)
 	}
 
