@@ -279,6 +279,13 @@ func TestSLTPFiredText(t *testing.T) {
 			want:   []string{"Trailing stop hit", "$1.0000", "$0.8000", "$0.7200", "fully disarmed"},
 		},
 		{
+			name:    "SL-market escalation names the gapped floor honestly",
+			kind:    "SL-market",
+			result:  ok,
+			want:    []string{"Trailing stop hit", "gapped through the floor", "$0.7200", "sold at market", "fully disarmed"},
+			wantNot: []string{"FOK floor"},
+		},
+		{
 			name:   "SL with confirmed fill shows avg price",
 			kind:   "SL",
 			result: &polymarket.TradeResult{Success: true, FilledSize: 199.99, AveragePrice: 0.3610},

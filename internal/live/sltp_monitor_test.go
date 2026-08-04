@@ -288,6 +288,9 @@ type fakeExecutor struct {
 	mu    sync.Mutex
 	calls []executorCall
 	ret   *polymarket.TradeResult
+	// retFor, when set, answers per call (e.g. FOK fails, market succeeds)
+	// and takes precedence over ret.
+	retFor func(executorCall) *polymarket.TradeResult
 	// onSell, when set, is invoked (outside the lock) on every ExecuteSell —
 	// used to observe ordering (e.g. disarm must not precede the sell).
 	onSell func()
@@ -319,10 +322,14 @@ type lotteryCall struct {
 func (e *fakeExecutor) ExecuteSell(_ context.Context, arm *database.SLTPArm, sharesRaw int64,
 	limitPrice float64, orderType polymarket.OrderType) *polymarket.TradeResult {
 	e.mu.Lock()
-	e.calls = append(e.calls, executorCall{
+	call := executorCall{
 		armID: arm.ID, sharesRaw: sharesRaw, limitPrice: limitPrice, orderType: orderType,
-	})
+	}
+	e.calls = append(e.calls, call)
 	ret := e.ret
+	if e.retFor != nil {
+		ret = e.retFor(call)
+	}
 	hook := e.onSell
 	e.mu.Unlock()
 	if hook != nil {
@@ -1779,7 +1786,8 @@ func TestSLTPMonitor_SL_FOKFailureKeepsArmAndNotifiesPendingOnce(t *testing.T) {
 	}
 
 	// More breach evaluations inside the retry interval: still exactly one
-	// attempt and one pending notice.
+	// attempt pair (FOK + escalated market, both failed) and one pending
+	// notice.
 	clock.advance(10 * time.Second)
 	feed.emit("D6")
 	time.Sleep(50 * time.Millisecond)
@@ -1789,8 +1797,8 @@ func TestSLTPMonitor_SL_FOKFailureKeepsArmAndNotifiesPendingOnce(t *testing.T) {
 	notif.mu.Lock()
 	pendings := len(notif.pendings)
 	notif.mu.Unlock()
-	if calls != 1 || pendings != 1 {
-		t.Errorf("expected 1 attempt / 1 pending inside retry interval, got %d / %d", calls, pendings)
+	if calls != 2 || pendings != 1 {
+		t.Errorf("expected FOK+escalation pair / 1 pending inside retry interval, got %d / %d", calls, pendings)
 	}
 }
 
@@ -1810,10 +1818,11 @@ func TestSLTPMonitor_SL_RetryRateLimited(t *testing.T) {
 	waitFor(t, func() bool { return breachStamped(m, 76) })
 	clock.advance(31 * time.Second)
 	feed.emit("D7")
+	// First evaluation is the FOK + escalated-market pair, both failing.
 	waitFor(t, func() bool {
 		exec.mu.Lock()
 		defer exec.mu.Unlock()
-		return len(exec.calls) == 1
+		return len(exec.calls) == 2
 	})
 
 	clock.advance(10 * time.Second)
@@ -1824,16 +1833,17 @@ func TestSLTPMonitor_SL_RetryRateLimited(t *testing.T) {
 	exec.mu.Lock()
 	calls := len(exec.calls)
 	exec.mu.Unlock()
-	if calls != 1 {
+	if calls != 2 {
 		t.Errorf("expected retry to be rate-limited, got %d attempts", calls)
 	}
 
 	clock.advance(11 * time.Second) // 31s since attempt #1
 	feed.emit("D7")
+	// Escalated episode: the retry is a single market attempt, no fresh FOK.
 	waitFor(t, func() bool {
 		exec.mu.Lock()
 		defer exec.mu.Unlock()
-		return len(exec.calls) == 2
+		return len(exec.calls) == 3
 	})
 
 	// Second failure must not send a second pending notice (same episode).
@@ -2639,5 +2649,199 @@ func TestSLTPMonitor_TP_ShortfallBelowMinValueDisarms(t *testing.T) {
 	exec.mu.Unlock()
 	if calls != 1 {
 		t.Errorf("expected exactly 1 sell attempt (no clamped retry), got %d", calls)
+	}
+}
+
+// retForOrderType configures the shared fakeExecutor to answer per order
+// type — the escalation tests need the floored FOK to fail while the
+// follow-up market sell succeeds (or vice versa).
+func retForOrderType(fok, gtc *polymarket.TradeResult) func(executorCall) *polymarket.TradeResult {
+	return func(c executorCall) *polymarket.TradeResult {
+		if c.orderType == polymarket.OrderTypeFOK {
+			return fok
+		}
+		return gtc
+	}
+}
+
+func TestSLTPMonitor_SL_FirstFOKKillEscalatesToMarketSameEvaluation(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 90, TelegramID: 77, TokenID: "E1", AvgPrice: 0.50, SharesAtArm: 100,
+		HighWaterMark: 0.84, TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{retFor: retForOrderType(
+		&polymarket.TradeResult{Success: false, ErrorMsg: "fok killed"},
+		&polymarket.TradeResult{Success: true, OrderID: "mkt-1", FilledSize: 100, AveragePrice: 0.45},
+	)}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	// Trigger = 0.84*0.80 = 0.672; crash bid below the 0.6048 floor.
+	feed.setBid("E1", 0.59)
+	feed.emit("E1")
+	waitFor(t, func() bool { return breachStamped(m, 90) })
+	clock.advance(31 * time.Second)
+	feed.emit("E1")
+
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.fires) == 1
+	})
+
+	exec.mu.Lock()
+	calls := append([]executorCall(nil), exec.calls...)
+	exec.mu.Unlock()
+	if len(calls) != 2 {
+		t.Fatalf("want FOK then market in one evaluation, got %d calls: %+v", len(calls), calls)
+	}
+	if calls[0].orderType != polymarket.OrderTypeFOK || calls[0].limitPrice == 0 {
+		t.Errorf("first attempt must be the floored FOK, got %+v", calls[0])
+	}
+	if calls[1].orderType != polymarket.OrderTypeGTC || calls[1].limitPrice != 0 {
+		t.Errorf("escalation must be a market (0, GTC) sell, got %+v", calls[1])
+	}
+	notif.mu.Lock()
+	fire := notif.fires[0]
+	pendings := len(notif.pendings)
+	notif.mu.Unlock()
+	if fire.kind != "SL-market" {
+		t.Errorf("escalated exit kind = %q, want SL-market", fire.kind)
+	}
+	if pendings != 0 {
+		t.Errorf("successful escalation must not send a pending notice, got %d", pendings)
+	}
+	store.mu.Lock()
+	disarms := store.disarmCalls
+	store.mu.Unlock()
+	if disarms != 1 {
+		t.Errorf("escalated fill must disarm once, got %d", disarms)
+	}
+}
+
+func TestSLTPMonitor_SL_EscalatedMarketFailureKeepsArmThenRetriesMarketOnly(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 91, TelegramID: 77, TokenID: "E2", AvgPrice: 0.50, SharesAtArm: 100,
+		HighWaterMark: 0.84, TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{ret: &polymarket.TradeResult{Success: false, ErrorMsg: "everything fails"}}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("E2", 0.59)
+	feed.emit("E2")
+	waitFor(t, func() bool { return breachStamped(m, 91) })
+	clock.advance(31 * time.Second)
+	feed.emit("E2")
+
+	// First evaluation: FOK kill + failed market escalation → pending once.
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.pendings) == 1
+	})
+	// Next attempt after the retry interval goes STRAIGHT to market.
+	clock.advance(31 * time.Second)
+	feed.emit("E2")
+	waitFor(t, func() bool {
+		exec.mu.Lock()
+		defer exec.mu.Unlock()
+		return len(exec.calls) == 3
+	})
+
+	exec.mu.Lock()
+	calls := append([]executorCall(nil), exec.calls...)
+	exec.mu.Unlock()
+	if calls[0].orderType != polymarket.OrderTypeFOK ||
+		calls[1].orderType != polymarket.OrderTypeGTC ||
+		calls[2].orderType != polymarket.OrderTypeGTC {
+		t.Errorf("want FOK,GTC,GTC sequence, got %+v", calls)
+	}
+	store.mu.Lock()
+	disarms := store.disarmCalls
+	store.mu.Unlock()
+	if disarms != 0 {
+		t.Errorf("failed escalation keeps the arm, got %d disarms", disarms)
+	}
+}
+
+func TestSLTPMonitor_SL_RecoveryResetsEscalationToFOKFirst(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 92, TelegramID: 77, TokenID: "E3", AvgPrice: 0.50, SharesAtArm: 100,
+		HighWaterMark: 0.84, TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{ret: &polymarket.TradeResult{Success: false, ErrorMsg: "fails"}}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("E3", 0.59)
+	feed.emit("E3")
+	waitFor(t, func() bool { return breachStamped(m, 92) })
+	clock.advance(31 * time.Second)
+	feed.emit("E3")
+	waitFor(t, func() bool {
+		exec.mu.Lock()
+		defer exec.mu.Unlock()
+		return len(exec.calls) == 2 // FOK + escalated market, both failed
+	})
+
+	// Recovery above the trigger clears the episode (and the escalation flag).
+	feed.setBid("E3", 0.70)
+	feed.emit("E3")
+	waitFor(t, func() bool { return slStateCleared(m, 92) })
+
+	// Fresh breach: must start with the floored FOK again.
+	feed.setBid("E3", 0.55)
+	feed.emit("E3")
+	waitFor(t, func() bool { return breachStamped(m, 92) })
+	clock.advance(31 * time.Second)
+	feed.emit("E3")
+	waitFor(t, func() bool {
+		exec.mu.Lock()
+		defer exec.mu.Unlock()
+		return len(exec.calls) >= 3
+	})
+	exec.mu.Lock()
+	third := exec.calls[2]
+	exec.mu.Unlock()
+	if third.orderType != polymarket.OrderTypeFOK {
+		t.Errorf("fresh episode must lead with the floored FOK, got %+v", third)
+	}
+}
+
+func TestSLTPMonitor_SL_ShortfallOnFOKDoesNotEscalate(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 93, TelegramID: 77, TokenID: "E4", AvgPrice: 0.50, SharesAtArm: 100,
+		HighWaterMark: 0.84, TPArmed: true, SLArmed: true})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{ret: &polymarket.TradeResult{Success: false,
+		InsufficientBalance: true, AvailableSharesRaw: 50_000_000}}
+	notif := &fakeNotifier{}
+	m, clock := slBreachMonitor(store, feed, exec, notif)
+	_ = m.Start()
+
+	feed.setBid("E4", 0.59)
+	feed.emit("E4")
+	waitFor(t, func() bool { return breachStamped(m, 93) })
+	clock.advance(31 * time.Second)
+	feed.emit("E4")
+
+	waitFor(t, func() bool {
+		notif.mu.Lock()
+		defer notif.mu.Unlock()
+		return len(notif.stales) == 1
+	})
+	exec.mu.Lock()
+	calls := len(exec.calls)
+	exec.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("shortfall takes the clamp path, never escalation — want 1 call, got %d", calls)
 	}
 }

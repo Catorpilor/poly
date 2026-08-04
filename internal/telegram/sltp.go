@@ -548,6 +548,18 @@ func sltpFiredText(kind string, arm *database.SLTPArm, bid float64, result *poly
 				"Position fully disarmed.",
 			bid, arm.HighWaterMark, arm.SLTriggerPrice(), arm.Outcome, arm.SLFloorPrice(), fill,
 		)
+	case "SL-market":
+		// Escalated exit: the floored FOK was refused, the remainder went to
+		// market (ADR 0006). GTC acceptance semantics — fill details arrive
+		// on the tape, not in the result, so quote the intent honestly.
+		return fmt.Sprintf(
+			"🛑 *Trailing stop hit* at $%.4f — book gapped through the floor\n\n"+
+				"Peak was $%.4f, stop $%.4f. The $%.4f floor found no buyer, so the "+
+				"remaining %s shares were sold at market — in a real collapse any "+
+				"fill beats riding to zero.\n"+
+				"Position fully disarmed.",
+			bid, arm.HighWaterMark, arm.SLTriggerPrice(), arm.SLFloorPrice(), arm.Outcome,
+		)
 	default:
 		return fmt.Sprintf("ℹ️ %s fired at $%.4f", kind, bid)
 	}
