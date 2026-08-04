@@ -685,3 +685,48 @@ closed:true evidence sweeps.
 - [x] go test -count=1 ./... green
 - [x] go test -race -count=1 ./internal/live/ green (per-package — RPi)
 - [x] gofmt -l clean on touched files; go vet ./internal/live/ clean
+
+---
+
+# Comeback Snipe v2 — auto-buy on alert (issue #45, 2026-08-04)
+
+## telegram — auto-buy path
+- [x] snipeAutoBuyUSD ($10) / snipeAutoBuyDailyCapUSD ($50) product-policy
+      constants in snipe.go
+- [x] snipeSpendLedger: per-chat UTC-day accumulator, mutex-guarded,
+      injectable now() (registry pattern), reserve-before-buy /
+      release-on-failure so only successful buys consume the cap and
+      racing alerts can't overshoot it; restart resets (soft rail,
+      documented in code)
+- [x] snipeGuardedBuy factored out of handleSnipeCallback — guard
+      re-check via BestAsk, fetchSnipeMarket, token-index verify,
+      executeBuyOrderByIndex, MarkBought on success; tap path and
+      auto-buy both call it (claiming/cap accounting stay with callers)
+- [x] NotifySnipeAlert: register alert → auto-buy attempt → auto-sniped
+      message with [⚡ Add $25] (same registry entry, NOT claimed) +
+      [🎯 Arm SL/TP]; every failure path (no wallet, cap, guard, market
+      fetch, buy) degrades to the unchanged manual alert — cap-reached
+      appends the one-line note; the send is unconditional
+- [x] snipeAutoBoughtText pure builder; snipeWatch interface narrows the
+      watcher field for fakes; snipeMarkets/snipeBuyExec test seams
+
+## Tests (snipe_autobuy_test.go)
+- [x] builder table (incl. non-ASCII truncation, $0 cap left)
+- [x] ledger: five $10 reservations to the $50 boundary, sixth refused,
+      release refunds, UTC rollover resets, post-rollover release clamps
+- [x] auto-buy success: one $10 buy at index 0, MarkBought, "Auto-sniped"
+      + both buttons; Add $25 tap buys $25 off the same entry; double-tap
+      after that refuses ("Already handled")
+- [x] guard-refusal / no-wallet / buy-failure fallbacks: manual alert
+      with both snipe buttons, no MarkBought, cap refunded (proved by
+      next success showing $40 left)
+- [x] daily cap flow: fifth alert auto-buys at the boundary, sixth falls
+      back with cap note, rollover re-arms
+- [x] concurrent alerts race-safe on the cap: 10 racing alerts → exactly
+      5 buys, 10 deliveries (-race)
+
+## Verification
+- [x] go test -count=1 ./... green
+- [x] go test -race -count=1 ./internal/telegram/ ./internal/live/ green
+      (per-package — RPi)
+- [x] gofmt -l clean on touched files; go vet ./internal/telegram/ clean

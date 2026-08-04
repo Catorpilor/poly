@@ -12,6 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
+	"github.com/Catorpilor/poly/internal/database"
 	"github.com/Catorpilor/poly/internal/live"
 	"github.com/Catorpilor/poly/internal/polymarket"
 )
@@ -21,6 +22,27 @@ import (
 type SnipeAskSource interface {
 	BestAsk(tokenID string) (float64, bool)
 }
+
+// snipeWatch is the slice of the comeback-snipe watcher the bot drives: watch
+// registration and the bought latch. *live.SnipeWatcher implements it; tests
+// inject a recording fake.
+type snipeWatch interface {
+	WatchArmed(m live.SnipeMarket)
+	UnwatchArmed(tokenID string)
+	WatchHeld(chatID int64, m live.SnipeMarket, ttl time.Duration)
+	RenewHeld(chatID int64, tokenID string, ttl time.Duration) bool
+	MarkBought(tokenID string)
+}
+
+// Comeback Snipe v2 auto-buy sizing — product policy, deliberately global
+// constants, not per-user configuration (see CONTEXT.md "Comeback Snipe").
+const (
+	// snipeAutoBuyUSD is the fixed stake auto-bought on every genuine alert.
+	snipeAutoBuyUSD = 10.0
+	// snipeAutoBuyDailyCapUSD bounds one recipient's auto-snipe spend per UTC
+	// day.
+	snipeAutoBuyDailyCapUSD = 50.0
+)
 
 // The bot is the snipe watcher's notifier (wired in cmd/bot/main.go).
 var _ live.SnipeNotifier = (*Bot)(nil)
@@ -112,6 +134,57 @@ func (r *snipeAlertRegistry) claim(id string) (snipeAlertEntry, snipeAlertStatus
 	return *e, snipeAlertOK
 }
 
+// snipeSpendLedger accumulates per-chat auto-snipe spend for the current UTC
+// day. In-memory only — a restart resets the cap. That's a soft rail by
+// design: it bounds a runaway alert day, not an adversary. Reservation-style:
+// reserve before the buy so racing alerts cannot overshoot the cap, release on
+// failure so only successful buys consume it.
+type snipeSpendLedger struct {
+	mu    sync.Mutex
+	day   string // UTC date of the amounts in spent; rollover clears them
+	spent map[int64]float64
+	now   func() time.Time
+}
+
+func newSnipeSpendLedger() *snipeSpendLedger {
+	return &snipeSpendLedger{spent: make(map[int64]float64), now: time.Now}
+}
+
+// rollLocked clears the accumulator on UTC-day change. Callers hold mu.
+func (l *snipeSpendLedger) rollLocked() {
+	day := l.now().UTC().Format("2006-01-02")
+	if day != l.day {
+		l.day = day
+		l.spent = make(map[int64]float64)
+	}
+}
+
+// reserve claims amount of chatID's daily cap, reporting the cap remaining
+// after the claim. A claim that would exceed the cap is refused whole — no
+// partial auto-buys.
+func (l *snipeSpendLedger) reserve(chatID int64, amount float64) (left float64, ok bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.rollLocked()
+	if l.spent[chatID]+amount > snipeAutoBuyDailyCapUSD {
+		return snipeAutoBuyDailyCapUSD - l.spent[chatID], false
+	}
+	l.spent[chatID] += amount
+	return snipeAutoBuyDailyCapUSD - l.spent[chatID], true
+}
+
+// release refunds a reservation whose buy failed. A release landing after a
+// UTC rollover is dropped — the fresh day's accumulator never goes negative.
+func (l *snipeSpendLedger) release(chatID int64, amount float64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.rollLocked()
+	l.spent[chatID] -= amount
+	if l.spent[chatID] <= 0 {
+		delete(l.spent, chatID)
+	}
+}
+
 // snipeAlertText builds the alert body. Pure — table-tested.
 func snipeAlertText(question, outcome string, sessionHigh, ask float64) string {
 	multiple := 0.0
@@ -134,6 +207,35 @@ func snipeKeyboard(alertID string) tgbotapi.InlineKeyboardMarkup {
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("⚡ Snipe $10", fmt.Sprintf("snipe:%s:10", alertID)),
 			tgbotapi.NewInlineKeyboardButtonData("⚡ Snipe $25", fmt.Sprintf("snipe:%s:25", alertID)),
+		),
+	)
+}
+
+// snipeAutoBoughtText builds the v2 auto-buy confirmation. Pure — table-tested.
+func snipeAutoBoughtText(question, outcome string, sessionHigh, ask, amount float64, orderID string, capLeft float64) string {
+	return fmt.Sprintf(
+		"⚡ *Auto-sniped $%.0f*\n\n"+
+			"*%s*\n"+
+			"*Side:* Buy %s\n"+
+			"was $%.2f, now $%.2f ask.\n\n"+
+			"*Order ID:* %s\n"+
+			"Auto-snipe cap left today: $%.0f\n\n"+
+			"Top it up or protect it below.",
+		amount, truncateUTF8(question, 60), outcome, sessionHigh, ask, orderID, capLeft)
+}
+
+// snipeCapNote is the one-liner appended to the manual alert when the daily
+// auto-snipe cap blocked the buy.
+const snipeCapNote = "\n\n⚠️ Daily auto-snipe cap reached — manual taps only until UTC midnight."
+
+// snipeAutoBoughtKeyboard builds the auto-sniped message's buttons. The top-up
+// rides the SAME registry entry — the auto-buy never claims it, so the normal
+// snipe callback still works exactly once.
+func snipeAutoBoughtKeyboard(alertID string) tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⚡ Add $25", fmt.Sprintf("snipe:%s:25", alertID)),
+			tgbotapi.NewInlineKeyboardButtonData("🎯 Arm SL/TP", "sltp_list"),
 		),
 	)
 }
@@ -177,16 +279,153 @@ func snipeFilledText(question, outcome string, amount float64, orderID string) s
 // into the bot. Must be called after construction (the watcher depends on the
 // bot as its notifier — same cycle-break as SetSLTPMonitor).
 func (b *Bot) SetSnipe(w *live.SnipeWatcher, feed SnipeAskSource) {
-	b.snipeWatcher = w
+	if w != nil { // guard the typed-nil-in-interface trap
+		b.snipeWatcher = w
+	}
 	b.snipeFeed = feed
 }
 
 // NotifySnipeAlert implements live.SnipeNotifier: registers the alert for
-// one-tap buying and DMs the recipient.
+// one-tap buying, attempts the v2 fixed-stake auto-buy, and DMs the recipient.
+// The alert is always delivered — the message is picked from the auto-buy's
+// status and the send is unconditional, so no failure path can block it.
 func (b *Bot) NotifySnipeAlert(chatID int64, market live.SnipeMarket, sessionHigh, ask float64) {
 	alertID := b.snipeAlerts.add(market)
-	text := snipeAlertText(market.Question, market.Outcome, sessionHigh, ask)
-	b.sendMessageWithKeyboard(chatID, text, snipeKeyboard(alertID))
+	text, keyboard := b.snipeAlertMessage(chatID, alertID, market, sessionHigh, ask)
+	b.sendMessageWithKeyboard(chatID, text, keyboard)
+}
+
+// snipeAlertMessage picks the alert body and buttons: the auto-sniped
+// confirmation when the auto-buy filled, otherwise the unchanged manual alert
+// (with a one-line note when the daily cap was the blocker).
+func (b *Bot) snipeAlertMessage(chatID int64, alertID string, market live.SnipeMarket, sessionHigh, ask float64) (string, tgbotapi.InlineKeyboardMarkup) {
+	res, capLeft, status := b.snipeAutoBuy(chatID, market)
+	switch status {
+	case snipeAutoBought:
+		return snipeAutoBoughtText(market.Question, market.Outcome, sessionHigh, ask, snipeAutoBuyUSD, res.orderID, capLeft),
+			snipeAutoBoughtKeyboard(alertID)
+	case snipeAutoCapReached:
+		return snipeAlertText(market.Question, market.Outcome, sessionHigh, ask) + snipeCapNote,
+			snipeKeyboard(alertID)
+	default:
+		return snipeAlertText(market.Question, market.Outcome, sessionHigh, ask),
+			snipeKeyboard(alertID)
+	}
+}
+
+// snipeAutoStatus classifies a snipeAutoBuy attempt for messaging.
+type snipeAutoStatus int
+
+const (
+	snipeAutoBought     snipeAutoStatus = iota
+	snipeAutoCapReached                 // daily cap blocked the buy — noted on the alert
+	snipeAutoSkipped                    // no wallet / guard / market / buy failure — plain manual alert
+)
+
+// snipeAutoBuy attempts the fixed $10 auto-buy for one alert recipient (the
+// chat ID is the recipient's telegram ID — alerts are DMs). It never claims
+// the registry entry, so the Add-$25 tap later claims it normally and
+// double-tap safety is preserved. Cap headroom is reserved before the buy so
+// racing alerts cannot overshoot the daily cap; a failed buy refunds it.
+func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResult, float64, snipeAutoStatus) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	user, err := b.userRepo.GetByTelegramID(ctx, chatID)
+	if err != nil || user == nil {
+		return snipeBuyResult{}, 0, snipeAutoSkipped
+	}
+	capLeft, ok := b.snipeSpend.reserve(chatID, snipeAutoBuyUSD)
+	if !ok {
+		log.Printf("Snipe auto-buy: cap reached chat=%d", chatID)
+		return snipeBuyResult{}, capLeft, snipeAutoCapReached
+	}
+	entry := snipeAlertEntry{
+		tokenID:  market.TokenID,
+		marketID: market.MarketID,
+		question: market.Question,
+		outcome:  market.Outcome,
+	}
+	res := b.snipeGuardedBuy(ctx, user, entry, snipeAutoBuyUSD)
+	if res.outcome != snipeBuyFilled {
+		b.snipeSpend.release(chatID, snipeAutoBuyUSD)
+		log.Printf("Snipe auto-buy: skipped chat=%d token=%.12s… reason=%d err=%v msg=%s",
+			chatID, market.TokenID, res.outcome, res.err, res.errorMsg)
+		return res, 0, snipeAutoSkipped
+	}
+	log.Printf("Snipe auto-buy: filled chat=%d token=%.12s… $%.0f order=%s cap-left=$%.2f",
+		chatID, market.TokenID, snipeAutoBuyUSD, res.orderID, capLeft)
+	return res, capLeft, snipeAutoBought
+}
+
+// snipeBuyOutcome classifies a snipeGuardedBuy attempt.
+type snipeBuyOutcome int
+
+const (
+	snipeBuyFilled    snipeBuyOutcome = iota
+	snipeBuyRepriced                  // guard refusal: fresh ask missing or repriced
+	snipeBuyMarketErr                 // market fetch failed
+	snipeBuyMismatch                  // alert token not in the market's clobTokenIds
+	snipeBuyRejected                  // executor reported Success=false
+)
+
+// snipeBuyResult carries what each caller needs to message the user.
+type snipeBuyResult struct {
+	outcome  snipeBuyOutcome
+	ask      float64 // fresh ask at guard time (snipeBuyRepriced)
+	askOK    bool
+	err      error  // snipeBuyMarketErr
+	orderID  string // snipeBuyFilled
+	errorMsg string // snipeBuyRejected
+}
+
+// snipeGuardedBuy is the shared guarded snipe buy behind both the one-tap
+// callback and the v2 auto-buy: repricing guard on a fresh ask, market fetch,
+// token-index verify, buy, MarkBought on success. Claiming the registry entry
+// and cap accounting stay with the callers.
+func (b *Bot) snipeGuardedBuy(ctx context.Context, user *database.User, entry snipeAlertEntry, amount float64) snipeBuyResult {
+	var ask float64
+	var ok bool
+	if b.snipeFeed != nil {
+		ask, ok = b.snipeFeed.BestAsk(entry.tokenID)
+	}
+	if snipeRefuseBuy(ask, ok) {
+		return snipeBuyResult{outcome: snipeBuyRepriced, ask: ask, askOK: ok}
+	}
+
+	mc := b.snipeMarkets
+	if mc == nil {
+		mc = polymarket.NewMarketClient()
+	}
+	market, err := fetchSnipeMarket(ctx, mc, entry.marketID)
+	if err != nil {
+		return snipeBuyResult{outcome: snipeBuyMarketErr, err: err}
+	}
+	idx := -1
+	for i, id := range market.GetClobTokenIds() {
+		if id == entry.tokenID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return snipeBuyResult{outcome: snipeBuyMismatch}
+	}
+
+	exec := b.snipeBuyExec
+	if exec == nil {
+		exec = func(ctx context.Context, user *database.User, market *polymarket.GammaMarket, idx int, amount float64) *polymarket.TradeResult {
+			return b.executeBuyOrderByIndex(ctx, user, market, idx, amount, 0)
+		}
+	}
+	result := exec(ctx, user, market, idx, amount)
+	if !result.Success {
+		return snipeBuyResult{outcome: snipeBuyRejected, errorMsg: result.ErrorMsg}
+	}
+	if b.snipeWatcher != nil {
+		b.snipeWatcher.MarkBought(entry.tokenID)
+	}
+	return snipeBuyResult{outcome: snipeBuyFilled, ask: ask, orderID: result.OrderID}
 }
 
 // handleSnipeCallback executes the one-tap snipe buy.
@@ -221,58 +460,34 @@ func (b *Bot) handleSnipeCallback(ctx context.Context, update *tgbotapi.Update) 
 		return
 	}
 
-	// Repricing guard: re-check the live ask at tap time.
-	var ask float64
-	var ok bool
-	if b.snipeFeed != nil {
-		ask, ok = b.snipeFeed.BestAsk(entry.tokenID)
-	}
-	if snipeRefuseBuy(ask, ok) {
-		log.Printf("Snipe guard: refuse user=%d token=%s ask=%.4f ok=%v", userID, entry.tokenID, ask, ok)
-		b.editMessage(chatID, messageID, snipeRepricedText(entry.outcome, ask, ok))
-		return
-	}
-
-	marketClient := polymarket.NewMarketClient()
-	market, err := fetchSnipeMarket(ctx, marketClient, entry.marketID)
-	if err != nil {
-		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Snipe failed: couldn't fetch market: %v", err))
-		return
-	}
-	idx := -1
-	for i, id := range market.GetClobTokenIds() {
-		if id == entry.tokenID {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
-		b.editMessage(chatID, messageID, "❌ Snipe failed: market data mismatch — not buying.")
-		return
-	}
-
 	question := truncateUTF8(entry.question, 60)
 	b.editMessage(chatID, messageID, fmt.Sprintf(
 		"⏳ *Sniping...*\n\n*Market:* %s\n*Side:* Buy %s\n*Amount:* $%.2f",
 		question, entry.outcome, amount))
 
-	result := b.executeBuyOrderByIndex(ctx, user, market, idx, amount, 0)
-	if result.Success {
-		if b.snipeWatcher != nil {
-			b.snipeWatcher.MarkBought(entry.tokenID)
-		}
+	// Guard, market verify, buy — shared with the auto-buy path.
+	res := b.snipeGuardedBuy(ctx, user, entry, amount)
+	switch res.outcome {
+	case snipeBuyRepriced:
+		log.Printf("Snipe guard: refuse user=%d token=%s ask=%.4f ok=%v", userID, entry.tokenID, res.ask, res.askOK)
+		b.editMessage(chatID, messageID, snipeRepricedText(entry.outcome, res.ask, res.askOK))
+	case snipeBuyMarketErr:
+		b.editMessage(chatID, messageID, fmt.Sprintf("❌ Snipe failed: couldn't fetch market: %v", res.err))
+	case snipeBuyMismatch:
+		b.editMessage(chatID, messageID, "❌ Snipe failed: market data mismatch — not buying.")
+	case snipeBuyRejected:
+		b.editMessage(chatID, messageID, fmt.Sprintf(
+			"❌ *Snipe failed*\n\n*Market:* %s\n*Error:* %s",
+			question, res.errorMsg))
+	case snipeBuyFilled:
 		keyboard := tgbotapi.NewInlineKeyboardMarkup(
 			tgbotapi.NewInlineKeyboardRow(
 				tgbotapi.NewInlineKeyboardButtonData("🎯 Arm SL/TP", "sltp_list"),
 			),
 		)
 		b.editMessageWithKeyboard(chatID, messageID,
-			snipeFilledText(entry.question, entry.outcome, amount, result.OrderID), keyboard)
-		return
+			snipeFilledText(entry.question, entry.outcome, amount, res.orderID), keyboard)
 	}
-	b.editMessage(chatID, messageID, fmt.Sprintf(
-		"❌ *Snipe failed*\n\n*Market:* %s\n*Error:* %s",
-		question, result.ErrorMsg))
 }
 
 // snipeMarketFromGamma builds the watcher's per-token metadata from a Gamma
