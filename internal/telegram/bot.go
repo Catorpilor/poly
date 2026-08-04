@@ -42,10 +42,16 @@ type Bot struct {
 	sltpMonitor    *live.SLTPMonitor
 	// Comeback Snipe: watcher + ask source wired via SetSnipe; alert registry
 	// maps short callback IDs to token/market info (token IDs are ~78 digits,
-	// far beyond Telegram's 64-byte callback data).
-	snipeWatcher *live.SnipeWatcher
+	// far beyond Telegram's 64-byte callback data); spend ledger caps the v2
+	// auto-buys per UTC day.
+	snipeWatcher snipeWatch
 	snipeFeed    SnipeAskSource
 	snipeAlerts  *snipeAlertRegistry
+	snipeSpend   *snipeSpendLedger
+	// snipeMarkets and snipeBuyExec are test seams for the snipe buy path;
+	// nil selects production (a fresh Gamma client / executeBuyOrderByIndex).
+	snipeMarkets *polymarket.MarketClient
+	snipeBuyExec func(ctx context.Context, user *database.User, market *polymarket.GammaMarket, idx int, amount float64) *polymarket.TradeResult
 }
 
 // CommandHandler is a function that handles a command
@@ -122,6 +128,7 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 		relayerClient:  relayerClient,
 		liveManager:    liveManager,
 		snipeAlerts:    newSnipeAlertRegistry(),
+		snipeSpend:     newSnipeSpendLedger(),
 	}
 
 	// Set bot as telegram sender for live manager
