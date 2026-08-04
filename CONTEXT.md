@@ -182,21 +182,28 @@ taking precedence over the 2× rule.
 fill-or-kill buy of the *opposite* outcome token, only if it costs at most
 $0.05 per share, spending at most $5 — a cheap bet on a reversal.
 
-**Comeback Snipe** — An alert-then-buy on a token that was *formerly
-competitive, now priced as dead*: an in-play market whose token's
-Session High bid reached ≥ 0.40 and whose ask has since fallen into
-the 0.03–0.20 crash band. Below 0.03 the market is declaring death or
-settlement rather than overreacting — no game-end signal exists in the
-metadata, so the floor is what keeps a finished game's loser token
-from alerting. The bot never buys on its own — it sends an alert with a
-one-tap buy button; the human judges the game state. Alerts are
-episode-based: after alerting, a token re-alerts only once its ask has
-recovered above the midpoint of the crash threshold and the
+**Comeback Snipe** — An auto-buy-then-top-up on a token that was
+*formerly competitive, now priced as dead*: an in-play market whose
+token's Session High bid reached ≥ 0.40 and whose ask has since fallen
+into the 0.03–0.20 crash band. Below 0.03 the market is declaring death
+or settlement rather than overreacting — no game-end signal exists in
+the metadata, so the floor is what keeps a finished game's loser token
+from alerting. v2 (issue #45): on every genuine alert the bot instantly
+auto-buys a fixed $10 for the recipient through the guarded buy path
+(fresh-ask repricing guard ≤ 0.30), bounded by a $50-per-user-per-UTC-day
+in-memory cap (a restart resets it — soft rail). The alert then offers a
+one-tap Add $25 top-up riding the same alert entry; any auto-buy failure
+(cap, guard, no wallet, CLOB) falls back to the unchanged manual alert
+with one-tap buy buttons — delivery is never blocked by execution. The
+human judgment layer thus moved from gatekeeper to top-up: the bot takes
+the small stake on its own, the human decides whether to press. Alerts
+are episode-based: after alerting, a token re-alerts only once its ask
+has recovered above the midpoint of the crash threshold and the
 competitiveness bar (0.30 today) and then crashes again — a real
-recovery, not spread noise. Buying via the alert silences that token
-for the rest of the match. Distinct from a Lottery Ticket (which
-reacts to *our own* ceiling exit on the other side) and from pre-game
-value buys (not in-play, out of scope).
+recovery, not spread noise. Buying via the alert (auto or tap) silences
+that token for the rest of the match. Distinct from a Lottery Ticket
+(which reacts to *our own* ceiling exit on the other side) and from
+pre-game value buys (not in-play, out of scope).
 
 **Session High** — The highest trade-or-bid price the bot knows for a
 token in the current session: seeded at watch-start from the CLOB's
