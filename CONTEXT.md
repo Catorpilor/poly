@@ -147,9 +147,12 @@ sells winners cheap once the trailing stop is insuring the position.
 reaches 1.20× the arm-time average price (until then there is no stop —
 max loss is the stake). Once active: trigger = max(entry, HWM × 0.80),
 ratcheting up only. A breach must hold for 30s straight (confirmation
-debounce), then the exit is a fill-or-kill limit at trigger × 0.90 — never
-a market order into a gapped book; a no-fill keeps the arm and retries
-every ≥30s while the breach persists. Replaced the fixed 0.70× stop in
+debounce), then the exit is a fill-or-kill limit at trigger × 0.90. The
+floored FOK gets exactly one shot per episode: if it is killed, every
+further attempt sells at market — counterfactual replay showed true
+collapses gap through any plausible floor within a minute, where any
+fill beats riding to zero (ADR 0006). A recovery above the trigger
+resets the episode to FOK-first. Replaced the fixed 0.70× stop in
 v0.11: 92 days of fills showed that stop realizing −48% of basis and
 selling 29% eventual winners.
 

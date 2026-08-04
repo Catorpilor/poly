@@ -179,6 +179,12 @@ type slArmState struct {
 	// sell min(snapshot, clamped) instead of the stale arm-time snapshot.
 	clampedSharesRaw int64
 	staleNotified    bool // stale-size notice sent for this episode
+	// escalated: this episode's floored FOK was killed, so every further
+	// attempt sells at market. Counterfactual replay of realized crashes
+	// (2026-08-04, ADR 0006) showed true collapses gap through any plausible
+	// floor within a minute — after one refused floor, any fill beats zero.
+	// A recovery above the trigger clears the episode and the flag with it.
+	escalated bool
 }
 
 // SLTPMonitor evaluates armed TP/SL thresholds on each price update and fires
@@ -683,9 +689,28 @@ func (m *SLTPMonitor) attemptSLExit(arm *database.SLTPArm, bid, trigger float64)
 	}
 
 	floor := arm.SLFloorPrice()
-	log.Printf("SLTPMonitor: SL attempt user=%d token=%s bid=%.4f trigger=%.4f floor=%.4f sharesRaw=%d",
-		arm.TelegramID, arm.TokenID, bid, trigger, floor, sharesRaw)
-	result := m.executor.ExecuteSell(m.ctx, arm, sharesRaw, floor, polymarket.OrderTypeFOK)
+
+	// Escalated episodes go straight to market: the floored FOK already had
+	// its one shot this episode (ADR 0006).
+	if !m.slEscalated(arm.ID) {
+		log.Printf("SLTPMonitor: SL attempt user=%d token=%s bid=%.4f trigger=%.4f floor=%.4f sharesRaw=%d",
+			arm.TelegramID, arm.TokenID, bid, trigger, floor, sharesRaw)
+		result := m.executor.ExecuteSell(m.ctx, arm, sharesRaw, floor, polymarket.OrderTypeFOK)
+		if result != nil && result.Success {
+			m.completeSLExit(arm, "SL", bid, floor, sharesRaw, result)
+			return
+		}
+		if result != nil && result.InsufficientBalance {
+			m.finishSLAttempt(arm.ID)
+			m.handleSLShortfall(arm, result.AvailableSharesRaw, floor)
+			return
+		}
+		m.setSLEscalated(arm.ID)
+	}
+
+	log.Printf("SLTPMonitor: SL escalate user=%d token=%s bid=%.4f trigger=%.4f sharesRaw=%d (floor %.4f refused)",
+		arm.TelegramID, arm.TokenID, bid, trigger, sharesRaw, floor)
+	result := m.executor.ExecuteSell(m.ctx, arm, sharesRaw, 0, polymarket.OrderTypeGTC)
 	if result == nil || !result.Success {
 		m.finishSLAttempt(arm.ID)
 		if result != nil && result.InsufficientBalance {
@@ -695,10 +720,17 @@ func (m *SLTPMonitor) attemptSLExit(arm *database.SLTPArm, bid, trigger float64)
 		m.notifySLPendingOnce(arm, bid, trigger, floor)
 		return
 	}
+	m.completeSLExit(arm, "SL-market", bid, floor, sharesRaw, result)
+}
 
+// completeSLExit finishes a filled SL sell (floored FOK or escalated market):
+// latch sold, disarm (tolerating an already-gone row), clear state, drop the
+// feed sub, notify with the given kind.
+func (m *SLTPMonitor) completeSLExit(arm *database.SLTPArm, kind string, bid, floor float64,
+	sharesRaw int64, result *polymarket.TradeResult) {
 	m.markSLSold(arm.ID)
-	log.Printf("SLTPMonitor: SL fire user=%d token=%s bid=%.4f floor=%.4f sharesRaw=%d",
-		arm.TelegramID, arm.TokenID, bid, floor, sharesRaw)
+	log.Printf("SLTPMonitor: SL fire user=%d token=%s kind=%s bid=%.4f floor=%.4f sharesRaw=%d",
+		arm.TelegramID, arm.TokenID, kind, bid, floor, sharesRaw)
 	if err := m.store.Disarm(m.ctx, arm.TelegramID, arm.TokenID); err != nil && !errors.Is(err, repositories.ErrSLTPArmNotFound) {
 		// Keep the sold state; a later evaluation retries the disarm only.
 		log.Printf("SLTPMonitor: disarm after SL sell for %d/%s: %v (will retry)",
@@ -707,7 +739,23 @@ func (m *SLTPMonitor) attemptSLExit(arm *database.SLTPArm, bid, trigger float64)
 		m.clearSLState(arm.ID)
 		m.unsubscribeIfLast(arm.TokenID)
 	}
-	m.notifier.NotifySLTPFired(arm.TelegramID, "SL", arm, bid, result)
+	m.notifier.NotifySLTPFired(arm.TelegramID, kind, arm, bid, result)
+}
+
+// slEscalated reports whether this episode already burned its floored FOK.
+func (m *SLTPMonitor) slEscalated(armID int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st := m.slState[armID]
+	return st != nil && st.escalated
+}
+
+func (m *SLTPMonitor) setSLEscalated(armID int) {
+	m.mu.Lock()
+	if st := m.slState[armID]; st != nil {
+		st.escalated = true
+	}
+	m.mu.Unlock()
 }
 
 // handleSLShortfall reacts to a balance-shortfall rejection of an SL exit:

@@ -730,3 +730,15 @@ closed:true evidence sweeps.
 - [x] go test -race -count=1 ./internal/telegram/ ./internal/live/ green
       (per-package — RPi)
 - [x] gofmt -l clean on touched files; go vet ./internal/telegram/ clean
+
+---
+
+## SL market escalation (ADR 0006, v0.13.1) — 2026-08-04
+
+- [x] Counterfactual (199 episodes, fid-1 refined): deeper floors ≈ noise; market exits +$402 P=0.99
+- [x] Grilled: N=1 (one floored FOK per episode), escalation via existing market path (user decisions)
+- [x] slArmState.escalated + attemptSLExit restructure + completeSLExit helper
+- [x] Kind "SL-market" + honest gapped-floor notification text
+- [x] Tests: escalate-same-eval, market-fail-keeps-arm + market-only retries, recovery resets to FOK-first, shortfall never escalates; legacy call-count tests updated
+- [x] CONTEXT.md Stop-Loss entry + ADR 0006
+- [x] go test ./... green; -race live+telegram green
