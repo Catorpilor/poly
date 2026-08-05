@@ -543,6 +543,55 @@ func TestPriceFeed_DeferredConnect_ConnectsAfterSubscribe(t *testing.T) {
 	t.Fatal("expected connection after Subscribe, never got connected")
 }
 
+// TestPriceFeed_ConcurrentWSWrites_NoPanic reproduces issue #48: pingLoop and
+// resubscribeAll wrote to the shared WS conn without serialization, and
+// gorilla/websocket panics with "concurrent write to websocket connection"
+// when two writers collide. Subscribe/Unsubscribe call resubscribeAll on every
+// watch-list change, so mid-session churn raced the periodic PING in prod.
+func TestPriceFeed_ConcurrentWSWrites_NoPanic(t *testing.T) {
+	t.Parallel()
+	_, wsURL := startMockWSServer(t, func(c *websocket.Conn) {
+		for {
+			if _, _, err := c.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+
+	f := newStubFetcher()
+	m := newPriceFeedManagerWithURL(f, wsURL)
+	defer m.Stop()
+
+	m.Subscribe("token1") // non-empty sub list so resubscribeAll actually writes
+	m.Start()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		m.mu.RLock()
+		connected := m.connected
+		m.mu.RUnlock()
+		if connected {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("never connected to mock WS server")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 300; i++ {
+				m.resubscribeAll()
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 // startMockWSServer spins up an httptest server that upgrades to WebSocket and
 // hands the connection to the provided handler.
 func startMockWSServer(t *testing.T, handler func(*websocket.Conn)) (*httptest.Server, string) {

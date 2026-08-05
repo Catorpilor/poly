@@ -41,6 +41,11 @@ type PriceFeedManager struct {
 	fetcher orderBookFetcher
 	wsURL   string
 
+	// writeMu serializes all writes to conn — gorilla/websocket forbids
+	// concurrent writers, and resubscribeAll (via Subscribe/Unsubscribe)
+	// races the pingLoop PING otherwise (issue #48).
+	writeMu sync.Mutex
+
 	mu             sync.RWMutex
 	conn           *websocket.Conn
 	connected      bool
@@ -425,7 +430,10 @@ func (m *PriceFeedManager) resubscribeAll() {
 		return
 	}
 	log.Printf("[WS-DIAG] subscribe send (%d ids): %s", len(ids), string(b))
-	if err := conn.WriteMessage(websocket.TextMessage, b); err != nil {
+	m.writeMu.Lock()
+	err = conn.WriteMessage(websocket.TextMessage, b)
+	m.writeMu.Unlock()
+	if err != nil {
 		log.Printf("PriceFeedManager: write subscribe: %v", err)
 	}
 }
@@ -451,7 +459,10 @@ func (m *PriceFeedManager) pingLoop() {
 				_ = conn.Close()
 				return
 			}
-			if err := conn.WriteMessage(websocket.TextMessage, []byte("PING")); err != nil {
+			m.writeMu.Lock()
+			err := conn.WriteMessage(websocket.TextMessage, []byte("PING"))
+			m.writeMu.Unlock()
+			if err != nil {
 				log.Printf("PriceFeedManager: ping failed: %v", err)
 				_ = conn.Close()
 				return
