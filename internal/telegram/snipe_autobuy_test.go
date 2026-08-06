@@ -446,6 +446,9 @@ func TestNotifySnipeAlertGuardRefusalFallsBack(t *testing.T) {
 	if strings.Contains(sent.text, "cap reached") {
 		t.Errorf("guard fallback must not carry the cap note:\n%s", sent.text)
 	}
+	if !strings.Contains(sent.text, "Auto-buy skipped") || !strings.Contains(sent.text, "moved past the snipe guard") {
+		t.Errorf("guard fallback must say why the auto-buy was skipped (issue #50):\n%s", sent.text)
+	}
 	callbackData(t, sent.markup, "⚡ Snipe $10")
 	callbackData(t, sent.markup, "⚡ Snipe $25")
 	// The failed attempt released its reservation: the full cap is available.
@@ -468,6 +471,9 @@ func TestNotifySnipeAlertNoWalletFallsBack(t *testing.T) {
 	sent := h.tg.sentAt(t, 0)
 	if !strings.Contains(sent.text, "Comeback Snipe") || strings.Contains(sent.text, "Auto-sniped") {
 		t.Errorf("fallback alert wrong:\n%s", sent.text)
+	}
+	if !strings.Contains(sent.text, "no trading wallet") {
+		t.Errorf("no-wallet fallback must say why the auto-buy was skipped (issue #50):\n%s", sent.text)
 	}
 	callbackData(t, sent.markup, "⚡ Snipe $10")
 	callbackData(t, sent.markup, "⚡ Snipe $25")
@@ -497,6 +503,9 @@ func TestNotifySnipeAlertBuyFailureFallsBack(t *testing.T) {
 	sent := h.tg.sentAt(t, 0)
 	if !strings.Contains(sent.text, "Comeback Snipe") || strings.Contains(sent.text, "Auto-sniped") {
 		t.Errorf("fallback alert wrong:\n%s", sent.text)
+	}
+	if !strings.Contains(sent.text, "order was rejected") {
+		t.Errorf("buy-failure fallback must say why the auto-buy was skipped (issue #50):\n%s", sent.text)
 	}
 	callbackData(t, sent.markup, "⚡ Snipe $10")
 

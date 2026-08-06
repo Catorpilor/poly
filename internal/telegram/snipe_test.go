@@ -58,6 +58,40 @@ func TestSnipeAlertText(t *testing.T) {
 					t.Errorf("snipeAlertText missing %q in:\n%s", want, got)
 				}
 			}
+			// v1 copy claimed the bot never buys on its own — false since the
+			// v2 auto-buy, and it landed 2s before an "Auto-sniped" confirm on
+			// 2026-08-05 (issue #50).
+			if strings.Contains(got, "never buys on its own") {
+				t.Errorf("snipeAlertText still carries stale v1 copy:\n%s", got)
+			}
+		})
+	}
+}
+
+// TestSnipeSkipNote: the degraded manual alert must say why the auto-buy
+// didn't run (issue #50: contradictory copy without a reason).
+func TestSnipeSkipNote(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		res  snipeBuyResult
+		want string
+	}{
+		{"repriced", snipeBuyResult{outcome: snipeBuyRepriced, ask: 0.34, askOK: true}, "moved past the snipe guard"},
+		{"no ask", snipeBuyResult{outcome: snipeBuyRepriced, askOK: false}, "moved past the snipe guard"},
+		{"market error", snipeBuyResult{outcome: snipeBuyMarketErr}, "market lookup failed"},
+		{"mismatch", snipeBuyResult{outcome: snipeBuyMismatch}, "market data mismatch"},
+		{"rejected", snipeBuyResult{outcome: snipeBuyRejected, errorMsg: "not enough balance"}, "order was rejected"},
+		{"no wallet", snipeBuyResult{outcome: snipeBuyNoWallet}, "no trading wallet"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := snipeSkipNote(tt.res)
+			if !strings.Contains(got, "Auto-buy skipped") || !strings.Contains(got, tt.want) {
+				t.Errorf("snipeSkipNote(%v) = %q, want it to contain %q and 'Auto-buy skipped'", tt.res.outcome, got, tt.want)
+			}
 		})
 	}
 }
