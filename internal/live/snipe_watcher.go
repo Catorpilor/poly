@@ -112,6 +112,10 @@ type snipeTokenState struct {
 	// dispatching marks an alert delivery (including the v2 auto-buy) in
 	// flight; the episode never un-latches underneath it (issue #50).
 	dispatching bool
+	// lastAlertAt is when this token last fired. Log-only instrumentation
+	// for the corpse-filter review: a crash whose same-market complement also
+	// alerted recently is a see-saw game, not a decided one.
+	lastAlertAt time.Time
 	// Watch sources. A token stays watched while any source is live.
 	events  map[string]bool     // subscribed event slugs
 	armed   bool                // watched because an SL/TP arm exists
@@ -512,9 +516,15 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		st.sessionHigh >= SnipeCompetitiveBid &&
 		ask >= SnipeMinAsk && ask <= SnipeCrashAsk &&
 		w.inPlay(st.market, now)
+	var pairAgo string
 	if fire {
 		st.alerted = true
 		st.dispatching = true
+		st.lastAlertAt = now
+		pairAgo = "never"
+		if at, ok := w.pairLastAlertLocked(st.market.MarketID, tokenID); ok {
+			pairAgo = now.Sub(at).Round(time.Second).String()
+		}
 	}
 	market := st.market
 	high := st.sessionHigh
@@ -532,14 +542,38 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 
 	if fire {
 		recipients := w.dispatch(market, high, ask, eventSlugs, holders)
-		log.Printf("SnipeWatcher: alert token=%.12s… high=%.3f ask=%.3f recipients=%d",
-			tokenID, high, ask, recipients)
+		// bid/impliedComplement/pairAlerted are log-only instrumentation for
+		// the corpse-filter review: complement bid is mechanically 1-ask on
+		// Polymarket's mirrored binary books; a wide own-side spread and a
+		// never-alerted pair are the corpse signature, a recently-alerted
+		// pair is the see-saw signature.
+		log.Printf("SnipeWatcher: alert token=%.12s… high=%.3f ask=%.3f bid=%.3f impliedComplement=%.3f pairAlerted=%s recipients=%d",
+			tokenID, high, ask, bid, 1-ask, pairAgo, recipients)
 		w.mu.Lock()
 		if st := w.tokens[tokenID]; st != nil {
 			st.dispatching = false
 		}
 		w.mu.Unlock()
 	}
+}
+
+// pairLastAlertLocked returns the most recent alert time among OTHER tokens
+// of the same market — the complement side(s) in a binary market. Callers
+// hold w.mu. Log-only instrumentation: blocks nothing.
+func (w *SnipeWatcher) pairLastAlertLocked(marketID, exceptTokenID string) (time.Time, bool) {
+	if marketID == "" {
+		return time.Time{}, false
+	}
+	var latest time.Time
+	for id, st := range w.tokens {
+		if id == exceptTokenID || st.market.MarketID != marketID || st.lastAlertAt.IsZero() {
+			continue
+		}
+		if st.lastAlertAt.After(latest) {
+			latest = st.lastAlertAt
+		}
+	}
+	return latest, !latest.IsZero()
 }
 
 // inPlay gates alerts to started games: the scheduled start is known and has

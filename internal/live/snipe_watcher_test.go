@@ -192,6 +192,63 @@ func TestSnipeWatcher_TriggerBoundaries(t *testing.T) {
 	}
 }
 
+// TestSnipeWatcher_PairAlertInstrumentation: each fire stamps lastAlertAt,
+// and pairLastAlertLocked surfaces the most recent alert among OTHER tokens
+// of the same market — log-only fuel for the September corpse-filter review
+// (every winning tap so far came from a game where BOTH sides alerted; the
+// corpse losses came from one-sided crashes).
+func TestSnipeWatcher_PairAlertInstrumentation(t *testing.T) {
+	t.Parallel()
+	w, _, rec, notif, clock := snipeHarness()
+	rec.eventSubs["evt"] = []int64{101}
+	a := startedMarket("TA")
+	b := startedMarket("TB")
+	b.MarketID = a.MarketID // two outcomes of one market share the market ID
+	other := startedMarket("TC") // unrelated market
+	w.WatchEventMarkets("evt", []SnipeMarket{a, b, other})
+
+	// No alerts anywhere yet.
+	w.mu.Lock()
+	if _, ok := w.pairLastAlertLocked(a.MarketID, "TA"); ok {
+		t.Error("pairLastAlertLocked before any alert = ok, want none")
+	}
+	w.mu.Unlock()
+
+	// Side A crashes and alerts.
+	w.evaluate("TA", 0.61, 0.50)
+	w.evaluate("TA", 0.10, 0.20)
+	if notif.count() != 1 {
+		t.Fatalf("alerts = %d, want 1", notif.count())
+	}
+	firedAt := clock.now()
+
+	clock.advance(7 * time.Minute)
+
+	// Side B's view: the pair (A) alerted 7 minutes ago.
+	w.mu.Lock()
+	got, ok := w.pairLastAlertLocked(b.MarketID, "TB")
+	w.mu.Unlock()
+	if !ok || !got.Equal(firedAt) {
+		t.Errorf("pairLastAlertLocked for TB = (%v, %v), want (%v, true)", got, ok, firedAt)
+	}
+
+	// A's own view excludes itself; B never alerted.
+	w.mu.Lock()
+	_, ok = w.pairLastAlertLocked(a.MarketID, "TA")
+	w.mu.Unlock()
+	if ok {
+		t.Error("pairLastAlertLocked must exclude the asking token itself")
+	}
+
+	// Unrelated market sees nothing.
+	w.mu.Lock()
+	_, ok = w.pairLastAlertLocked(other.MarketID, "TC")
+	w.mu.Unlock()
+	if ok {
+		t.Error("pairLastAlertLocked crossed market boundaries")
+	}
+}
+
 // TestSnipeWatcher_ResetRequiresSustainedRecovery covers issue #50: on
 // 2026-08-05 a single transient ask tick above the reset level un-latched an
 // episode while the first alert's auto-buy was still in flight, and the same
