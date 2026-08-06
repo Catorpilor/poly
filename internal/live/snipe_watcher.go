@@ -32,6 +32,14 @@ func snipeResetAsk() float64 {
 	return (SnipeCrashAsk + SnipeCompetitiveBid) / 2
 }
 
+// snipeResetConfirm is how long the ask must HOLD above snipeResetAsk before
+// the episode un-latches. A single tick above the reset level used to clear
+// the latch instantly — in a whipsawing thin book that re-alerted the same
+// crash 2 seconds apart while the first alert's auto-buy was still in flight
+// (issue #50, 2026-08-05 HANJIN BRION). A real recovery holds the level;
+// spread noise doesn't.
+const snipeResetConfirm = 10 * time.Second
+
 // SnipeHeldTTL is how long a held-position registration keeps a token watched
 // without renewal. Long enough to cover any single game; refreshed every time
 // the user fetches positions.
@@ -97,6 +105,13 @@ type snipeTokenState struct {
 	sessionHigh float64
 	alerted     bool
 	bought      bool
+	// resetSince is when the current above-reset recovery streak began; zero
+	// when none is running. The episode un-latches only once the streak spans
+	// snipeResetConfirm (issue #50).
+	resetSince time.Time
+	// dispatching marks an alert delivery (including the v2 auto-buy) in
+	// flight; the episode never un-latches underneath it (issue #50).
+	dispatching bool
 	// Watch sources. A token stays watched while any source is live.
 	events  map[string]bool     // subscribed event slugs
 	armed   bool                // watched because an SL/TP arm exists
@@ -482,8 +497,15 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 	if bid > st.sessionHigh {
 		st.sessionHigh = bid
 	}
-	if st.alerted && ask > snipeResetAsk() {
-		st.alerted = false
+	if st.alerted && !st.dispatching && ask > snipeResetAsk() {
+		if st.resetSince.IsZero() {
+			st.resetSince = now
+		} else if now.Sub(st.resetSince) >= snipeResetConfirm {
+			st.alerted = false
+			st.resetSince = time.Time{}
+		}
+	} else {
+		st.resetSince = time.Time{}
 	}
 
 	fire := !st.alerted && !st.bought &&
@@ -492,6 +514,7 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		w.inPlay(st.market, now)
 	if fire {
 		st.alerted = true
+		st.dispatching = true
 	}
 	market := st.market
 	high := st.sessionHigh
@@ -511,6 +534,11 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		recipients := w.dispatch(market, high, ask, eventSlugs, holders)
 		log.Printf("SnipeWatcher: alert token=%.12s… high=%.3f ask=%.3f recipients=%d",
 			tokenID, high, ask, recipients)
+		w.mu.Lock()
+		if st := w.tokens[tokenID]; st != nil {
+			st.dispatching = false
+		}
+		w.mu.Unlock()
 	}
 }
 

@@ -196,8 +196,8 @@ func snipeAlertText(question, outcome string, sessionHigh, ask float64) string {
 			"*%s*\n"+
 			"*Outcome:* %s\n\n"+
 			"was $%.2f, now $%.2f ask — %.1f× payout if it comes back.\n\n"+
-			"In-play crash on a formerly competitive side. You judge the game "+
-			"state — the bot never buys on its own.",
+			"In-play crash on a formerly competitive side. No auto-buy went "+
+			"through for this alert — judge the game state and tap below.",
 		truncateUTF8(question, 60), outcome, sessionHigh, ask, multiple)
 }
 
@@ -227,6 +227,29 @@ func snipeAutoBoughtText(question, outcome string, sessionHigh, ask, amount floa
 // snipeCapNote is the one-liner appended to the manual alert when the daily
 // auto-snipe cap blocked the buy.
 const snipeCapNote = "\n\n⚠️ Daily auto-snipe cap reached — manual taps only until UTC midnight."
+
+// snipeSkipNote explains why the v2 auto-buy did not run, appended to the
+// manual alert. Issue #50 follow-up: the degraded alert used to carry the v1
+// "bot never buys on its own" copy with no reason — contradictory when a
+// parallel evaluation's auto-buy confirmation landed seconds later.
+func snipeSkipNote(res snipeBuyResult) string {
+	var reason string
+	switch res.outcome {
+	case snipeBuyRepriced:
+		reason = "the ask moved past the snipe guard before the buy"
+	case snipeBuyMarketErr:
+		reason = "market lookup failed"
+	case snipeBuyMismatch:
+		reason = "market data mismatch"
+	case snipeBuyRejected:
+		reason = "the order was rejected"
+	case snipeBuyNoWallet:
+		reason = "no trading wallet on this account"
+	default:
+		reason = "auto-buy unavailable"
+	}
+	return fmt.Sprintf("\n\n⚠️ Auto-buy skipped: %s — tap below if you still want it.", reason)
+}
 
 // snipeAutoBoughtKeyboard builds the auto-sniped message's buttons. The top-up
 // rides the SAME registry entry — the auto-buy never claims it, so the normal
@@ -308,7 +331,7 @@ func (b *Bot) snipeAlertMessage(chatID int64, alertID string, market live.SnipeM
 		return snipeAlertText(market.Question, market.Outcome, sessionHigh, ask) + snipeCapNote,
 			snipeKeyboard(alertID)
 	default:
-		return snipeAlertText(market.Question, market.Outcome, sessionHigh, ask),
+		return snipeAlertText(market.Question, market.Outcome, sessionHigh, ask) + snipeSkipNote(res),
 			snipeKeyboard(alertID)
 	}
 }
@@ -333,7 +356,7 @@ func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResul
 
 	user, err := b.userRepo.GetByTelegramID(ctx, chatID)
 	if err != nil || user == nil {
-		return snipeBuyResult{}, 0, snipeAutoSkipped
+		return snipeBuyResult{outcome: snipeBuyNoWallet}, 0, snipeAutoSkipped
 	}
 	capLeft, ok := b.snipeSpend.reserve(chatID, snipeAutoBuyUSD)
 	if !ok {
@@ -353,7 +376,7 @@ func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResul
 			chatID, market.TokenID, res.outcome, res.err, res.errorMsg)
 		return res, 0, snipeAutoSkipped
 	}
-	log.Printf("Snipe auto-buy: filled chat=%d token=%.12s… $%.0f order=%s cap-left=$%.2f",
+	log.Printf("Snipe auto-buy: accepted chat=%d token=%.12s… $%.0f order=%s cap-left=$%.2f",
 		chatID, market.TokenID, snipeAutoBuyUSD, res.orderID, capLeft)
 	return res, capLeft, snipeAutoBought
 }
@@ -367,6 +390,7 @@ const (
 	snipeBuyMarketErr                 // market fetch failed
 	snipeBuyMismatch                  // alert token not in the market's clobTokenIds
 	snipeBuyRejected                  // executor reported Success=false
+	snipeBuyNoWallet                  // recipient has no trading wallet — buy path never attempted
 )
 
 // snipeBuyResult carries what each caller needs to message the user.

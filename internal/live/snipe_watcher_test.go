@@ -168,11 +168,11 @@ func TestSnipeWatcher_TriggerBoundaries(t *testing.T) {
 			want:  1,
 		},
 		{
-			name: "Kudermetova replay: crash, recover 0.34, re-crash fires twice",
+			name: "instant recover-and-recrash yields one alert — reset needs a sustained hold (#50)",
 			steps: [][2]float64{
 				{0.45, 0.50}, {0.10, 0.17}, {0.12, 0.34}, {0.08, 0.16},
 			},
-			want: 2,
+			want: 1,
 		},
 	}
 	for _, tt := range tests {
@@ -189,6 +189,141 @@ func TestSnipeWatcher_TriggerBoundaries(t *testing.T) {
 				t.Errorf("alerts = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestSnipeWatcher_ResetRequiresSustainedRecovery covers issue #50: on
+// 2026-08-05 a single transient ask tick above the reset level un-latched an
+// episode while the first alert's auto-buy was still in flight, and the same
+// crash double-alerted 2 seconds apart. A recovery now resets the episode
+// only after the ask HOLDS above snipeResetAsk for snipeResetConfirm.
+func TestSnipeWatcher_ResetRequiresSustainedRecovery(t *testing.T) {
+	t.Parallel()
+	type step struct {
+		bid, ask float64
+		advance  time.Duration // clock advance BEFORE this observation
+	}
+	tests := []struct {
+		name  string
+		steps []step
+		want  int
+	}{
+		{
+			name: "HANJIN replay: transient tick above reset does not re-arm",
+			steps: []step{
+				{bid: 0.61, ask: 0.50},
+				{bid: 0.10, ask: 0.20},                           // alert #1
+				{bid: 0.10, ask: 0.31},                           // one tick above reset
+				{bid: 0.10, ask: 0.14, advance: 2 * time.Second}, // re-crash 2s later
+			},
+			want: 1,
+		},
+		{
+			name: "Kudermetova replay: sustained recovery re-arms, re-crash fires twice",
+			steps: []step{
+				{bid: 0.45, ask: 0.50},
+				{bid: 0.10, ask: 0.17}, // alert #1
+				{bid: 0.12, ask: 0.34},
+				{bid: 0.12, ask: 0.34, advance: snipeResetConfirm + time.Second}, // held above reset
+				{bid: 0.08, ask: 0.16},                                           // alert #2
+			},
+			want: 2,
+		},
+		{
+			name: "dip below reset restarts the confirm window",
+			steps: []step{
+				{bid: 0.45, ask: 0.50},
+				{bid: 0.10, ask: 0.17}, // alert #1
+				{bid: 0.12, ask: 0.34},
+				{bid: 0.12, ask: 0.25, advance: 6 * time.Second}, // streak broken
+				{bid: 0.12, ask: 0.34, advance: 6 * time.Second}, // streak restarts here
+				{bid: 0.08, ask: 0.16, advance: 6 * time.Second}, // 6s < confirm: no reset
+			},
+			want: 1,
+		},
+		{
+			name: "missing ask interrupts the confirm window",
+			steps: []step{
+				{bid: 0.45, ask: 0.50},
+				{bid: 0.10, ask: 0.17}, // alert #1
+				{bid: 0.12, ask: 0.34},
+				{bid: 0.12, ask: 0, advance: 6 * time.Second},    // no data: streak broken
+				{bid: 0.12, ask: 0.34, advance: 6 * time.Second}, // restart
+				{bid: 0.08, ask: 0.16, advance: 6 * time.Second}, // 6s < confirm: no reset
+			},
+			want: 1,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			w, _, rec, notif, clock := snipeHarness()
+			rec.eventSubs["evt"] = []int64{101}
+			w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+			for _, s := range tt.steps {
+				clock.advance(s.advance)
+				w.evaluate("T1", s.bid, s.ask)
+			}
+			if got := notif.count(); got != tt.want {
+				t.Errorf("alerts = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// reentrantSnipeNotifier drives more evaluations from inside a delivery,
+// simulating WS/tick evaluations landing while the v2 auto-buy's HTTP
+// round-trip is still in flight.
+type reentrantSnipeNotifier struct {
+	inner  fakeSnipeNotifier
+	during func() // run on the first delivery only
+	ran    bool
+}
+
+func (n *reentrantSnipeNotifier) NotifySnipeAlert(chatID int64, market SnipeMarket, sessionHigh, ask float64) {
+	n.inner.NotifySnipeAlert(chatID, market, sessionHigh, ask)
+	if !n.ran && n.during != nil {
+		n.ran = true
+		n.during()
+	}
+}
+
+// TestSnipeWatcher_NoResetWhileDispatching: even a SUSTAINED above-reset
+// recovery observed while the alert is still being delivered must not
+// un-latch the episode (issue #50 belt-and-braces) — but once delivery
+// completes, the normal sustained-reset path works again.
+func TestSnipeWatcher_NoResetWhileDispatching(t *testing.T) {
+	t.Parallel()
+	feed := newFakeFeed()
+	rec := newFakeSnipeRecipients()
+	clock := newFakeClock()
+	notif := &reentrantSnipeNotifier{}
+	w := NewSnipeWatcher(feed, rec, notif)
+	w.now = clock.now
+	notif.during = func() {
+		w.evaluate("T1", 0.10, 0.31)
+		clock.advance(snipeResetConfirm + time.Second)
+		w.evaluate("T1", 0.10, 0.31) // sustained, but delivery in flight
+		w.evaluate("T1", 0.10, 0.14) // re-crash: must NOT re-alert
+	}
+
+	rec.eventSubs["evt"] = []int64{101}
+	w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+	w.evaluate("T1", 0.61, 0.50)
+	w.evaluate("T1", 0.10, 0.20) // alert #1; re-entrant evals run inside delivery
+
+	if got := notif.inner.count(); got != 1 {
+		t.Fatalf("alerts with delivery in flight = %d, want 1", got)
+	}
+
+	// Delivery done: the same sustained recovery now resets and re-fires.
+	w.evaluate("T1", 0.10, 0.31)
+	clock.advance(snipeResetConfirm + time.Second)
+	w.evaluate("T1", 0.10, 0.31)
+	w.evaluate("T1", 0.10, 0.14)
+	if got := notif.inner.count(); got != 2 {
+		t.Errorf("alerts after delivery completed = %d, want 2 (dispatching flag must clear)", got)
 	}
 }
 
