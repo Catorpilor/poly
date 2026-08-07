@@ -10,6 +10,7 @@ import (
 
 	"github.com/Catorpilor/poly/internal/config"
 	"github.com/Catorpilor/poly/internal/database"
+	"github.com/Catorpilor/poly/internal/database/repositories"
 	"github.com/Catorpilor/poly/internal/live"
 	"github.com/Catorpilor/poly/internal/polymarket"
 	"github.com/Catorpilor/poly/internal/telegram"
@@ -86,6 +87,16 @@ func main() {
 	bot.GetLiveManager().SetSnipeWatcher(snipeWatcher)
 	bot.SetSnipe(snipeWatcher, priceFeed)
 	bot.SeedSnipeArmed()
+
+	// Durable Live Watches (ADR 0008, issue #57 phase 1): wire the Postgres
+	// store, then re-register and re-resolve every stored watch so a restart is
+	// watch-neutral. Must run after the snipe watcher is wired — restore
+	// re-arms each event's snipe watch. A resolve failure keeps the row and is
+	// logged; boot never deletes a watch (expiry is a later phase).
+	bot.GetLiveManager().SetLiveWatchStore(repositories.NewLiveWatchRepository(db))
+	if _, _, err := bot.GetLiveManager().RestoreWatches(context.Background()); err != nil {
+		log.Printf("Warning: Failed to restore live watches: %v", err)
+	}
 
 	// Start live monitoring web server
 	liveWebPort := 8081 // Default port for live monitoring web interface
