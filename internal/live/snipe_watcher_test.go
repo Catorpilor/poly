@@ -16,15 +16,42 @@ type snipeAlertRec struct {
 	ask     float64
 }
 
+type snipeDeepRec struct {
+	chatID     int64
+	tokenID    string
+	ask        float64
+	alertAsk   float64
+	sinceAlert time.Duration
+}
+
 type fakeSnipeNotifier struct {
 	mu     sync.Mutex
 	alerts []snipeAlertRec
+	deeps  []snipeDeepRec
 }
 
 func (n *fakeSnipeNotifier) NotifySnipeAlert(chatID int64, market SnipeMarket, sessionHigh, ask float64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.alerts = append(n.alerts, snipeAlertRec{chatID: chatID, tokenID: market.TokenID, high: sessionHigh, ask: ask})
+}
+
+func (n *fakeSnipeNotifier) NotifySnipeDeepCrash(chatID int64, market SnipeMarket, sessionHigh, ask, alertAsk float64, sinceAlert time.Duration) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.deeps = append(n.deeps, snipeDeepRec{chatID: chatID, tokenID: market.TokenID, ask: ask, alertAsk: alertAsk, sinceAlert: sinceAlert})
+}
+
+func (n *fakeSnipeNotifier) deepCount() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return len(n.deeps)
+}
+
+func (n *fakeSnipeNotifier) deepAt(i int) snipeDeepRec {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.deeps[i]
 }
 
 func (n *fakeSnipeNotifier) count() int {
@@ -344,6 +371,116 @@ func (n *reentrantSnipeNotifier) NotifySnipeAlert(chatID int64, market SnipeMark
 		n.ran = true
 		n.during()
 	}
+}
+
+func (n *reentrantSnipeNotifier) NotifySnipeDeepCrash(chatID int64, market SnipeMarket, sessionHigh, ask, alertAsk float64, sinceAlert time.Duration) {
+	n.inner.NotifySnipeDeepCrash(chatID, market, sessionHigh, ask, alertAsk, sinceAlert)
+}
+
+// TestSnipeWatcher_DeepCrash covers ADR 0007: the sub-corpse-floor tier fires
+// only inside an episode that already produced a genuine in-band alert (the
+// only evidence a cheap token is a live panic and not a corpse), once per
+// episode, past the bought latch, inside [SnipeDeepFloor, SnipeMinAsk).
+func TestSnipeWatcher_DeepCrash(t *testing.T) {
+	t.Parallel()
+
+	t.Run("HANJIN replay: alert, buy, keep collapsing — deep fires once past the bought latch", func(t *testing.T) {
+		t.Parallel()
+		w, _, rec, notif, clock := snipeHarness()
+		rec.eventSubs["evt"] = []int64{101}
+		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+
+		w.evaluate("T1", 0.585, 0.50)
+		w.evaluate("T1", 0.10, 0.09) // in-band alert
+		w.MarkBought("T1")           // the $10 auto-buy landed
+		clock.advance(3 * time.Minute)
+		w.evaluate("T1", 0.02, 0.025) // sub-floor print → deep fires
+		w.evaluate("T1", 0.01, 0.015) // still in zone → already latched
+
+		if notif.count() != 1 || notif.deepCount() != 1 {
+			t.Fatalf("alerts=%d deeps=%d, want 1 and 1", notif.count(), notif.deepCount())
+		}
+		d := notif.deepAt(0)
+		if d.ask != 0.025 || d.alertAsk != 0.09 || d.sinceAlert != 3*time.Minute {
+			t.Errorf("deep record = %+v, want ask 0.025 alertAsk 0.09 sinceAlert 3m", d)
+		}
+	})
+
+	t.Run("MOUZ replay: first sighted already cheap — no prior alert, deep stays silent", func(t *testing.T) {
+		t.Parallel()
+		w, _, rec, notif, _ := snipeHarness()
+		rec.eventSubs["evt"] = []int64{101}
+		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+
+		w.evaluate("T1", 0.625, 0.60)
+		w.evaluate("T1", 0.01, 0.02) // in deep zone, but never alerted in-band
+		w.evaluate("T1", 0.01, 0.008)
+
+		if notif.count() != 0 || notif.deepCount() != 0 {
+			t.Errorf("alerts=%d deeps=%d, want 0 and 0", notif.count(), notif.deepCount())
+		}
+	})
+
+	t.Run("zone bounds: floor is inclusive, corpse dust below it never fires", func(t *testing.T) {
+		t.Parallel()
+		w, _, rec, notif, _ := snipeHarness()
+		rec.eventSubs["evt"] = []int64{101}
+		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+
+		w.evaluate("T1", 0.45, 0.50)
+		w.evaluate("T1", 0.10, 0.17)   // in-band alert
+		w.evaluate("T1", 0.01, 0.004)  // below SnipeDeepFloor: dust, silent
+		if notif.deepCount() != 0 {
+			t.Fatalf("deep fired below the floor")
+		}
+		w.evaluate("T1", 0.01, SnipeDeepFloor) // exactly at the floor: fires
+		if notif.deepCount() != 1 {
+			t.Errorf("deep at exactly SnipeDeepFloor = %d fires, want 1", notif.deepCount())
+		}
+	})
+
+	t.Run("sustained recovery resets both tiers (unbought token re-fires both)", func(t *testing.T) {
+		t.Parallel()
+		w, _, rec, notif, clock := snipeHarness()
+		rec.eventSubs["evt"] = []int64{101}
+		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+
+		w.evaluate("T1", 0.45, 0.50)
+		w.evaluate("T1", 0.10, 0.17) // alert #1 (no buy)
+		w.evaluate("T1", 0.01, 0.02) // deep #1
+		w.evaluate("T1", 0.12, 0.34)
+		clock.advance(snipeResetConfirm + time.Second)
+		w.evaluate("T1", 0.12, 0.34) // sustained recovery: episode resets
+		w.evaluate("T1", 0.08, 0.16) // alert #2
+		w.evaluate("T1", 0.01, 0.01) // deep #2
+		if notif.count() != 2 || notif.deepCount() != 2 {
+			t.Errorf("alerts=%d deeps=%d, want 2 and 2", notif.count(), notif.deepCount())
+		}
+	})
+
+	t.Run("no deep fire while a delivery is in flight", func(t *testing.T) {
+		t.Parallel()
+		feed := newFakeFeed()
+		rec := newFakeSnipeRecipients()
+		clock := newFakeClock()
+		notif := &reentrantSnipeNotifier{}
+		w := NewSnipeWatcher(feed, rec, notif)
+		w.now = clock.now
+		notif.during = func() {
+			w.evaluate("T1", 0.01, 0.02) // deep-zone print mid-delivery: must wait
+		}
+		rec.eventSubs["evt"] = []int64{101}
+		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+		w.evaluate("T1", 0.45, 0.50)
+		w.evaluate("T1", 0.10, 0.17) // in-band alert; re-entrant deep print inside
+		if notif.inner.deepCount() != 0 {
+			t.Fatalf("deep fired during in-band delivery")
+		}
+		w.evaluate("T1", 0.01, 0.02) // delivery done: now it fires
+		if notif.inner.deepCount() != 1 {
+			t.Errorf("deep after delivery = %d, want 1", notif.inner.deepCount())
+		}
+	})
 }
 
 // TestSnipeWatcher_NoResetWhileDispatching: even a SUSTAINED above-reset

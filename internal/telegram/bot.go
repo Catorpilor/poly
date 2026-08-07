@@ -47,7 +47,8 @@ type Bot struct {
 	snipeWatcher snipeWatch
 	snipeFeed    SnipeAskSource
 	snipeAlerts  *snipeAlertRegistry
-	snipeSpend   *snipeSpendLedger
+	snipeSpend     *snipeSpendLedger
+	snipeDeepSpend *snipeSpendLedger
 	// snipeMarkets and snipeBuyExec are test seams for the snipe buy path;
 	// nil selects production (a fresh Gamma client / executeBuyOrderByIndex).
 	snipeMarkets *polymarket.MarketClient
@@ -128,7 +129,8 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 		relayerClient:  relayerClient,
 		liveManager:    liveManager,
 		snipeAlerts:    newSnipeAlertRegistry(),
-		snipeSpend:     newSnipeSpendLedger(),
+		snipeSpend:     newSnipeSpendLedger(snipeAutoBuyDailyCapUSD),
+		snipeDeepSpend: newSnipeSpendLedger(snipeDeepDailyCapUSD),
 	}
 
 	// Set bot as telegram sender for live manager

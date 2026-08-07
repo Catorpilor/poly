@@ -188,10 +188,12 @@ $0.05 per share, spending at most $5 — a cheap bet on a reversal.
 **Comeback Snipe** — An auto-buy-then-top-up on a token that was
 *formerly competitive, now priced as dead*: an in-play market whose
 token's Session High bid reached ≥ 0.40 and whose ask has since fallen
-into the 0.03–0.20 crash band. Below 0.03 the market is declaring death
-or settlement rather than overreacting — no game-end signal exists in
-the metadata, so the floor is what keeps a finished game's loser token
-from alerting. v2 (issue #45): on every genuine alert the bot instantly
+into the 0.03–0.20 crash band. Below 0.03 the market is *presumed* to be
+declaring death or settlement rather than overreacting — no game-end
+signal exists in the metadata, so the floor is what keeps a finished
+game's loser token from alerting. That presumption is rebutted only when
+the token crashed down *through* the band under watch in the current
+episode — see Deep Crash. v2 (issue #45): on every genuine alert the bot instantly
 auto-buys a fixed $10 for the recipient through the guarded buy path
 (fresh-ask repricing guard ≤ 0.30), bounded by a $50-per-user-per-UTC-day
 in-memory cap (a restart resets it — soft rail). The alert then offers a
@@ -204,9 +206,24 @@ are episode-based: after alerting, a token re-alerts only once its ask
 has recovered above the midpoint of the crash threshold and the
 competitiveness bar (0.30 today) and then crashes again — a real
 recovery, not spread noise. Buying via the alert (auto or tap) silences
-that token for the rest of the match. Distinct from a Lottery Ticket
-(which reacts to *our own* ceiling exit on the other side) and from
-pre-game value buys (not in-play, out of scope).
+that token for the rest of the match — except for the Deep Crash tier,
+which deliberately fires past the bought latch. Distinct from a Lottery
+Ticket (which reacts to *our own* ceiling exit on the other side) and
+from pre-game value buys (not in-play, out of scope).
+
+**Deep Crash** — The second, deeper tier of the Comeback Snipe: a token
+whose current episode already produced a genuine in-band alert keeps
+collapsing until its ask prints below the corpse floor (zone 0.005 ≤ ask
+< 0.03). Firing requires that prior alert — the market demonstrably
+traded down through the crash band while watched, which is the only
+evidence that distinguishes a live panic from a corpse first sighted
+cheap. Fires once per episode, past the bought latch (the in-band $10
+usually already bought), notifies with an explicit corpse warning, and
+auto-buys a fixed $5 from a separate, smaller daily pool — executed only
+if a fresh ask is still inside the zone at buy time. Below 0.005 is
+settlement dust and never fires. Named distinctly from Lottery Ticket,
+which it is not: a Deep Crash doubles down on the same side; a Lottery
+Ticket buys the opposite side after our own ceiling exit.
 
 **Session High** — The highest trade-or-bid price the bot knows for a
 token in the current session: seeded at watch-start from the CLOB's
