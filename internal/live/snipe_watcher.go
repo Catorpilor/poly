@@ -32,6 +32,14 @@ func snipeResetAsk() float64 {
 	return (SnipeCrashAsk + SnipeCompetitiveBid) / 2
 }
 
+// SnipeDeepFloor bounds the Deep Crash tier (ADR 0007): inside an episode
+// that already produced a genuine in-band alert, an ask in
+// [SnipeDeepFloor, SnipeMinAsk) fires the deep tier — the prior alert is the
+// evidence that this is a live panic that crashed through the band under
+// watch, not a corpse first sighted cheap. Below this floor is settlement
+// dust and never fires (observed winners bottomed at 0.0065 and 0.015).
+const SnipeDeepFloor = 0.005
+
 // snipeResetConfirm is how long the ask must HOLD above snipeResetAsk before
 // the episode un-latches. A single tick above the reset level used to clear
 // the latch instantly — in a whipsawing thin book that re-alerted the same
@@ -69,9 +77,12 @@ type SnipeMarket struct {
 	GameStart time.Time
 }
 
-// SnipeNotifier delivers a snipe alert to one recipient.
+// SnipeNotifier delivers snipe alerts to one recipient. NotifySnipeDeepCrash
+// is the Deep Crash tier (ADR 0007): alertAsk and sinceAlert describe the
+// episode's earlier in-band alert.
 type SnipeNotifier interface {
 	NotifySnipeAlert(chatID int64, market SnipeMarket, sessionHigh, ask float64)
+	NotifySnipeDeepCrash(chatID int64, market SnipeMarket, sessionHigh, ask, alertAsk float64, sinceAlert time.Duration)
 }
 
 // SnipeHistorySeeder supplies a token's recent trade high so a Session High
@@ -116,6 +127,13 @@ type snipeTokenState struct {
 	// for the corpse-filter review: a crash whose same-market complement also
 	// alerted recently is a see-saw game, not a decided one.
 	lastAlertAt time.Time
+	// alertAsk is the ask at this episode's in-band alert — carried into the
+	// Deep Crash notification so the message can say "alerted at $X earlier".
+	alertAsk float64
+	// deepAlerted latches the Deep Crash tier: once per episode, cleared by
+	// the same sustained recovery that clears alerted (ADR 0007). Deliberately
+	// NOT gated on bought — the in-band auto-buy usually already fired.
+	deepAlerted bool
 	// Watch sources. A token stays watched while any source is live.
 	events  map[string]bool     // subscribed event slugs
 	armed   bool                // watched because an SL/TP arm exists
@@ -506,6 +524,7 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 			st.resetSince = now
 		} else if now.Sub(st.resetSince) >= snipeResetConfirm {
 			st.alerted = false
+			st.deepAlerted = false
 			st.resetSince = time.Time{}
 		}
 	} else {
@@ -521,16 +540,35 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		st.alerted = true
 		st.dispatching = true
 		st.lastAlertAt = now
+		st.alertAsk = ask
+		st.deepAlerted = false
 		pairAgo = "never"
 		if at, ok := w.pairLastAlertLocked(st.market.MarketID, tokenID); ok {
 			pairAgo = now.Sub(at).Round(time.Second).String()
 		}
 	}
+
+	// Deep Crash tier (ADR 0007): requires this episode's in-band alert (the
+	// live-panic evidence), fires once, ignores bought — the $10 usually
+	// already bought and the dip is the top-up moment. Zones are disjoint, so
+	// fire and deepFire are mutually exclusive.
+	deepFire := st.alerted && !st.deepAlerted && !st.dispatching && !fire &&
+		ask >= SnipeDeepFloor && ask < SnipeMinAsk &&
+		w.inPlay(st.market, now)
+	var sinceAlert time.Duration
+	var alertAsk float64
+	if deepFire {
+		st.deepAlerted = true
+		st.dispatching = true
+		sinceAlert = now.Sub(st.lastAlertAt)
+		alertAsk = st.alertAsk
+	}
+
 	market := st.market
 	high := st.sessionHigh
 	var eventSlugs []string
 	var holders []int64
-	if fire {
+	if fire || deepFire {
 		for slug := range st.events {
 			eventSlugs = append(eventSlugs, slug)
 		}
@@ -549,6 +587,17 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		// pair is the see-saw signature.
 		log.Printf("SnipeWatcher: alert token=%.12s… high=%.3f ask=%.3f bid=%.3f impliedComplement=%.3f pairAlerted=%s recipients=%d",
 			tokenID, high, ask, bid, 1-ask, pairAgo, recipients)
+	}
+	if deepFire {
+		recipients := 0
+		for _, chatID := range w.recipientOrder(market, eventSlugs, holders) {
+			w.notifier.NotifySnipeDeepCrash(chatID, market, high, ask, alertAsk, sinceAlert)
+			recipients++
+		}
+		log.Printf("SnipeWatcher: deep-crash token=%.12s… high=%.3f ask=%.3f bid=%.3f sinceAlert=%s alertAsk=%.3f recipients=%d",
+			tokenID, high, ask, bid, sinceAlert.Round(time.Second), alertAsk, recipients)
+	}
+	if fire || deepFire {
 		w.mu.Lock()
 		if st := w.tokens[tokenID]; st != nil {
 			st.dispatching = false
@@ -586,6 +635,17 @@ func (w *SnipeWatcher) inPlay(m SnipeMarket, now time.Time) bool {
 // dispatch notifies the union of event subscribers, arm owners, and holders —
 // each recipient exactly once. Returns the number of recipients notified.
 func (w *SnipeWatcher) dispatch(market SnipeMarket, high, ask float64, eventSlugs []string, holders []int64) int {
+	order := w.recipientOrder(market, eventSlugs, holders)
+	for _, chatID := range order {
+		w.notifier.NotifySnipeAlert(chatID, market, high, ask)
+	}
+	return len(order)
+}
+
+// recipientOrder resolves the alert audience — the union of event
+// subscribers, arm owners, and holders, each exactly once — shared by the
+// in-band and Deep Crash tiers.
+func (w *SnipeWatcher) recipientOrder(market SnipeMarket, eventSlugs []string, holders []int64) []int64 {
 	seen := make(map[int64]bool)
 	var order []int64
 	add := func(ids []int64) {
@@ -601,11 +661,7 @@ func (w *SnipeWatcher) dispatch(market SnipeMarket, high, ask float64, eventSlug
 	}
 	add(w.recipients.ArmOwners(market.TokenID))
 	add(holders)
-
-	for _, chatID := range order {
-		w.notifier.NotifySnipeAlert(chatID, market, high, ask)
-	}
-	return len(order)
+	return order
 }
 
 // tickLoop runs the periodic re-evaluation. The WS OnUpdate callback is the

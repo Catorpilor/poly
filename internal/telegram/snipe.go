@@ -42,6 +42,13 @@ const (
 	// snipeAutoBuyDailyCapUSD bounds one recipient's auto-snipe spend per UTC
 	// day.
 	snipeAutoBuyDailyCapUSD = 50.0
+	// snipeDeepBuyUSD is the fixed stake auto-bought on a Deep Crash fire
+	// (ADR 0007) — deliberately half the in-band stake: the base rate below
+	// the corpse floor is worse and the payoff floor is 33×.
+	snipeDeepBuyUSD = 5.0
+	// snipeDeepDailyCapUSD bounds Deep Crash spend in its own pool, isolating
+	// corpse false-positives from the main band's budget.
+	snipeDeepDailyCapUSD = 20.0
 )
 
 // The bot is the snipe watcher's notifier (wired in cmd/bot/main.go).
@@ -141,13 +148,14 @@ func (r *snipeAlertRegistry) claim(id string) (snipeAlertEntry, snipeAlertStatus
 // failure so only successful buys consume it.
 type snipeSpendLedger struct {
 	mu    sync.Mutex
-	day   string // UTC date of the amounts in spent; rollover clears them
+	cap   float64 // per-chat daily budget this ledger enforces
+	day   string  // UTC date of the amounts in spent; rollover clears them
 	spent map[int64]float64
 	now   func() time.Time
 }
 
-func newSnipeSpendLedger() *snipeSpendLedger {
-	return &snipeSpendLedger{spent: make(map[int64]float64), now: time.Now}
+func newSnipeSpendLedger(capUSD float64) *snipeSpendLedger {
+	return &snipeSpendLedger{cap: capUSD, spent: make(map[int64]float64), now: time.Now}
 }
 
 // rollLocked clears the accumulator on UTC-day change. Callers hold mu.
@@ -166,11 +174,11 @@ func (l *snipeSpendLedger) reserve(chatID int64, amount float64) (left float64, 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.rollLocked()
-	if l.spent[chatID]+amount > snipeAutoBuyDailyCapUSD {
-		return snipeAutoBuyDailyCapUSD - l.spent[chatID], false
+	if l.spent[chatID]+amount > l.cap {
+		return l.cap - l.spent[chatID], false
 	}
 	l.spent[chatID] += amount
-	return snipeAutoBuyDailyCapUSD - l.spent[chatID], true
+	return l.cap - l.spent[chatID], true
 }
 
 // release refunds a reservation whose buy failed. A release landing after a
@@ -336,6 +344,97 @@ func (b *Bot) snipeAlertMessage(chatID int64, alertID string, market live.SnipeM
 	}
 }
 
+// snipeDeepText builds the Deep Crash body — blunt about the base rate: this
+// zone is usually corpses; the prior in-band alert is the only reason we're
+// here at all. Pure — table-tested.
+func snipeDeepText(question, outcome string, alertAsk, ask float64) string {
+	multiple := 0.0
+	if ask > 0 {
+		multiple = 1 / ask
+	}
+	return fmt.Sprintf(
+		"💎 *Deep Crash*\n\n"+
+			"*%s*\n"+
+			"*Outcome:* %s\n\n"+
+			"Alerted at $%.2f earlier — now $%.3f ask. %.0f× if it turns.\n\n"+
+			"⚠️ Corpse territory: games this cheap are usually over. Anything "+
+			"beyond the system's stake is your read of the game state.",
+		truncateUTF8(question, 60), outcome, alertAsk, ask, multiple)
+}
+
+// snipeDeepBoughtText builds the Deep Crash auto-buy confirmation. Pure —
+// table-tested.
+func snipeDeepBoughtText(question, outcome string, alertAsk, ask, amount float64, orderID string, poolLeft float64) string {
+	return snipeDeepText(question, outcome, alertAsk, ask) + fmt.Sprintf(
+		"\n\n⚡ *$%.0f auto-bought* (deep pool)\n"+
+			"*Order ID:* %s\n"+
+			"Deep pool left today: $%.0f",
+		amount, orderID, poolLeft)
+}
+
+// snipeDeepCapNote is appended to the Deep Crash alert when the deep pool
+// blocked the buy.
+const snipeDeepCapNote = "\n\n⚠️ Deep pool exhausted — manual taps only until UTC midnight."
+
+// NotifySnipeDeepCrash implements the Deep Crash tier of live.SnipeNotifier
+// (ADR 0007): registers the alert for one-tap buying, attempts the $5
+// auto-buy from the deep pool behind the strict zone guard, and DMs the
+// recipient. Delivery is unconditional, exactly like the in-band tier.
+func (b *Bot) NotifySnipeDeepCrash(chatID int64, market live.SnipeMarket, sessionHigh, ask, alertAsk float64, sinceAlert time.Duration) {
+	alertID := b.snipeAlerts.add(market)
+	text, keyboard := b.snipeDeepMessage(chatID, alertID, market, ask, alertAsk)
+	b.sendMessageWithKeyboard(chatID, text, keyboard)
+}
+
+// snipeDeepMessage picks the Deep Crash body and buttons from the auto-buy's
+// status, mirroring snipeAlertMessage.
+func (b *Bot) snipeDeepMessage(chatID int64, alertID string, market live.SnipeMarket, ask, alertAsk float64) (string, tgbotapi.InlineKeyboardMarkup) {
+	res, poolLeft, status := b.snipeDeepAutoBuy(chatID, market)
+	base := snipeDeepText(market.Question, market.Outcome, alertAsk, ask)
+	switch status {
+	case snipeAutoBought:
+		return snipeDeepBoughtText(market.Question, market.Outcome, alertAsk, ask, snipeDeepBuyUSD, res.orderID, poolLeft),
+			snipeAutoBoughtKeyboard(alertID)
+	case snipeAutoCapReached:
+		return base + snipeDeepCapNote, snipeKeyboard(alertID)
+	default:
+		return base + snipeSkipNote(res), snipeKeyboard(alertID)
+	}
+}
+
+// snipeDeepAutoBuy attempts the fixed $5 Deep Crash buy from the deep pool,
+// mirroring snipeAutoBuy's reserve-then-refund but with the strict zone guard.
+func (b *Bot) snipeDeepAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResult, float64, snipeAutoStatus) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	user, err := b.userRepo.GetByTelegramID(ctx, chatID)
+	if err != nil || user == nil {
+		return snipeBuyResult{outcome: snipeBuyNoWallet}, 0, snipeAutoSkipped
+	}
+	poolLeft, ok := b.snipeDeepSpend.reserve(chatID, snipeDeepBuyUSD)
+	if !ok {
+		log.Printf("Snipe deep-buy: pool reached chat=%d", chatID)
+		return snipeBuyResult{}, poolLeft, snipeAutoCapReached
+	}
+	entry := snipeAlertEntry{
+		tokenID:  market.TokenID,
+		marketID: market.MarketID,
+		question: market.Question,
+		outcome:  market.Outcome,
+	}
+	res := b.snipeGuardedBuyRefuse(ctx, user, entry, snipeDeepBuyUSD, snipeRefuseDeepBuy)
+	if res.outcome != snipeBuyFilled {
+		b.snipeDeepSpend.release(chatID, snipeDeepBuyUSD)
+		log.Printf("Snipe deep-buy: skipped chat=%d token=%.12s… reason=%d err=%v msg=%s",
+			chatID, market.TokenID, res.outcome, res.err, res.errorMsg)
+		return res, 0, snipeAutoSkipped
+	}
+	log.Printf("Snipe deep-buy: accepted chat=%d token=%.12s… $%.0f order=%s pool-left=$%.2f",
+		chatID, market.TokenID, snipeDeepBuyUSD, res.orderID, poolLeft)
+	return res, poolLeft, snipeAutoBought
+}
+
 // snipeAutoStatus classifies a snipeAutoBuy attempt for messaging.
 type snipeAutoStatus int
 
@@ -403,17 +502,32 @@ type snipeBuyResult struct {
 	errorMsg string // snipeBuyRejected
 }
 
+// snipeRefuseDeepBuy is the Deep Crash buy guard (ADR 0007): strict zone
+// check — the $5 executes only while the fresh ask is still inside
+// [SnipeDeepFloor, SnipeMinAsk). A bounce out of the zone means the dip is
+// gone (the in-band tranche is already riding it); below the floor is dust.
+// Pure — table-tested.
+func snipeRefuseDeepBuy(ask float64, ok bool) bool {
+	return !ok || ask < live.SnipeDeepFloor || ask >= live.SnipeMinAsk
+}
+
 // snipeGuardedBuy is the shared guarded snipe buy behind both the one-tap
 // callback and the v2 auto-buy: repricing guard on a fresh ask, market fetch,
 // token-index verify, buy, MarkBought on success. Claiming the registry entry
 // and cap accounting stay with the callers.
 func (b *Bot) snipeGuardedBuy(ctx context.Context, user *database.User, entry snipeAlertEntry, amount float64) snipeBuyResult {
+	return b.snipeGuardedBuyRefuse(ctx, user, entry, amount, snipeRefuseBuy)
+}
+
+// snipeGuardedBuyRefuse is snipeGuardedBuy with a caller-chosen repricing
+// guard — the Deep Crash tier substitutes its strict zone check.
+func (b *Bot) snipeGuardedBuyRefuse(ctx context.Context, user *database.User, entry snipeAlertEntry, amount float64, refuse func(ask float64, ok bool) bool) snipeBuyResult {
 	var ask float64
 	var ok bool
 	if b.snipeFeed != nil {
 		ask, ok = b.snipeFeed.BestAsk(entry.tokenID)
 	}
-	if snipeRefuseBuy(ask, ok) {
+	if refuse(ask, ok) {
 		return snipeBuyResult{outcome: snipeBuyRepriced, ask: ask, askOK: ok}
 	}
 
