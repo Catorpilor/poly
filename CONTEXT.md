@@ -225,6 +225,24 @@ settlement dust and never fires. Named distinctly from Lottery Ticket,
 which it is not: a Deep Crash doubles down on the same side; a Lottery
 Ticket buys the opposite side after our own ceiling exit.
 
+**Live Watch** — A durable, per-user subscription to an event: it drives
+snipe watching, alerts, and (when its tape flag is set) the batched
+Telegram trade feed. v2: created from Telegram (`/live <slug>`) or the
+authenticated web page, owned by the session's Telegram identity either
+way, persisted in Postgres (a restart re-registers and re-resolves every
+watch — user intent is not a soft rail), refreshed by the Event Refresh
+loop, and expired only on positive market-closed evidence. Distinct from
+web *viewing* (a per-connection WebSocket spectator subscription that
+creates nothing durable).
+
+**Event Refresh** — The periodic re-resolution (every ~2 minutes) of each
+Live Watch's event against Gamma, idempotently registering markets that
+were created or activated after subscribe time — series games appear
+mid-series, and an unrefreshed watch misses their crashes entirely (the
+Team WE Game-2 miss: the market's whole collapse predated registration).
+Scoped to subscribed events only; lookup responses are identity-validated;
+errors log and skip — a transient API failure never drops a watch.
+
 **Session High** — The highest trade-or-bid price the bot knows for a
 token in the current session: seeded at watch-start from the CLOB's
 recent trade history (since ~game start), then ratcheted live by
