@@ -392,6 +392,21 @@ func (r *SubscriptionRegistry) WriteConn(conn *websocket.Conn, data []byte) erro
 	return conn.WriteMessage(websocket.TextMessage, data)
 }
 
+// TelegramSubscribedEvents returns the distinct event slugs with at least one
+// telegram subscriber — the durable Live Watches, which the Event Refresh loop
+// re-resolves (ADR 0008). Web viewing subscriptions are ephemeral per-connection
+// spectators and are deliberately excluded.
+func (r *SubscriptionRegistry) TelegramSubscribedEvents() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	result := make([]string, 0, len(r.telegramSubs))
+	for eventSlug := range r.telegramSubs {
+		result = append(result, eventSlug)
+	}
+	return result
+}
+
 func (r *SubscriptionRegistry) GetAllSubscribedEvents() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -452,6 +467,16 @@ type LiveTradeManager struct {
 	// so a boot with many watches stays gentle on Gamma. Zero disables the
 	// pause (the struct-literal test harness relies on this).
 	restorePause time.Duration
+
+	// refreshInterval is the Event Refresh cadence (ADR 0008 phase 2): how often
+	// the loop re-resolves every subscribed event to pick up markets created
+	// after subscribe time. Overridable for tests (mirrors the snipe watcher's
+	// tickInterval); zero is invalid for the ticker, so only StartEventRefresh
+	// and callers that drive runEventRefresh must set it.
+	refreshInterval time.Duration
+	// refreshPause spaces the sequential per-event resolves within one refresh
+	// cycle, gentle on Gamma. Zero disables the pause (tests rely on this).
+	refreshPause time.Duration
 }
 
 // SetSnipeWatcher wires the comeback-snipe watcher into the subscription
@@ -483,6 +508,17 @@ func snipeMarketsFor(markets []*MarketInfo) []SnipeMarket {
 	return out
 }
 
+// eventSnipeMarkets resolves the markets the snipe watcher should watch for a
+// subscription: the pinned market when the slug names a tradeable sub-market,
+// the Moneyline markets otherwise. Shared by the subscribe path and the Event
+// Refresh loop so both register the identical set.
+func (m *LiveTradeManager) eventSnipeMarkets(eventSlug string, eventInfo *EventInfo) []*MarketInfo {
+	if pinned := pinnedMarket(m.resolver, eventInfo, eventSlug); pinned != nil {
+		return []*MarketInfo{pinned}
+	}
+	return m.resolver.GetAllMLMarkets(eventInfo)
+}
+
 // snipeWatchEvent registers the subscription's tokens with the snipe watcher,
 // mirroring the trade feed's market resolution: the pinned market for pinned
 // subscriptions, the Moneyline markets otherwise.
@@ -490,13 +526,7 @@ func (m *LiveTradeManager) snipeWatchEvent(eventSlug string, eventInfo *EventInf
 	if m.snipeWatcher == nil {
 		return
 	}
-	var markets []*MarketInfo
-	if pinned := pinnedMarket(m.resolver, eventInfo, eventSlug); pinned != nil {
-		markets = []*MarketInfo{pinned}
-	} else {
-		markets = m.resolver.GetAllMLMarkets(eventInfo)
-	}
-	m.snipeWatcher.WatchEventMarkets(eventSlug, snipeMarketsFor(markets))
+	m.snipeWatcher.WatchEventMarkets(eventSlug, snipeMarketsFor(m.eventSnipeMarkets(eventSlug, eventInfo)))
 }
 
 // snipeUnwatchIfUnsubscribed releases an event's snipe watch when its last
@@ -524,6 +554,8 @@ func NewLiveTradeManager() *LiveTradeManager {
 		assetToEvent:      make(map[string]string),
 		assetToMarketName: make(map[string]string),
 		restorePause:      watchRestoreDefaultPause,
+		refreshInterval:   eventRefreshInterval,
+		refreshPause:      eventRefreshDefaultPause,
 	}
 }
 
