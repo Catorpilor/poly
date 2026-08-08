@@ -1776,9 +1776,17 @@
             }
         }
 
-        // Drop a Live Watch via DELETE (no confirm dialog — that is phase 4).
+        // Drop a Live Watch via DELETE. In-play unsubscribe guard (ADR 0008
+        // decision 4, phase 4): quiet watches cost nothing to keep, and a
+        // mid-game unsubscribe has burned us before (the BLG–TES drop preceded
+        // the biggest favorite collapse in the ledger). Both entry points — the
+        // event-panel toggle and the My Watches row button — route through here,
+        // so this single confirm covers both.
         async function unwatchEvent(slug) {
             if (!getSession()?.telegramId) { alert('Please login first'); return; }
+            if (!confirm('This event may still be live. Quiet watches cost nothing to keep, and unsubscribing mid-game has burned us before. Unwatch anyway?')) {
+                return;
+            }
             try {
                 const resp = await fetch(`/api/events/${encodeURIComponent(slug)}/subscription`, {
                     method: 'DELETE',

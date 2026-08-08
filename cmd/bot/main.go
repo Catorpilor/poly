@@ -105,6 +105,16 @@ func main() {
 	// manager lifecycle (stops when the manager stops).
 	bot.GetLiveManager().StartEventRefresh()
 
+	// Watch expiry sweep (ADR 0008 phase 4, issue #57): a couple minutes after
+	// boot and hourly thereafter, remove a Live Watch only on positive evidence
+	// that its event finished — every market closed=true under Gamma's
+	// identity-validated closed filter (the #40 sweeper doctrine, #33 trap). A
+	// resolve failure is never closed-evidence, so errors keep the watch and
+	// only silence when the event truly ends. The resolver is the closed-event
+	// checker; bound to the manager lifecycle (stops when the manager stops).
+	bot.GetLiveManager().SetClosedEventChecker(bot.GetLiveManager().GetResolver())
+	bot.GetLiveManager().StartWatchExpirySweep()
+
 	// Start live monitoring web server
 	liveWebPort := 8081 // Default port for live monitoring web interface
 	if cfg.App.Port > 0 {
