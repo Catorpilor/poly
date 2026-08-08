@@ -55,6 +55,21 @@ type User struct {
 	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
 }
 
+// LiveSubscription is the durable record of one Live Watch (ADR 0008): a
+// per-user subscription to an event, owned by the session's Telegram identity.
+// One row per (ChatID, EventSlug). A Live Watch is user intent, not a soft
+// rail — it is persisted so a restart re-registers and re-resolves it, whereas
+// snipe caps and episode latches stay in-memory (bounds on harm, self-healing).
+// The registry in internal/live is the runtime view; this is the record.
+type LiveSubscription struct {
+	ChatID    int64  `json:"chat_id" db:"chat_id"`
+	EventSlug string `json:"event_slug" db:"event_slug"`
+	// Tape opts the watch into the batched Telegram trade feed. A quiet watch
+	// (false, the default) still arms the snipe watch and the web tape.
+	Tape      bool      `json:"tape" db:"tape"`
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+}
+
 // SLTPArm represents an armed take-profit / stop-loss for a user's position on a token.
 // v1 uses fixed presets: TP fires at avg_price*2.0 selling 50% of remaining;
 // SL fires at avg_price*0.70 selling 100% of remaining.

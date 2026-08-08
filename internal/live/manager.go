@@ -442,6 +442,16 @@ type LiveTradeManager struct {
 	// snipeWatcher, when set, watches subscribed events' tokens for the
 	// comeback-snipe pattern. Nil-safe: every hook checks before calling.
 	snipeWatcher *SnipeWatcher
+
+	// watchStore is the durable record of Live Watches (ADR 0008). Optional:
+	// nil keeps the pre-0008 in-memory-only behavior, so tests and any
+	// store-less wiring work unchanged. Every subscribe/unsubscribe path
+	// checks before calling.
+	watchStore LiveWatchStore
+	// restorePause spaces sequential Gamma re-resolves during RestoreWatches
+	// so a boot with many watches stays gentle on Gamma. Zero disables the
+	// pause (the struct-literal test harness relies on this).
+	restorePause time.Duration
 }
 
 // SetSnipeWatcher wires the comeback-snipe watcher into the subscription
@@ -513,6 +523,7 @@ func NewLiveTradeManager() *LiveTradeManager {
 		cancel:            cancel,
 		assetToEvent:      make(map[string]string),
 		assetToMarketName: make(map[string]string),
+		restorePause:      watchRestoreDefaultPause,
 	}
 }
 
@@ -967,6 +978,17 @@ func (m *LiveTradeManager) SubscribeTelegram(ctx context.Context, chatID int64, 
 		m.snipeWatchEvent(eventSlug, eventInfo)
 	}
 
+	// Persist after a successful resolve+register: a Live Watch is user intent
+	// and must survive a restart (ADR 0008). Upsert on every subscribe — a
+	// re-subscribe may flip the tape flag on an existing row. Best-effort: a
+	// store error leaves the in-memory watch live and only costs durability
+	// for this row, so it must never fail the user's subscribe.
+	if m.watchStore != nil {
+		if err := m.watchStore.Save(ctx, chatID, eventSlug, tape); err != nil {
+			log.Printf("LiveTradeManager: persist watch (chat=%d slug=%s): %v", chatID, eventSlug, err)
+		}
+	}
+
 	return eventInfo, nil
 }
 
@@ -983,6 +1005,15 @@ func (m *LiveTradeManager) UnsubscribeTelegram(chatID int64, eventSlug string) b
 			m.feedBatcher.Flush(chatID, eventSlug)
 		}
 		m.snipeUnwatchIfUnsubscribed(eventSlug)
+		// An explicit unsubscribe is user intent to drop the watch — remove the
+		// durable row too. Best-effort: the in-memory unsubscribe already
+		// succeeded, so a store error only leaves a stale row for the next boot
+		// to re-resolve.
+		if m.watchStore != nil {
+			if err := m.watchStore.Delete(context.Background(), chatID, eventSlug); err != nil {
+				log.Printf("LiveTradeManager: delete watch (chat=%d slug=%s): %v", chatID, eventSlug, err)
+			}
+		}
 	}
 	return ok
 }
@@ -995,6 +1026,13 @@ func (m *LiveTradeManager) UnsubscribeAllTelegram(chatID int64) []string {
 		}
 	}
 	m.snipeUnwatchIfUnsubscribed(unsubscribed...)
+	// Drop every durable row for the user in one statement. Best-effort, same
+	// rationale as UnsubscribeTelegram.
+	if m.watchStore != nil && len(unsubscribed) > 0 {
+		if _, err := m.watchStore.DeleteAll(context.Background(), chatID); err != nil {
+			log.Printf("LiveTradeManager: delete all watches (chat=%d): %v", chatID, err)
+		}
+	}
 	return unsubscribed
 }
 
