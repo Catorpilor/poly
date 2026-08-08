@@ -11,16 +11,17 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/gorilla/websocket"
 	"github.com/Catorpilor/poly/internal/config"
 	"github.com/Catorpilor/poly/internal/database"
 	"github.com/Catorpilor/poly/internal/database/repositories"
 	"github.com/Catorpilor/poly/internal/polymarket"
 	"github.com/Catorpilor/poly/internal/wallet"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/gorilla/websocket"
 )
 
 // WebSocket message types
@@ -31,12 +32,12 @@ type wsMessage struct {
 }
 
 type wsResponse struct {
-	Type     string   `json:"type"`              // subscribed, unsubscribed, subscriptions, error
-	Event    string   `json:"event,omitempty"`   // event slug
-	Title    string   `json:"title,omitempty"`   // event title (for subscribe response)
+	Type     string   `json:"type"`               // subscribed, unsubscribed, subscriptions, error
+	Event    string   `json:"event,omitempty"`    // event slug
+	Title    string   `json:"title,omitempty"`    // event title (for subscribe response)
 	Outcomes []string `json:"outcomes,omitempty"` // outcome names for the main market (for subscribe response)
-	Events   []string `json:"events,omitempty"`  // list of subscribed events
-	Message  string   `json:"message,omitempty"` // error message
+	Events   []string `json:"events,omitempty"`   // list of subscribed events
+	Message  string   `json:"message,omitempty"`  // error message
 	// Set when the subscribe slug named a specific sub-market: the panel's
 	// primary buy buttons target this market instead of the Moneyline.
 	Market         string `json:"market,omitempty"`
@@ -45,6 +46,26 @@ type wsResponse struct {
 
 //go:embed static/*
 var staticFiles embed.FS
+
+// liveWatchManager is the subset of *LiveTradeManager the Live Watch web
+// endpoints depend on (ADR 0008 phase 3). Extracted as a seam so handler
+// tests can inject a fake: SubscribeTelegram otherwise resolves against Gamma
+// and tracks RTDS assets. Web-managed watches funnel through these same
+// methods as /live, so a web-created watch and a Telegram-created one are one
+// durable object (the DB PK dedupes, Event Refresh covers both).
+// *LiveTradeManager satisfies this in production.
+type liveWatchManager interface {
+	SubscribeTelegram(ctx context.Context, chatID int64, eventSlug string, tape bool) (*EventInfo, error)
+	UnsubscribeTelegram(chatID int64, eventSlug string) bool
+	GetUserSubscriptions(chatID int64) []string
+	IsTapeSubscription(chatID int64, eventSlug string) bool
+}
+
+// maxLiveWatchesPerUser caps active web-created Live Watches per user (ADR
+// 0008 guardrail). The 31st DISTINCT event is refused; a re-subscribe to an
+// existing watch (e.g. a tape flip) is never capped. Telegram /live is
+// deliberately uncapped.
+const maxLiveWatchesPerUser = 30
 
 // WebServer serves the live monitoring web interface
 type WebServer struct {
@@ -60,6 +81,10 @@ type WebServer struct {
 	tradingClient  *polymarket.TradingClient
 	tradeExecutor  *polymarket.TradeExecutor
 	allowedHost    string // hostname from LIVE_WEB_URL, allowed alongside localhost/IP literals
+	// watches is the Live Watch surface of liveManager, held behind an
+	// interface so handler tests can inject a fake. In production it is the
+	// same *LiveTradeManager as liveManager.
+	watches liveWatchManager
 }
 
 // NewWebServer creates a new web server for live monitoring
@@ -80,6 +105,12 @@ func NewWebServer(
 		tradingClient: tradingClient,
 	}
 	ws.upgrader = websocket.Upgrader{CheckOrigin: ws.requestAllowed}
+
+	// Hold the Live Watch surface behind the interface seam. Guarded so a
+	// typed-nil *LiveTradeManager never becomes a non-nil interface value.
+	if liveManager != nil {
+		ws.watches = liveManager
+	}
 
 	if tradingClient != nil {
 		ws.tradeExecutor = polymarket.NewTradeExecutor(tradingClient, polymarket.NewMarketClient())
@@ -123,6 +154,15 @@ func NewWebServer(
 
 	// Trade endpoint
 	mux.HandleFunc("POST /api/trade", ws.guardAPI(ws.handleTrade))
+
+	// Live Watch management (ADR 0008 phase 3). Session-validated exactly
+	// like /api/trade. PUT/DELETE are non-simple methods (always preflighted
+	// cross-origin) and, with the Host/Origin guard, need no extra CSRF
+	// handling beyond guardAPI. The list endpoint is POST-with-body for
+	// consistency with how the page already sends its authenticated session.
+	mux.HandleFunc("PUT /api/events/{slug}/subscription", ws.guardAPI(ws.handlePutSubscription))
+	mux.HandleFunc("DELETE /api/events/{slug}/subscription", ws.guardAPI(ws.handleDeleteSubscription))
+	mux.HandleFunc("POST /api/subscriptions/list", ws.guardAPI(ws.handleListSubscriptions))
 
 	// API namespace fallback. Without this, a wrong-method or unknown
 	// /api/ request falls through to the "/" file server and gets an HTML
@@ -202,10 +242,11 @@ func (ws *WebServer) hostAllowed(hostport string) bool {
 // apiEndpoints are the registered API paths, used by the fallback to tell
 // a wrong method (405) from an unknown path (404).
 var apiEndpoints = map[string]bool{
-	"/api/auth/init":     true,
-	"/api/auth/status":   true,
-	"/api/auth/complete": true,
-	"/api/trade":         true,
+	"/api/auth/init":          true,
+	"/api/auth/status":        true,
+	"/api/auth/complete":      true,
+	"/api/trade":              true,
+	"/api/subscriptions/list": true,
 }
 
 func handleAPIFallback(w http.ResponseWriter, r *http.Request) {
@@ -795,6 +836,47 @@ func resolveWebTrade(mlMarkets []*MarketInfo, marketIndex, outcomeIndex int) (ma
 	return market.ID, tokenIDs[outcomeIndex], outcome, nil
 }
 
+// writeJSONError writes a {"error": msg} body with the given status.
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// authWebSession validates a web request's session against the stored user
+// record — the single source of truth for "is this session allowed to act as
+// this user", shared by /api/trade and the Live Watch endpoints so none is
+// weaker than another. It requires a present TelegramID, an existing user, and
+// a session ProxyAddress that matches the user's Trading Wallet. On failure it
+// writes the JSON error + status and returns (nil, false); on success it
+// returns the user. The nil-user check matters: GetByTelegramID returns
+// (nil, nil) for a missing row, which would otherwise nil-panic downstream.
+func (ws *WebServer) authWebSession(w http.ResponseWriter, r *http.Request, session webTradeSession) (*database.User, bool) {
+	if ws.userRepo == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "User authentication not configured")
+		return nil, false
+	}
+	if session.TelegramID == 0 {
+		writeJSONError(w, http.StatusUnauthorized, "Not authenticated")
+		return nil, false
+	}
+	user, err := ws.userRepo.GetByTelegramID(r.Context(), session.TelegramID)
+	if err != nil {
+		log.Printf("WebServer: Failed to get user: %v", err)
+		writeJSONError(w, http.StatusUnauthorized, "User not found")
+		return nil, false
+	}
+	if user == nil {
+		writeJSONError(w, http.StatusUnauthorized, "User not found")
+		return nil, false
+	}
+	if user.ProxyAddress == "" || user.ProxyAddress != session.ProxyAddress {
+		writeJSONError(w, http.StatusUnauthorized, "Wallet address mismatch")
+		return nil, false
+	}
+	return user, true
+}
+
 // handleTrade handles trade execution from the web interface
 func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -822,33 +904,11 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if user repo is available
-	if ws.userRepo == nil {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "User authentication not configured"})
-		return
-	}
-
-	// Validate session
-	if req.Session.TelegramID == 0 {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Not authenticated"})
-		return
-	}
-
-	// Fetch user from database
-	user, err := ws.userRepo.GetByTelegramID(r.Context(), req.Session.TelegramID)
-	if err != nil {
-		log.Printf("WebServer: Failed to get user: %v", err)
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "User not found"})
-		return
-	}
-
-	// Verify wallet address matches (security check)
-	if user.ProxyAddress == "" || user.ProxyAddress != req.Session.ProxyAddress {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: "Wallet address mismatch"})
+	// Authenticate the session against the stored user. Same validation the
+	// Live Watch endpoints use (shared helper), so no path is weaker: a
+	// present TelegramID, an existing user, and a matching Trading Wallet.
+	user, ok := ws.authWebSession(w, r, req.Session)
+	if !ok {
 		return
 	}
 
@@ -925,4 +985,146 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 		OrderID: result.OrderID,
 		Message: "Trade executed successfully",
 	})
+}
+
+// Live Watch management request/response types (ADR 0008 phase 3). All reuse
+// webTradeSession for the session block, so the page sends the same session
+// shape it already sends to /api/trade.
+type subscriptionRequest struct {
+	Session webTradeSession `json:"session"`
+	Tape    bool            `json:"tape"`
+}
+
+type sessionRequest struct {
+	Session webTradeSession `json:"session"`
+}
+
+type subscriptionResponse struct {
+	Success    bool   `json:"success"`
+	EventTitle string `json:"eventTitle,omitempty"`
+	Tape       bool   `json:"tape"`
+}
+
+type subscriptionListItem struct {
+	EventSlug string `json:"eventSlug"`
+	Tape      bool   `json:"tape"`
+}
+
+// handlePutSubscription creates (or updates the tape flag of) a Live Watch on
+// the event named in the path. It funnels through SubscribeTelegram — the same
+// method /live uses — so the watch is one durable, refreshed object. The
+// 30-watch cap is enforced here: a new distinct event past the cap is 409; a
+// re-subscribe to an existing watch is never capped.
+func (ws *WebServer) handlePutSubscription(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	slug := r.PathValue("slug")
+	if slug == "" {
+		writeJSONError(w, http.StatusBadRequest, "Missing event slug")
+		return
+	}
+
+	var req subscriptionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	user, ok := ws.authWebSession(w, r, req.Session)
+	if !ok {
+		return
+	}
+
+	if ws.watches == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "Live watches not configured")
+		return
+	}
+
+	// Cap only new distinct events; a re-subscribe (tape flip) is exempt.
+	existing := ws.watches.GetUserSubscriptions(user.TelegramID)
+	if !slices.Contains(existing, slug) && len(existing) >= maxLiveWatchesPerUser {
+		writeJSONError(w, http.StatusConflict, fmt.Sprintf("watch limit reached (%d)", maxLiveWatchesPerUser))
+		return
+	}
+
+	eventInfo, err := ws.watches.SubscribeTelegram(r.Context(), user.TelegramID, slug, req.Tape)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Event not found: %v", err))
+		return
+	}
+
+	resp := subscriptionResponse{Success: true, Tape: req.Tape}
+	if eventInfo != nil {
+		resp.EventTitle = eventInfo.Title
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleDeleteSubscription drops a Live Watch. 404 when the user has no watch
+// on that event.
+func (ws *WebServer) handleDeleteSubscription(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	slug := r.PathValue("slug")
+	if slug == "" {
+		writeJSONError(w, http.StatusBadRequest, "Missing event slug")
+		return
+	}
+
+	var req sessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	user, ok := ws.authWebSession(w, r, req.Session)
+	if !ok {
+		return
+	}
+
+	if ws.watches == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "Live watches not configured")
+		return
+	}
+
+	if !ws.watches.UnsubscribeTelegram(user.TelegramID, slug) {
+		writeJSONError(w, http.StatusNotFound, "Not subscribed to this event")
+		return
+	}
+
+	json.NewEncoder(w).Encode(subscriptionResponse{Success: true})
+}
+
+// handleListSubscriptions returns the user's Live Watches with their tape
+// flags. POST-with-body (not GET) so the authenticated session travels in the
+// JSON body, consistent with the page's other authenticated calls and keeping
+// the ProxyAddress out of URLs/logs.
+func (ws *WebServer) handleListSubscriptions(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var req sessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	user, ok := ws.authWebSession(w, r, req.Session)
+	if !ok {
+		return
+	}
+
+	if ws.watches == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "Live watches not configured")
+		return
+	}
+
+	slugs := ws.watches.GetUserSubscriptions(user.TelegramID)
+	items := make([]subscriptionListItem, 0, len(slugs))
+	for _, slug := range slugs {
+		items = append(items, subscriptionListItem{
+			EventSlug: slug,
+			Tape:      ws.watches.IsTapeSubscription(user.TelegramID, slug),
+		})
+	}
+	json.NewEncoder(w).Encode(items)
 }
