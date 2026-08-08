@@ -40,6 +40,17 @@ func snipeResetAsk() float64 {
 // dust and never fires (observed winners bottomed at 0.0065 and 0.015).
 const SnipeDeepFloor = 0.005
 
+// Shadow underdog-dip instrumentation (log-only, September review). The
+// Enterprise case (2026-08-07): a 0.365-high underdog dipped to 0.095 and won
+// the series — structurally excluded by SnipeCompetitiveBid. Whether that
+// class has positive expectancy is unknown; these bounds define the shadow
+// band that gets LOGGED (never notified, never bought) so September can
+// decide on recovery-rate data instead of one glorious counterexample.
+const (
+	snipeShadowHighMin  = 0.30 // session high at or above this (and below SnipeCompetitiveBid)
+	snipeShadowCrashAsk = 0.15 // ask at or below this fires the shadow log
+)
+
 // snipeResetConfirm is how long the ask must HOLD above snipeResetAsk before
 // the episode un-latches. A single tick above the reset level used to clear
 // the latch instantly — in a whipsawing thin book that re-alerted the same
@@ -130,6 +141,10 @@ type snipeTokenState struct {
 	// alertAsk is the ask at this episode's in-band alert — carried into the
 	// Deep Crash notification so the message can say "alerted at $X earlier".
 	alertAsk float64
+	// shadowAlerted latches the log-only underdog-dip shadow once per
+	// episode; shadowCount tallies fires for tests and has no runtime role.
+	shadowAlerted bool
+	shadowCount   int
 	// deepAlerted latches the Deep Crash tier: once per episode, cleared by
 	// the same sustained recovery that clears alerted (ADR 0007). Deliberately
 	// NOT gated on bought — the in-band auto-buy usually already fired.
@@ -519,12 +534,13 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 	if bid > st.sessionHigh {
 		st.sessionHigh = bid
 	}
-	if st.alerted && !st.dispatching && ask > snipeResetAsk() {
+	if (st.alerted || st.shadowAlerted) && !st.dispatching && ask > snipeResetAsk() {
 		if st.resetSince.IsZero() {
 			st.resetSince = now
 		} else if now.Sub(st.resetSince) >= snipeResetConfirm {
 			st.alerted = false
 			st.deepAlerted = false
+			st.shadowAlerted = false
 			st.resetSince = time.Time{}
 		}
 	} else {
@@ -564,6 +580,18 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		alertAsk = st.alertAsk
 	}
 
+	// Shadow underdog-dip (log-only): sub-competitive high in [0.30, 0.40)
+	// printing at or below the shadow band. Never notifies, never buys,
+	// never touches the real tiers' state beyond its own latch.
+	shadowFire := !st.shadowAlerted && !st.alerted && !st.bought &&
+		st.sessionHigh >= snipeShadowHighMin && st.sessionHigh < SnipeCompetitiveBid &&
+		ask >= SnipeDeepFloor && ask <= snipeShadowCrashAsk &&
+		w.inPlay(st.market, now)
+	if shadowFire {
+		st.shadowAlerted = true
+		st.shadowCount++
+	}
+
 	market := st.market
 	high := st.sessionHigh
 	var eventSlugs []string
@@ -596,6 +624,10 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		}
 		log.Printf("SnipeWatcher: deep-crash token=%.12s… high=%.3f ask=%.3f bid=%.3f sinceAlert=%s alertAsk=%.3f recipients=%d",
 			tokenID, high, ask, bid, sinceAlert.Round(time.Second), alertAsk, recipients)
+	}
+	if shadowFire {
+		log.Printf("SnipeWatcher: shadow-alert class=underdog-dip token=%.12s… high=%.3f ask=%.3f bid=%.3f impliedComplement=%.3f",
+			tokenID, high, ask, bid, 1-ask)
 	}
 	if fire || deepFire {
 		w.mu.Lock()

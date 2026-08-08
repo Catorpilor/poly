@@ -276,6 +276,94 @@ func TestSnipeWatcher_PairAlertInstrumentation(t *testing.T) {
 	}
 }
 
+// TestSnipeWatcher_ShadowUnderdogDip: log-only instrumentation for the
+// September review of the underdog-dip class (Enterprise case, 2026-08-07:
+// high 0.365 → 0.095 → won the series — structurally excluded by the 0.40
+// competitiveness bar). A shadow alert latches state and logs; it must never
+// notify, buy, or touch episode machinery for real alerts.
+func TestSnipeWatcher_ShadowUnderdogDip(t *testing.T) {
+	t.Parallel()
+	type step struct {
+		bid, ask float64
+		advance  time.Duration
+	}
+	tests := []struct {
+		name        string
+		steps       []step
+		wantShadows int
+		wantAlerts  int
+	}{
+		{
+			name: "Enterprise replay: sub-bar high dips into the shadow band, latches once",
+			steps: []step{
+				{bid: 0.365, ask: 0.40},
+				{bid: 0.10, ask: 0.12}, // shadow #1
+				{bid: 0.08, ask: 0.10}, // still latched
+			},
+			wantShadows: 1, wantAlerts: 0,
+		},
+		{
+			name: "competitive high belongs to the real alert, not the shadow",
+			steps: []step{
+				{bid: 0.45, ask: 0.50},
+				{bid: 0.10, ask: 0.12},
+			},
+			wantShadows: 0, wantAlerts: 1,
+		},
+		{
+			name:        "high below 0.30 never shadows",
+			steps:       []step{{bid: 0.28, ask: 0.30}, {bid: 0.08, ask: 0.10}},
+			wantShadows: 0, wantAlerts: 0,
+		},
+		{
+			name:        "ask above the shadow band does not fire",
+			steps:       []step{{bid: 0.36, ask: 0.40}, {bid: 0.14, ask: 0.16}},
+			wantShadows: 0, wantAlerts: 0,
+		},
+		{
+			name:        "settlement dust below the deep floor does not fire",
+			steps:       []step{{bid: 0.36, ask: 0.40}, {bid: 0.003, ask: 0.004}},
+			wantShadows: 0, wantAlerts: 0,
+		},
+		{
+			name: "sustained recovery re-arms the shadow episode",
+			steps: []step{
+				{bid: 0.36, ask: 0.40},
+				{bid: 0.10, ask: 0.12}, // shadow #1
+				{bid: 0.12, ask: 0.34},
+				{bid: 0.12, ask: 0.34, advance: snipeResetConfirm + time.Second},
+				{bid: 0.08, ask: 0.11}, // shadow #2
+			},
+			wantShadows: 2, wantAlerts: 0,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			w, _, rec, notif, clock := snipeHarness()
+			rec.eventSubs["evt"] = []int64{101}
+			w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+			for _, s := range tt.steps {
+				clock.advance(s.advance)
+				w.evaluate("T1", s.bid, s.ask)
+			}
+			w.mu.Lock()
+			shadows := w.tokens["T1"].shadowCount
+			w.mu.Unlock()
+			if shadows != tt.wantShadows {
+				t.Errorf("shadow fires = %d, want %d", shadows, tt.wantShadows)
+			}
+			if got := notif.count(); got != tt.wantAlerts {
+				t.Errorf("real alerts = %d, want %d", got, tt.wantAlerts)
+			}
+			if notif.deepCount() != 0 {
+				t.Errorf("shadow path must never reach the deep tier or any notifier")
+			}
+		})
+	}
+}
+
 // TestSnipeWatcher_ResetRequiresSustainedRecovery covers issue #50: on
 // 2026-08-05 a single transient ask tick above the reset level un-latched an
 // episode while the first alert's auto-buy was still in flight, and the same
