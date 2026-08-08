@@ -124,6 +124,16 @@
             </div>
         </div>
 
+        <!-- My Watches (durable Live Watches, distinct from the ephemeral
+             viewing panels below) -->
+        <div id="watchesSection" class="hidden mb-6">
+            <div class="flex items-center justify-between mb-2">
+                <h2 class="text-lg font-semibold">My Watches</h2>
+                <span class="text-gray-500 text-xs">Durable subscriptions — snipe alerts, optional tape feed</span>
+            </div>
+            <div id="watchesList" class="space-y-1"></div>
+        </div>
+
         <!-- Event Panels Grid -->
         <div id="eventPanels" class="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
             <!-- Placeholder when no events -->
@@ -1006,12 +1016,23 @@
                 `).join('');
             }
 
+            // Watch toggle: promotes this event into a durable Live Watch (or
+            // drops it). Only meaningful when logged in — the session owns the
+            // watch. State comes from liveWatches, hydrated by the list endpoint.
+            const isWatched = liveWatches.has(slug);
+            const watchBtn = getSession()?.telegramId ? `
+                    <button onclick="toggleWatch('${slug}')" data-watch-btn="${slug}"
+                            class="ml-2 px-2 py-1 rounded text-xs font-medium transition-colors ${isWatched ? 'bg-yellow-600 hover:bg-yellow-700' : 'bg-gray-700 hover:bg-gray-600'}">
+                        ${isWatched ? '★ Watching' : '☆ Watch'}
+                    </button>` : '';
+
             panel.innerHTML = `
                 <div class="px-4 py-3 border-b border-gray-700 flex items-center justify-between">
                     <div class="flex-1 min-w-0">
                         <div class="font-semibold text-sm truncate" title="${eventData.title}">${eventData.title}</div>
                         <div class="text-gray-500 text-xs truncate">${slug}</div>
                     </div>
+                    ${watchBtn}
                     <button onclick="unsubscribeEvent('${slug}')"
                             class="ml-2 text-gray-500 hover:text-red-400 transition-colors">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1649,6 +1670,11 @@
 
             // Show trade sections
             updateTradeSections();
+
+            // Rebuild panels so the Watch buttons appear, then hydrate the
+            // durable Live Watch state from the server.
+            renderPanels();
+            fetchLiveWatches();
         }
 
         // Logout and clear session
@@ -1662,6 +1688,176 @@
 
             // Hide trade sections
             updateTradeSections();
+
+            // Drop the durable-watch view (the session that owned it is gone).
+            liveWatches.clear();
+            renderWatches();
+            renderPanels();
+        }
+
+        // ==================== Live Watches (durable subscriptions) ====================
+        // A Live Watch is a durable, server-persisted subscription (snipe watch
+        // + alerts + optional tape feed), owned by the logged-in Telegram
+        // identity — distinct from the ephemeral WebSocket viewing panels.
+        // Managed through the session-guarded /api/events/{slug}/subscription and
+        // /api/subscriptions/list endpoints (same session block as /api/trade).
+
+        let liveWatches = new Map(); // eventSlug -> { tape: bool }
+
+        // Build a request body carrying the current session plus any extras.
+        function watchRequestBody(extra = {}) {
+            const s = getSession() || {};
+            return JSON.stringify({
+                session: {
+                    telegramId: s.telegramId,
+                    walletAddress: s.walletAddress,
+                    proxyAddress: s.proxyAddress
+                },
+                ...extra
+            });
+        }
+
+        // A 401 means the session is stale/absent — fall back to the login flow.
+        function handleWatchAuthError() {
+            alert('Please login to manage Live Watches');
+            logout();
+        }
+
+        // Load the user's durable watches and refresh the UI.
+        async function fetchLiveWatches() {
+            if (!getSession()?.telegramId) {
+                liveWatches.clear();
+                renderWatches();
+                return;
+            }
+            try {
+                const resp = await fetch('/api/subscriptions/list', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: watchRequestBody()
+                });
+                if (resp.status === 401) { handleWatchAuthError(); return; }
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const items = await resp.json();
+                liveWatches = new Map((items || []).map(it => [it.eventSlug, { tape: !!it.tape }]));
+                renderWatches();
+                refreshWatchButtons();
+            } catch (e) {
+                console.error('Failed to load Live Watches:', e);
+            }
+        }
+
+        // Create or update (tape flip) a Live Watch via PUT.
+        async function watchEvent(slug, tape = false) {
+            if (!getSession()?.telegramId) { alert('Please login first'); return; }
+            try {
+                const resp = await fetch(`/api/events/${encodeURIComponent(slug)}/subscription`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: watchRequestBody({ tape })
+                });
+                if (resp.status === 401) { handleWatchAuthError(); return; }
+                if (resp.status === 409) {
+                    const err = await resp.json().catch(() => ({}));
+                    alert(err.error || 'Watch limit reached');
+                    return;
+                }
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    throw new Error(err.error || `HTTP ${resp.status}`);
+                }
+                const data = await resp.json();
+                liveWatches.set(slug, { tape: !!data.tape });
+                renderWatches();
+                refreshWatchButtons();
+            } catch (e) {
+                console.error('Watch failed:', e);
+                alert('Watch failed: ' + e.message);
+            }
+        }
+
+        // Drop a Live Watch via DELETE (no confirm dialog — that is phase 4).
+        async function unwatchEvent(slug) {
+            if (!getSession()?.telegramId) { alert('Please login first'); return; }
+            try {
+                const resp = await fetch(`/api/events/${encodeURIComponent(slug)}/subscription`, {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: watchRequestBody()
+                });
+                if (resp.status === 401) { handleWatchAuthError(); return; }
+                if (!resp.ok && resp.status !== 404) {
+                    const err = await resp.json().catch(() => ({}));
+                    throw new Error(err.error || `HTTP ${resp.status}`);
+                }
+                // 404 = already gone server-side; converge the local view either way.
+                liveWatches.delete(slug);
+                renderWatches();
+                refreshWatchButtons();
+            } catch (e) {
+                console.error('Unwatch failed:', e);
+                alert('Unwatch failed: ' + e.message);
+            }
+        }
+
+        // Event-panel button: watch if not watched, unwatch if watched.
+        function toggleWatch(slug) {
+            if (liveWatches.has(slug)) {
+                unwatchEvent(slug);
+            } else {
+                watchEvent(slug, false); // quiet by default
+            }
+        }
+
+        // My Watches row: flip the tape flag with a re-PUT.
+        function toggleWatchTape(slug) {
+            const w = liveWatches.get(slug);
+            if (!w) return;
+            watchEvent(slug, !w.tape);
+        }
+
+        // Render the My Watches panel.
+        function renderWatches() {
+            const section = document.getElementById('watchesSection');
+            const list = document.getElementById('watchesList');
+            if (!section || !list) return;
+
+            if (!getSession()?.telegramId || liveWatches.size === 0) {
+                section.classList.add('hidden');
+                list.innerHTML = '';
+                return;
+            }
+
+            section.classList.remove('hidden');
+            list.innerHTML = '';
+            liveWatches.forEach((w, slug) => {
+                const row = document.createElement('div');
+                row.className = 'flex items-center justify-between gap-2 bg-gray-800 rounded px-3 py-2';
+                row.innerHTML = `
+                    <span class="text-sm text-gray-200 truncate" title="${slug}">${slug}</span>
+                    <div class="flex items-center gap-2 shrink-0">
+                        <button onclick="toggleWatchTape('${slug}')"
+                                class="px-2 py-1 rounded text-xs font-medium transition-colors ${w.tape ? 'bg-blue-600 hover:bg-blue-700' : 'bg-gray-700 hover:bg-gray-600'}">
+                            Tape ${w.tape ? 'On' : 'Off'}
+                        </button>
+                        <button onclick="unwatchEvent('${slug}')"
+                                class="px-2 py-1 bg-gray-700 hover:bg-red-700 rounded text-xs font-medium transition-colors">
+                            Unwatch
+                        </button>
+                    </div>
+                `;
+                list.appendChild(row);
+            });
+        }
+
+        // Update the Watch buttons on any live event panels in place.
+        function refreshWatchButtons() {
+            document.querySelectorAll('[data-watch-btn]').forEach(btn => {
+                const slug = btn.getAttribute('data-watch-btn');
+                const watched = liveWatches.has(slug);
+                btn.className = `ml-2 px-2 py-1 rounded text-xs font-medium transition-colors ${watched ? 'bg-yellow-600 hover:bg-yellow-700' : 'bg-gray-700 hover:bg-gray-600'}`;
+                btn.textContent = watched ? '★ Watching' : '☆ Watch';
+            });
         }
 
         // Check session on page load
