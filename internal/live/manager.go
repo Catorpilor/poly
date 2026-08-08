@@ -477,6 +477,23 @@ type LiveTradeManager struct {
 	// refreshPause spaces the sequential per-event resolves within one refresh
 	// cycle, gentle on Gamma. Zero disables the pause (tests rely on this).
 	refreshPause time.Duration
+
+	// telegramSender delivers the grouped 🧹 watch-expiry notice directly (not
+	// via the batched feed). Set alongside the feed batcher by SetTelegramBot;
+	// nil-safe — the sweep skips the notice when unset.
+	telegramSender TelegramSender
+
+	// closedEventChecker is the Gamma closed-event lookup that drives the watch
+	// expiry sweep (ADR 0008 phase 4). nil (the default) keeps the sweep
+	// disabled, so any wiring that never sets it — and every test that does not
+	// exercise expiry — is unaffected. Set before StartWatchExpirySweep; read
+	// unguarded, matching the manager's other setter-injected dependencies.
+	closedEventChecker ClosedEventChecker
+	// sweepInitialDelay / sweepInterval schedule the watch expiry sweep,
+	// mirroring the SL/TP sweeper's post-boot + hourly cadence. Overridable for
+	// tests before StartWatchExpirySweep.
+	sweepInitialDelay time.Duration
+	sweepInterval     time.Duration
 }
 
 // SetSnipeWatcher wires the comeback-snipe watcher into the subscription
@@ -556,11 +573,16 @@ func NewLiveTradeManager() *LiveTradeManager {
 		restorePause:      watchRestoreDefaultPause,
 		refreshInterval:   eventRefreshInterval,
 		refreshPause:      eventRefreshDefaultPause,
+		sweepInitialDelay: watchSweepInitialDelay,
+		sweepInterval:     watchSweepInterval,
 	}
 }
 
 func (m *LiveTradeManager) SetTelegramBot(bot TelegramSender) {
 	m.feedBatcher = NewFeedBatcher(bot)
+	// Same sender is the direct path for the grouped watch-expiry notice, which
+	// must not be coalesced through the trade-feed batcher.
+	m.telegramSender = bot
 }
 
 func (m *LiveTradeManager) Start() error {

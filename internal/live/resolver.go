@@ -3,6 +3,7 @@ package live
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -11,6 +12,13 @@ import (
 
 	"github.com/Catorpilor/poly/internal/polymarket"
 )
+
+// ErrEventNotClosed is the common negative for the event-level closed check:
+// Gamma returned no event under the closed=true filter, so the event is still
+// active/open (or does not exist). The watch expiry sweep matches it with
+// errors.Is to tell "keep quietly" from a real lookup error — the event-level
+// analog of polymarket.ErrMarketNotFound in the resolved-arm sweeper.
+var ErrEventNotClosed = errors.New("event not closed")
 
 // subMarketKeywords is the single source of truth for keywords that indicate a sub-market
 // (not a moneyline market). Used by GetPrimaryMarket and GetAllMLMarkets.
@@ -223,6 +231,62 @@ func (r *EventSlugResolver) fetchEventBySlug(ctx context.Context, slug string) (
 
 	if len(events) == 0 {
 		return nil, fmt.Errorf("event not found: %s", slug)
+	}
+
+	return &events[0], nil
+}
+
+// ClosedEventBySlug fetches the event for slug ONLY when Gamma affirmatively
+// reports it closed. It is the event-level analog of
+// polymarket.GetClosedMarketByConditionID (the #40 sweeper doctrine) and the
+// only positive-evidence source the watch expiry sweep may act on (ADR 0008
+// phase 4).
+//
+// The closed=true filter returns the event iff Gamma considers it closed; an
+// active event yields an empty list, surfaced as ErrEventNotClosed (the common
+// negative — "keep quietly"). The response slug is validated against the
+// request: Gamma silently IGNORES unknown query params and returns a default
+// list (#33), so an unmatched slug must NEVER pass as this event's result.
+// Callers additionally require every nested market to be closed=true before
+// expiring a watch, so even a regressed closed filter cannot sweep a live
+// event. This lookup deliberately does NOT touch the resolver cache — a closed
+// event must not start being served to the trade feed / refresh paths.
+func (r *EventSlugResolver) ClosedEventBySlug(ctx context.Context, slug string) (*EventInfo, error) {
+	url := fmt.Sprintf("%s/events?slug=%s&closed=true", r.gammaAPIURL, slug)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch event: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("%w: %s", ErrEventNotClosed, slug)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Gamma API returned status %d", resp.StatusCode)
+	}
+
+	var events []EventInfo
+	if err := json.NewDecoder(resp.Body).Decode(&events); err != nil {
+		return nil, fmt.Errorf("failed to decode events: %w", err)
+	}
+
+	if len(events) == 0 {
+		return nil, fmt.Errorf("%w: %s", ErrEventNotClosed, slug)
+	}
+
+	// Identity check (#33): if Gamma ignored the slug filter and returned a
+	// default list of closed events, the first must not pass as this event.
+	if !strings.EqualFold(events[0].Slug, slug) {
+		return nil, fmt.Errorf("gamma returned event %q for requested slug %s — filter not applied",
+			events[0].Slug, slug)
 	}
 
 	return &events[0], nil
