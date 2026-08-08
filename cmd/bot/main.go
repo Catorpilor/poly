@@ -98,6 +98,13 @@ func main() {
 		log.Printf("Warning: Failed to restore live watches: %v", err)
 	}
 
+	// Event Refresh loop (ADR 0008 phase 2, issue #55): every ~2 min, re-resolve
+	// each subscribed event and register markets created after subscribe time —
+	// series games appear mid-series and an unrefreshed watch misses their whole
+	// crash. Delta-only registration; resolve errors log-and-skip. Bound to the
+	// manager lifecycle (stops when the manager stops).
+	bot.GetLiveManager().StartEventRefresh()
+
 	// Start live monitoring web server
 	liveWebPort := 8081 // Default port for live monitoring web interface
 	if cfg.App.Port > 0 {

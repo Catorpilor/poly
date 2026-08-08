@@ -227,8 +227,14 @@ func (w *SnipeWatcher) Stop() {
 
 // WatchEventMarkets registers an event's market tokens, subscribing each to
 // the price feed. Idempotent per (eventSlug, token). Called when an event
-// gains a subscriber (telegram or web).
-func (w *SnipeWatcher) WatchEventMarkets(eventSlug string, markets []SnipeMarket) {
+// gains a subscriber (telegram or web) and, every cycle, by the Event Refresh
+// loop — so double registration must never re-subscribe the feed (the feed's
+// Subscribe is ref-counted; a leak there is unbounded, ADR 0008 phase 2).
+//
+// Returns the token IDs it newly subscribed to the feed this call — exactly the
+// feed delta (empty when nothing changed). The refresh loop reports it as
+// newAssets; existing callers ignore it.
+func (w *SnipeWatcher) WatchEventMarkets(eventSlug string, markets []SnipeMarket) []string {
 	var subscribe []string
 	w.mu.Lock()
 	for _, m := range markets {
@@ -253,6 +259,7 @@ func (w *SnipeWatcher) WatchEventMarkets(eventSlug string, markets []SnipeMarket
 	for _, id := range subscribe {
 		w.feed.Subscribe(id)
 	}
+	return subscribe
 }
 
 // UnwatchEventMarkets drops the event source from its tokens. Called when the
