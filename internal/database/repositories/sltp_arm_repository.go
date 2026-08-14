@@ -18,6 +18,13 @@ type SLTPArmRepository interface {
 	// Both tp_armed and sl_armed are set to true on arm/re-arm.
 	Arm(ctx context.Context, arm *database.SLTPArm) (*database.SLTPArm, error)
 
+	// ArmTPOnly creates or replaces the arm row with tp_armed = true and
+	// sl_armed = FALSE — the snipe auto-arm shape (feat/snipe-auto-arm-tp-only):
+	// take-profit + ceiling harvest the winners, but no trailing stop, which on
+	// snipe tranches amputates the 5× tail the band's economics need. A later
+	// manual Arm re-arms over this row with the full TP+SL.
+	ArmTPOnly(ctx context.Context, arm *database.SLTPArm) (*database.SLTPArm, error)
+
 	// Disarm removes the arm row entirely. Returns ErrSLTPArmNotFound if missing.
 	Disarm(ctx context.Context, telegramID int64, tokenID string) error
 
@@ -118,6 +125,48 @@ func (r *sltpArmRepo) Arm(ctx context.Context, arm *database.SLTPArm) (*database
 	result, err := scanArm(row)
 	if err != nil {
 		return nil, fmt.Errorf("failed to arm sltp: %w", err)
+	}
+	return result, nil
+}
+
+// ArmTPOnly mirrors Arm but sets sl_armed = FALSE (tp_armed = TRUE). See the
+// interface doc for the rationale. high_water_mark is seeded to avg_price like
+// Arm, so a later manual re-arm behaves identically.
+func (r *sltpArmRepo) ArmTPOnly(ctx context.Context, arm *database.SLTPArm) (*database.SLTPArm, error) {
+	if err := arm.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid arm: %w", err)
+	}
+
+	tickSize := arm.TickSize
+	if tickSize <= 0 {
+		tickSize = 0.01
+	}
+
+	query := `
+		INSERT INTO sltp_arms (
+			telegram_id, token_id, condition_id, market_id, outcome,
+			avg_price, shares_at_arm, high_water_mark, tick_size, tp_armed, sl_armed, neg_risk
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $6, $8, TRUE, FALSE, $9)
+		ON CONFLICT (telegram_id, token_id) DO UPDATE SET
+			condition_id = EXCLUDED.condition_id,
+			market_id = EXCLUDED.market_id,
+			outcome = EXCLUDED.outcome,
+			avg_price = EXCLUDED.avg_price,
+			shares_at_arm = EXCLUDED.shares_at_arm,
+			high_water_mark = EXCLUDED.avg_price,
+			tick_size = EXCLUDED.tick_size,
+			tp_armed = TRUE,
+			sl_armed = FALSE,
+			neg_risk = EXCLUDED.neg_risk
+		RETURNING ` + sltpArmColumns
+
+	row := r.db.Pool.QueryRow(ctx, query,
+		arm.TelegramID, arm.TokenID, arm.ConditionID, arm.MarketID, arm.Outcome,
+		arm.AvgPrice, arm.SharesAtArm, tickSize, arm.NegRisk,
+	)
+	result, err := scanArm(row)
+	if err != nil {
+		return nil, fmt.Errorf("failed to arm sltp (tp-only): %w", err)
 	}
 	return result, nil
 }

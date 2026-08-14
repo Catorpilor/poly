@@ -226,14 +226,19 @@ func (br *buyRecorder) call(t *testing.T, i int) buyCall {
 	return br.calls[i]
 }
 
-// fakeSnipeWatch records MarkBought calls; the watch-registration methods are
-// no-ops.
+// fakeSnipeWatch records MarkBought and WatchArmed calls; the other
+// watch-registration methods are no-ops.
 type fakeSnipeWatch struct {
 	mu     sync.Mutex
 	bought []string
+	armed  []live.SnipeMarket
 }
 
-func (f *fakeSnipeWatch) WatchArmed(live.SnipeMarket)                      {}
+func (f *fakeSnipeWatch) WatchArmed(m live.SnipeMarket) {
+	f.mu.Lock()
+	f.armed = append(f.armed, m)
+	f.mu.Unlock()
+}
 func (f *fakeSnipeWatch) UnwatchArmed(string)                              {}
 func (f *fakeSnipeWatch) WatchHeld(int64, live.SnipeMarket, time.Duration) {}
 func (f *fakeSnipeWatch) RenewHeld(int64, string, time.Duration) bool      { return true }
@@ -248,6 +253,12 @@ func (f *fakeSnipeWatch) boughtCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.bought)
+}
+
+func (f *fakeSnipeWatch) armedTokens() []live.SnipeMarket {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]live.SnipeMarket(nil), f.armed...)
 }
 
 // fakeSnipeUserRepo serves one fixed user for every telegram ID; nil means
@@ -310,7 +321,7 @@ func newSnipeAutoBuyHarness(t *testing.T, cfg snipeHarnessConfig) *snipeAutoBuyH
 	gamma := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/markets/"+m.MarketID {
 			fmt.Fprintf(w,
-				`{"id":%q,"question":%q,"outcomes":"[\"Lakers\",\"Trail Blazers\"]","clobTokenIds":"[\"%s\",\"%s\"]"}`,
+				`{"id":%q,"question":%q,"conditionId":"cond-1","outcomes":"[\"Lakers\",\"Trail Blazers\"]","clobTokenIds":"[\"%s\",\"%s\"]"}`,
 				m.MarketID, m.Question, m.TokenID, strings.Repeat("8", 78))
 			return
 		}

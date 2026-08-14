@@ -204,9 +204,16 @@ a third of the fresh ask — the decided-game signature). The alert then
 offers a one-tap Add $25 top-up riding the same alert entry; any
 auto-buy failure or gate skip (cap, guard, sport, spread, no wallet,
 CLOB) falls back to the unchanged manual alert with one-tap buy
-buttons — delivery is never blocked by execution. The
-human judgment layer thus moved from gatekeeper to top-up: the bot takes
-the small stake on its own, the human decides whether to press. Alerts
+buttons — delivery is never blocked by execution. Since 2026-08-14
+(v0.17.0) every snipe fill also auto-arms a TP-only Arm (take-profit +
+ceiling, NO trailing stop) built from the fill data: winners are
+harvested mechanically while the stake stays the maximum loss — a
+trailing stop on a lottery tranche mostly bottom-ticks gapped books and
+truncates the 5× tail the band's economics need. An existing Arm is
+never clobbered, and a manual arm re-arms over the auto-arm with the
+full TP+SL pair. The human judgment layer thus moved from gatekeeper to
+top-up: the bot takes the small stake on its own, the human decides
+whether to press. Alerts
 are episode-based: after alerting, a token re-alerts only once its ask
 has recovered above the midpoint of the crash threshold and the
 competitiveness bar (0.30 today) and then crashes again — a real
