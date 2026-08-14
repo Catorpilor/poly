@@ -66,6 +66,9 @@ func main() {
 	// Resolved-arm sweeper: hourly Gamma closed-market check that auto-disarms
 	// arms on finished markets (issue #39). Must be set before Start.
 	sltpMonitor.SetClosedMarketChecker(polymarket.NewMarketClient())
+	// TP-only auto-arms extend sell coverage to the whole current position
+	// (feat/auto-arm-full-coverage); the bot reads holdings via the Data API.
+	sltpMonitor.SetHoldingReader(bot)
 	if err := sltpMonitor.Start(); err != nil {
 		log.Printf("Warning: Failed to start SL/TP monitor: %v", err)
 	}

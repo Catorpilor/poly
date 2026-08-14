@@ -132,7 +132,12 @@ bot's control; no published SLA.
 **Arm** — A standing instruction on one position: watch its price and
 auto-sell when a trigger fires. One Arm per user per Token ID. Thresholds
 are frozen from the position's average price and share count *at arm time*;
-buying more shares later does not move them until re-armed. All triggers
+buying more shares later does not move them until re-armed. Exception
+(2026-08-15): a TP-only auto-arm's SHARE coverage — a mechanical fill
+snapshot, not a deliberate freeze — auto-extends to the whole current
+position (fire-time sizing from live holdings, sweep-reconciled
+upward); its price thresholds still never move. Manual TP+SL arms
+freeze fully, as ever. All triggers
 evaluate the **best bid** — the price a sell would actually hit — never the
 last trade or the midpoint. Arms whose market has closed are swept
 automatically — auto-disarmed with a cleanup notice, since a finished
