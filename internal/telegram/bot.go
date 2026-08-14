@@ -1340,8 +1340,11 @@ Please wait...`, marketName, outcomeName, amount))
 
 	// Show result
 	if result.Success {
-		// A successful buy makes the buyer a Held Watch holder (issue #64), off
-		// the render path.
+		// Register the bought token as a Held Watch directly from the market we
+		// already hold — lag-free, so a crash seconds after the fill still
+		// alerts (issue #67). The positions refetch stays as secondary rescue
+		// for older holdings the Data API has already indexed (issue #64).
+		b.snipeRegisterBoughtToken(chatID, market, idx)
 		go b.snipeRegisterHeldForUser(chatID, common.HexToAddress(user.ProxyAddress))
 		message := fmt.Sprintf(`✅ *Order Executed Successfully!*
 
@@ -1505,9 +1508,13 @@ Please wait...`, marketName, outcomeName, amount, limitPrice))
 
 	// Show result
 	if result.Success {
-		// Register the buyer's held positions as Held Watches (issue #64), off
-		// the render path. This scans actual positions, so a resting limit order
-		// only refreshes existing holdings until it fills.
+		// Register the bought token as a Held Watch directly from the market
+		// (issue #67), lag-free. A resting limit isn't a position yet, but
+		// registering the held watch immediately is strictly better: it's
+		// TTL-bounded, and these market-adjacent limits usually fill near-
+		// immediately — a fill-then-crash can't slip past the watch. The
+		// positions refetch stays as secondary rescue for older holdings (#64).
+		b.snipeRegisterBoughtToken(chatID, market, outcomeIndex)
 		go b.snipeRegisterHeldForUser(chatID, common.HexToAddress(user.ProxyAddress))
 		message := fmt.Sprintf(`✅ *Limit Buy Order Placed!*
 

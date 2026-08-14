@@ -945,6 +945,35 @@ func fetchSnipeMarket(ctx context.Context, mc *polymarket.MarketClient, id strin
 	return m, nil
 }
 
+// snipeRegisterBoughtToken registers a just-bought token as a Held Watch
+// directly from the Gamma market the buy already used — no Data API round-trip,
+// so it can't lose the race against the API's fill indexing (issue #67: a token
+// bought at 09:35:16 wasn't indexed when the portfolio refetch ran ~1s later,
+// so its 09:38 crash to 0.115 alerted nobody). These handlers fetch the market
+// by numeric ID, whose response carries gameStartTime (only the ?condition_id=
+// form drops it, per fetchSnipeMarket), so the resulting SnipeMarket is fully
+// in-play-gated. In-memory and cheap — call inline, not in a goroutine, and
+// keep the positions refetch as secondary rescue for older holdings. Never
+// MarkBought: a manual buy is not a snipe fill.
+func (b *Bot) snipeRegisterBoughtToken(chatID int64, market *polymarket.GammaMarket, idx int) {
+	if b.snipeWatcher == nil || market == nil {
+		return
+	}
+	tokenIDs := market.GetClobTokenIds()
+	if idx < 0 || idx >= len(tokenIDs) {
+		return
+	}
+	tokenID := tokenIDs[idx]
+	if tokenID == "" {
+		return
+	}
+	outcome := ""
+	if outcomes := market.GetOutcomes(); idx < len(outcomes) {
+		outcome = outcomes[idx]
+	}
+	b.snipeWatcher.WatchHeld(chatID, snipeMarketFromGamma(market, tokenID, outcome), live.SnipeHeldTTL)
+}
+
 // snipeRegisterHeldForUser fetches the user's positions and registers them as
 // held-token watches. Used by the /positions flows, which only produce a
 // rendered summary — the raw positions come from a second Data API call here,
