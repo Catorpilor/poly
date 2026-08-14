@@ -119,6 +119,31 @@ any trading incident review, replay the price path and score each
 decision against its own counterfactual — the component that hurts most
 emotionally is often not the one that lost the money.
 
+## 2026-08-15 — Relaxing an invariant means auditing every consumer of it, prose included
+v0.17.0 made SLArmed=false arms possible, relaxing "every arm has a
+stop" — but the TP-fire message template still said "Trailing stop
+watching the remainder" (its comment even asserted the stop was
+"necessarily active"), and it lied to the user at the worst possible
+moment: while their unprotected remainder rode a peak back to zero.
+The compiler verifies struct consumers; nothing verifies prose,
+comments, or UI copy that bake in the old invariant. Rule: when a
+change relaxes an invariant, grep every consumer of the TYPE (messages,
+views, docs, log templates) for wording that assumes the old world —
+list them in the PR as audited-and-kept or changed. The v0.19.0 list
+view had the sibling bug (rendered "armed" without coverage) for the
+same root cause.
+
+## 2026-08-15 — Changing a field's data source can silently change its meaning
+The #67 fix deliberately built auto-arms from FILL data (right call —
+lag). But SharesAtArm thereby quietly changed meaning from "the
+position at arm time" (the manual flow's semantics, which sell sizing
+and the UI were written against) to "the fill tranche" — and every
+consumer kept its old interpretation: TP sold 25% of the fill while
+manual tranches sat outside the arm, and the list showed the whole
+position as armed. Rule: when a field's value starts coming from a new
+source, re-derive what each consumer believes the field MEANS — a
+data-source substitution is a semantics change until proven otherwise.
+
 ## 2026-08-15 — Rebuild a guard process by diffing against its captured predecessor
 Re-arming the log monitor to add the boxed-tier lines, I retyped the
 loop and dropped both the `sleep 5` and the closing `done` — exit 2,
