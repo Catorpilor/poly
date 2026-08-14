@@ -24,10 +24,18 @@ type snipeDeepRec struct {
 	sinceAlert time.Duration
 }
 
+type snipeBoxedRec struct {
+	chatID  int64
+	tokenID string
+	high    float64
+	ask     float64
+}
+
 type fakeSnipeNotifier struct {
 	mu     sync.Mutex
 	alerts []snipeAlertRec
 	deeps  []snipeDeepRec
+	boxeds []snipeBoxedRec
 }
 
 func (n *fakeSnipeNotifier) NotifySnipeAlert(chatID int64, market SnipeMarket, sessionHigh, ask float64) {
@@ -42,6 +50,12 @@ func (n *fakeSnipeNotifier) NotifySnipeDeepCrash(chatID int64, market SnipeMarke
 	n.deeps = append(n.deeps, snipeDeepRec{chatID: chatID, tokenID: market.TokenID, ask: ask, alertAsk: alertAsk, sinceAlert: sinceAlert})
 }
 
+func (n *fakeSnipeNotifier) NotifySnipeBoxed(chatID int64, market SnipeMarket, sessionHigh, ask float64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.boxeds = append(n.boxeds, snipeBoxedRec{chatID: chatID, tokenID: market.TokenID, high: sessionHigh, ask: ask})
+}
+
 func (n *fakeSnipeNotifier) deepCount() int {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -52,6 +66,18 @@ func (n *fakeSnipeNotifier) deepAt(i int) snipeDeepRec {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.deeps[i]
+}
+
+func (n *fakeSnipeNotifier) boxedCount() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return len(n.boxeds)
+}
+
+func (n *fakeSnipeNotifier) boxedAt(i int) snipeBoxedRec {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.boxeds[i]
 }
 
 func (n *fakeSnipeNotifier) count() int {
@@ -465,6 +491,10 @@ func (n *reentrantSnipeNotifier) NotifySnipeDeepCrash(chatID int64, market Snipe
 	n.inner.NotifySnipeDeepCrash(chatID, market, sessionHigh, ask, alertAsk, sinceAlert)
 }
 
+func (n *reentrantSnipeNotifier) NotifySnipeBoxed(chatID int64, market SnipeMarket, sessionHigh, ask float64) {
+	n.inner.NotifySnipeBoxed(chatID, market, sessionHigh, ask)
+}
+
 // TestSnipeWatcher_DeepCrash covers ADR 0007: the sub-corpse-floor tier fires
 // only inside an episode that already produced a genuine in-band alert (the
 // only evidence a cheap token is a live panic and not a corpse), once per
@@ -567,6 +597,110 @@ func TestSnipeWatcher_DeepCrash(t *testing.T) {
 		w.evaluate("T1", 0.01, 0.02) // delivery done: now it fires
 		if notif.inner.deepCount() != 1 {
 			t.Errorf("deep after delivery = %d, want 1", notif.inner.deepCount())
+		}
+	})
+}
+
+// TestSnipeWatcher_Boxed covers the boxed tier (feat/boxed-snipe-postpone): the
+// alerted token is re-offered once its ask reaches [SnipeDeepFloor,
+// SnipeBoxedMaxAsk] within an episode that already produced an in-band alert,
+// fires once per episode, ignores the bought latch, and resets with the episode.
+func TestSnipeWatcher_Boxed(t *testing.T) {
+	t.Parallel()
+
+	t.Run("fires once at the 0.10 cross after an in-band alert, past the bought latch", func(t *testing.T) {
+		t.Parallel()
+		w, _, rec, notif, _ := snipeHarness()
+		rec.eventSubs["evt"] = []int64{101}
+		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+
+		w.evaluate("T1", 0.585, 0.50)
+		w.evaluate("T1", 0.10, 0.17) // in-band alert (boxed NOT this tick)
+		if notif.boxedCount() != 0 {
+			t.Fatalf("boxed fired in the same evaluate as the in-band alert")
+		}
+		w.MarkBought("T1")           // someone bought the crashed side
+		w.evaluate("T1", 0.02, 0.09) // now ≤ 0.10 → boxed fires
+		w.evaluate("T1", 0.02, 0.08) // still in zone → already latched
+		if notif.count() != 1 || notif.boxedCount() != 1 {
+			t.Fatalf("alerts=%d boxed=%d, want 1 and 1", notif.count(), notif.boxedCount())
+		}
+		if bx := notif.boxedAt(0); bx.ask != 0.09 || bx.chatID != 101 {
+			t.Errorf("boxed record = %+v, want ask 0.09 chat 101", bx)
+		}
+	})
+
+	t.Run("no boxed without a prior in-band alert", func(t *testing.T) {
+		t.Parallel()
+		w, _, rec, notif, _ := snipeHarness()
+		rec.eventSubs["evt"] = []int64{101}
+		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+
+		// Sub-competitive high: never fires the in-band alert, so the boxed tier
+		// (which requires it) must stay silent even at a ≤ 0.10 ask.
+		w.evaluate("T1", 0.30, 0.35)
+		w.evaluate("T1", 0.02, 0.09)
+		if notif.count() != 0 || notif.boxedCount() != 0 {
+			t.Errorf("alerts=%d boxed=%d, want 0 and 0", notif.count(), notif.boxedCount())
+		}
+	})
+
+	t.Run("below the deep floor nothing fires; in the deep overlap zone deep fires then boxed", func(t *testing.T) {
+		t.Parallel()
+		w, _, rec, notif, _ := snipeHarness()
+		rec.eventSubs["evt"] = []int64{101}
+		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+
+		w.evaluate("T1", 0.45, 0.50)
+		w.evaluate("T1", 0.10, 0.17)  // in-band alert
+		w.evaluate("T1", 0.01, 0.004) // below SnipeDeepFloor: nothing
+		if notif.boxedCount() != 0 || notif.deepCount() != 0 {
+			t.Fatalf("something fired below the deep floor (deep=%d boxed=%d)", notif.deepCount(), notif.boxedCount())
+		}
+		// Inside [SnipeDeepFloor, SnipeMinAsk) both zones apply; the dispatching
+		// latch makes deep win the first tick and boxed the next — case-3 still
+		// gets its postponed offer on a straight-to-deep crash.
+		w.evaluate("T1", 0.01, 0.02)
+		w.evaluate("T1", 0.01, 0.02)
+		if notif.deepCount() != 1 || notif.boxedCount() != 1 {
+			t.Errorf("deep=%d boxed=%d, want 1 and 1 (deep then boxed in the overlap)", notif.deepCount(), notif.boxedCount())
+		}
+	})
+
+	t.Run("upper bound: 0.10 inclusive, just above stays silent", func(t *testing.T) {
+		t.Parallel()
+		w, _, rec, notif, _ := snipeHarness()
+		rec.eventSubs["evt"] = []int64{101}
+		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+
+		w.evaluate("T1", 0.45, 0.50)
+		w.evaluate("T1", 0.10, 0.17) // in-band alert
+		w.evaluate("T1", 0.05, 0.11) // just above 0.10: silent
+		if notif.boxedCount() != 0 {
+			t.Fatalf("boxed fired above SnipeBoxedMaxAsk")
+		}
+		w.evaluate("T1", 0.05, SnipeBoxedMaxAsk) // exactly 0.10: fires
+		if notif.boxedCount() != 1 {
+			t.Errorf("boxed at exactly SnipeBoxedMaxAsk = %d fires, want 1", notif.boxedCount())
+		}
+	})
+
+	t.Run("sustained recovery resets the boxed latch (re-fires next episode)", func(t *testing.T) {
+		t.Parallel()
+		w, _, rec, notif, clock := snipeHarness()
+		rec.eventSubs["evt"] = []int64{101}
+		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+
+		w.evaluate("T1", 0.45, 0.50)
+		w.evaluate("T1", 0.10, 0.17) // alert #1
+		w.evaluate("T1", 0.02, 0.09) // boxed #1
+		w.evaluate("T1", 0.12, 0.34)
+		clock.advance(snipeResetConfirm + time.Second)
+		w.evaluate("T1", 0.12, 0.34) // sustained recovery: episode resets
+		w.evaluate("T1", 0.08, 0.16) // alert #2
+		w.evaluate("T1", 0.02, 0.08) // boxed #2
+		if notif.boxedCount() != 2 {
+			t.Errorf("boxed=%d, want 2 (latch reset with the episode)", notif.boxedCount())
 		}
 	})
 }

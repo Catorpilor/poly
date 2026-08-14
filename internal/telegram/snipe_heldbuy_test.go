@@ -35,6 +35,7 @@ func (r *recordingHeldWatch) RenewHeld(_ int64, tokenID string, _ time.Duration)
 	r.mu.Unlock()
 	return true
 }
+func (r *recordingHeldWatch) SiblingTokenIDs(_, _ string) []string { return nil }
 
 func (r *recordingHeldWatch) renewedTokens() []string {
 	r.mu.Lock()

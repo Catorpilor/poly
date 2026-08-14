@@ -229,9 +229,10 @@ func (br *buyRecorder) call(t *testing.T, i int) buyCall {
 // fakeSnipeWatch records MarkBought and WatchArmed calls; the other
 // watch-registration methods are no-ops.
 type fakeSnipeWatch struct {
-	mu     sync.Mutex
-	bought []string
-	armed  []live.SnipeMarket
+	mu       sync.Mutex
+	bought   []string
+	armed    []live.SnipeMarket
+	siblings []string // returned by SiblingTokenIDs (boxed case-3 tests)
 }
 
 func (f *fakeSnipeWatch) WatchArmed(m live.SnipeMarket) {
@@ -247,6 +248,14 @@ func (f *fakeSnipeWatch) MarkBought(tokenID string) {
 	f.mu.Lock()
 	f.bought = append(f.bought, tokenID)
 	f.mu.Unlock()
+}
+
+// siblings, when set, is returned by SiblingTokenIDs for any query — enough for
+// the boxed-tier case-3 tests.
+func (f *fakeSnipeWatch) SiblingTokenIDs(_, _ string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.siblings...)
 }
 
 func (f *fakeSnipeWatch) boughtCount() int {

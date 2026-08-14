@@ -38,6 +38,7 @@ func (c *capturingHeldWatch) MarkBought(tokenID string) {
 	c.bought = append(c.bought, tokenID)
 	c.mu.Unlock()
 }
+func (c *capturingHeldWatch) SiblingTokenIDs(_, _ string) []string { return nil }
 
 func (c *capturingHeldWatch) heldCalls() []heldWatchCall {
 	c.mu.Lock()
