@@ -92,6 +92,33 @@ find the condition that separates the mechanism's losses from its wins
 and gate on that; blanket off-switches destroy the option value and the
 September-review data stream. Alert delivery itself is NEVER gated.
 
+## 2026-08-14 — A missing log line only proves absence if THAT path logs
+Diagnosing #67 I inferred "the buy hook never ran" because no "Fetching
+positions" line followed the fill — but that line belongs to
+ScanAllStrategies (the display path); the hook's GetPositions is silent
+on success. The false inference cost a detour through three wrong
+hypotheses (stale binary, nil watcher, phantom third handler) before
+reading the callee settled it. Rules: (1) before treating a missing log
+line as proof a code path didn't execute, open the exact callee and
+confirm it emits that line — sibling functions logging similar things
+don't count; (2) corollary to the 08-01 silent-success lesson: a silent
+helper on a decision path (the positions read that gates registration)
+earns one debug line, because its silence is indistinguishable from its
+absence.
+
+## 2026-08-14 — Score the exit, the entry, and the settlement separately
+The AL stop-loss at $0.01 read as "a terrible loss" — but replaying the
+price log showed the exit BEAT holding by ~$1 (the game was over;
+settlement was $0). The loss was decided by the entries (knife-buy at
+0.20, add at 0.216, arm at the bounce top). Scoring the whole episode as
+"the SL failed" would have produced the wrong fix (soften the stop);
+separating entry/exit/settlement produced the right one (drop the stop
+from lottery tranches entirely, keep the TP harvest — validated within
+the hour when Yandex's TP bank cut a full-loss leg to −$1.66). Rule: in
+any trading incident review, replay the price path and score each
+decision against its own counterfactual — the component that hurts most
+emotionally is often not the one that lost the money.
+
 ## 2026-08-14 — Short-token substring allowlists false-positive in the harmful direction
 The esports classifier's bare `lec`/`lol` markers matched football club
 "Lecce" and name fragments — and a classifier false positive here
