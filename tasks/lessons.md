@@ -119,6 +119,28 @@ any trading incident review, replay the price path and score each
 decision against its own counterfactual — the component that hurts most
 emotionally is often not the one that lost the money.
 
+## 2026-08-15 — Rebuild a guard process by diffing against its captured predecessor
+Re-arming the log monitor to add the boxed-tier lines, I retyped the
+loop and dropped both the `sleep 5` and the closing `done` — exit 2,
+dead monitor, and had the syntax happened to parse it would have been a
+tight CPU spin on the Pi with the container down. TaskStop echoes the
+previous command verbatim: the correct move is to edit THAT text, not
+re-type from memory, then diff old vs new before launching, then
+confirm the replacement is actually running (TaskOutput non-error).
+A guard that fails to start is the silent loss of everything it guards.
+
+## 2026-08-15 — A bet against your own data must instrument both counterfactuals
+Boxed Snipe deliberately trades the ledger's best subclass (case-3 taps
+at ~0.20, +$92/4) for deep flip tickets, on the thesis that TP-only
+auto-arm ceilings now do the box-completion job. That may be wrong —
+and the only way the September review can falsify it is because every
+boxed-wait skip logs distinctly AND the re-offer logs its own fire, so
+both branches (what the skipped 0.20 buy would have done; what the
+0.10 buy captured) are scoreable. Rule: when a policy change knowingly
+contradicts historical performance, ship the instrumentation that can
+prove it wrong in the same release — a regime bet without counterfactual
+logging is just hope.
+
 ## 2026-08-14 — Short-token substring allowlists false-positive in the harmful direction
 The esports classifier's bare `lec`/`lol` markers matched football club
 "Lecce" and name fragments — and a classifier false positive here
