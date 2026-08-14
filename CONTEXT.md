@@ -196,10 +196,15 @@ the token crashed down *through* the band under watch in the current
 episode — see Deep Crash. v2 (issue #45): on every genuine alert the bot instantly
 auto-buys a fixed $10 for the recipient through the guarded buy path
 (fresh-ask repricing guard ≤ 0.30), bounded by a $50-per-user-per-UTC-day
-in-memory cap (a restart resets it — soft rail). The alert then offers a
-one-tap Add $25 top-up riding the same alert entry; any auto-buy failure
-(cap, guard, no wallet, CLOB) falls back to the unchanged manual alert
-with one-tap buy buttons — delivery is never blocked by execution. The
+in-memory cap (a restart resets it — soft rail). Since 2026-08-14 the
+auto-buy is gated twice: esports markets only (marker allowlist;
+non-esports and unclassifiable ⇒ alert-only — tennis went 0/5, every
+winner was esports), and skipped on corpse spread (fresh best bid below
+a third of the fresh ask — the decided-game signature). The alert then
+offers a one-tap Add $25 top-up riding the same alert entry; any
+auto-buy failure or gate skip (cap, guard, sport, spread, no wallet,
+CLOB) falls back to the unchanged manual alert with one-tap buy
+buttons — delivery is never blocked by execution. The
 human judgment layer thus moved from gatekeeper to top-up: the bot takes
 the small stake on its own, the human decides whether to press. Alerts
 are episode-based: after alerting, a token re-alerts only once its ask
@@ -220,8 +225,12 @@ evidence that distinguishes a live panic from a corpse first sighted
 cheap. Fires once per episode, past the bought latch (the in-band $10
 usually already bought), notifies with an explicit corpse warning, and
 auto-buys a fixed $5 from a separate, smaller daily pool — executed only
-if a fresh ask is still inside the zone at buy time. Below 0.005 is
-settlement dust and never fires. Named distinctly from Lottery Ticket,
+if a fresh ask is still inside the zone at buy time, the market is
+esports, and the recipient holds no shares of the token (2026-08-14: a
+held position is never topped up — every losing deep fire was a top-up
+onto a held corpse; the deep buy is a catch-up entry for when the
+in-band buy never funded). Below 0.005 is settlement dust and never
+fires. Named distinctly from Lottery Ticket,
 which it is not: a Deep Crash doubles down on the same side; a Lottery
 Ticket buys the opposite side after our own ceiling exit.
 

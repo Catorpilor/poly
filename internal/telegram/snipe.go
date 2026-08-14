@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,9 +19,11 @@ import (
 )
 
 // SnipeAskSource is the slice of the price feed the snipe tap handler needs:
-// a fresh best ask for the repricing guard.
+// a fresh best ask for the repricing guard and a fresh best bid for the in-band
+// corpse-spread gate.
 type SnipeAskSource interface {
 	BestAsk(tokenID string) (float64, bool)
+	BestBid(tokenID string) (float64, bool)
 }
 
 // snipeWatch is the slice of the comeback-snipe watcher the bot drives: watch
@@ -50,6 +53,108 @@ const (
 	// corpse false-positives from the main band's budget.
 	snipeDeepDailyCapUSD = 20.0
 )
+
+// Comeback Snipe auto-buy gates (feat/snipe-auto-buy-gates). Alerts and manual
+// tap buttons are NEVER gated — each gate only converts an auto-buy into the
+// existing alert-only fallback, so the user still judges the game and taps.
+
+// snipeEsportsMarkers is the case-insensitive allowlist that classifies a
+// market as esports for the sport gate (Gate 1). Matched as whole words (word
+// boundaries) against the market question (and event slugs when a caller has
+// them) — bare substrings would false-positive on names like Lecce ("lec") or
+// Alec, and a false positive auto-buys a non-esports corpse. The ledger's
+// winners are all fast-bouncing esports crashes; every tennis tap went 0/5 and
+// slow decided-sport crashes lost — so this is an allowlist, and non-esports or
+// unclassifiable markets default to alert-only. Tunable: append a marker as new
+// titles/leagues appear. Observed Gamma question prefixes: "Counter-Strike:",
+// "Dota 2:", "LoL:", "Valorant:"; observed slugs: cs2-, dota2-, lol-, val-,
+// lec-.
+var snipeEsportsMarkers = []string{
+	"counter-strike", "cs2", "cs:go",
+	"dota", "dota2",
+	"league of legends", "lol", "lec", "lck", "lpl",
+	"valorant",
+	"overwatch",
+	"rocket league",
+	"starcraft",
+	"honor of kings", "king of glory",
+	"mobile legends",
+}
+
+// snipeEsportsPattern compiles the marker allowlist into one word-bounded
+// alternation, so "lec-…" slugs and "LoL:" prefixes match while "Lecce" and
+// "Alec" do not.
+var snipeEsportsPattern = func() *regexp.Regexp {
+	quoted := make([]string, len(snipeEsportsMarkers))
+	for i, m := range snipeEsportsMarkers {
+		quoted[i] = regexp.QuoteMeta(m)
+	}
+	return regexp.MustCompile(`\b(?:` + strings.Join(quoted, "|") + `)\b`)
+}()
+
+// snipeIsEsports reports whether any of texts (the market question, plus event
+// slugs when the caller has them) carries an esports marker. Unknown or empty ⇒
+// false: the sport gate's conservative default is alert-only, because a false
+// positive auto-buys a non-esports corpse — the exact loss pattern the gate
+// exists to stop — while a false negative only degrades to manual taps.
+func snipeIsEsports(texts ...string) bool {
+	for _, t := range texts {
+		if snipeEsportsPattern.MatchString(strings.ToLower(t)) {
+			return true
+		}
+	}
+	return false
+}
+
+// snipeCorpseSpreadRatio is the own-side spread that separates a live panic
+// from a decided-game corpse (Gate 2, in-band $10 only): a fresh best bid below
+// ask/ratio is the corpse signature (2026-08-07 SBV Excelsior: bid 0.022 / ask
+// 0.100 ≈ 0.22×; 2026-08-11 JDG–EDG called the same way and lost).
+const snipeCorpseSpreadRatio = 3.0
+
+// snipeCorpseGeometry reports whether the fresh book shows corpse spread —
+// bid < ask/snipeCorpseSpreadRatio. A missing or non-positive bid is treated as
+// corpse geometry (conservative: skip the auto-buy, still alert). Strictly
+// less-than, so bid == ask/ratio proceeds. Pure — table-tested.
+func snipeCorpseGeometry(bid float64, bidOK bool, ask float64) bool {
+	if !bidOK || bid <= 0 {
+		return true
+	}
+	return bid < ask/snipeCorpseSpreadRatio
+}
+
+// snipeBoughtRecord tracks, per recipient, the tokens the bot snipe-bought via
+// the in-band auto-buy or a one-tap buy. In-memory, never cleared during a run
+// — matches end with their markets, so staleness is bounded. Gate 3 (Deep
+// holdings) reads it so a $5 Deep Crash top-up never funds a token the in-band
+// buy already holds (all 11 losing deep fires were top-ups onto held corpses).
+// This is the lag-free half of the holdings check; the Data API positions read
+// is the other half, and it lags fills by seconds — hence both.
+type snipeBoughtRecord struct {
+	mu     sync.Mutex
+	bought map[int64]map[string]bool // chatID -> tokenID -> true
+}
+
+func newSnipeBoughtRecord() *snipeBoughtRecord {
+	return &snipeBoughtRecord{bought: make(map[int64]map[string]bool)}
+}
+
+// mark records that chatID holds tokenID from a snipe buy.
+func (r *snipeBoughtRecord) mark(chatID int64, tokenID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.bought[chatID] == nil {
+		r.bought[chatID] = make(map[string]bool)
+	}
+	r.bought[chatID][tokenID] = true
+}
+
+// held reports whether chatID already snipe-bought tokenID.
+func (r *snipeBoughtRecord) held(chatID int64, tokenID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.bought[chatID][tokenID]
+}
 
 // The bot is the snipe watcher's notifier (wired in cmd/bot/main.go).
 var _ live.SnipeNotifier = (*Bot)(nil)
@@ -253,6 +358,12 @@ func snipeSkipNote(res snipeBuyResult) string {
 		reason = "the order was rejected"
 	case snipeBuyNoWallet:
 		reason = "no trading wallet on this account"
+	case snipeBuyNotEsports:
+		reason = "this isn't an esports market (auto-buy is esports-only)"
+	case snipeBuyCorpseSpread:
+		reason = "the book shows a decided-game spread (fresh bid far below ask)"
+	case snipeBuyDeepHeld:
+		reason = "you already hold this token — not topping up a held position"
 	default:
 		reason = "auto-buy unavailable"
 	}
@@ -405,6 +516,12 @@ func (b *Bot) snipeDeepMessage(chatID int64, alertID string, market live.SnipeMa
 // snipeDeepAutoBuy attempts the fixed $5 Deep Crash buy from the deep pool,
 // mirroring snipeAutoBuy's reserve-then-refund but with the strict zone guard.
 func (b *Bot) snipeDeepAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResult, float64, snipeAutoStatus) {
+	// Gate 1 (sport gate): the deep tier is esports-only too.
+	if !snipeIsEsports(market.Question) {
+		log.Printf("Snipe deep-buy: sport-gated chat=%d token=%.12s… q=%q", chatID, market.TokenID, market.Question)
+		return snipeBuyResult{outcome: snipeBuyNotEsports}, 0, snipeAutoSkipped
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -412,6 +529,23 @@ func (b *Bot) snipeDeepAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyR
 	if err != nil || user == nil {
 		return snipeBuyResult{outcome: snipeBuyNoWallet}, 0, snipeAutoSkipped
 	}
+
+	// Gate 3 (deep holdings gate): never top up a token the recipient already
+	// holds — all 11 losing deep fires were top-ups onto held corpses. The deep
+	// buy is only a catch-up entry for when the in-band buy never funded. Two
+	// independent checks; either one showing exposure ⇒ skip.
+	if b.snipeBought != nil && b.snipeBought.held(chatID, market.TokenID) {
+		log.Printf("Snipe deep-buy: holdings-gated (record) chat=%d token=%.12s…", chatID, market.TokenID)
+		return snipeBuyResult{outcome: snipeBuyDeepHeld}, 0, snipeAutoSkipped
+	}
+	if held, ok := b.snipeHoldsPosition(ctx, user, market.TokenID); ok && held {
+		log.Printf("Snipe deep-buy: holdings-gated (positions) chat=%d token=%.12s…", chatID, market.TokenID)
+		return snipeBuyResult{outcome: snipeBuyDeepHeld}, 0, snipeAutoSkipped
+	}
+	// ok==false means the positions read failed: fall back to the record alone,
+	// which is empty here (checked above) ⇒ allow the buy (the deep pool is
+	// small and capped).
+
 	poolLeft, ok := b.snipeDeepSpend.reserve(chatID, snipeDeepBuyUSD)
 	if !ok {
 		log.Printf("Snipe deep-buy: pool reached chat=%d", chatID)
@@ -423,7 +557,7 @@ func (b *Bot) snipeDeepAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyR
 		question: market.Question,
 		outcome:  market.Outcome,
 	}
-	res := b.snipeGuardedBuyRefuse(ctx, user, entry, snipeDeepBuyUSD, snipeRefuseDeepBuy)
+	res := b.snipeGuardedBuyRefuse(ctx, user, entry, snipeDeepBuyUSD, snipeRefuseDeepBuy, false)
 	if res.outcome != snipeBuyFilled {
 		b.snipeDeepSpend.release(chatID, snipeDeepBuyUSD)
 		log.Printf("Snipe deep-buy: skipped chat=%d token=%.12s… reason=%d err=%v msg=%s",
@@ -433,6 +567,32 @@ func (b *Bot) snipeDeepAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyR
 	log.Printf("Snipe deep-buy: accepted chat=%d token=%.12s… $%.0f order=%s pool-left=$%.2f",
 		chatID, market.TokenID, snipeDeepBuyUSD, res.orderID, poolLeft)
 	return res, poolLeft, snipeAutoBought
+}
+
+// snipeHoldsPosition reports whether the user's proxy holds shares of tokenID
+// (Gate 3b). It mirrors snipeRegisterHeldForUser's Data API read, using the
+// same injectable snipePositions seam. Returns ok=false when the position can't
+// be determined (no proxy, or the Data API errored) — the caller falls back to
+// the local bought record.
+func (b *Bot) snipeHoldsPosition(ctx context.Context, user *database.User, tokenID string) (held, ok bool) {
+	if user.ProxyAddress == "" {
+		return false, false
+	}
+	scanner := b.snipePositions
+	if scanner == nil {
+		scanner = polymarket.NewUnifiedPositionScanner()
+	}
+	positions, err := scanner.GetPositions(ctx, common.HexToAddress(user.ProxyAddress))
+	if err != nil {
+		log.Printf("Snipe deep-buy: positions read failed for holdings gate: %v", err)
+		return false, false
+	}
+	for _, pos := range positions {
+		if pos.TokenID == tokenID && pos.Shares != nil && pos.Shares.Sign() > 0 {
+			return true, true
+		}
+	}
+	return false, true
 }
 
 // snipeAutoStatus classifies a snipeAutoBuy attempt for messaging.
@@ -450,6 +610,14 @@ const (
 // double-tap safety is preserved. Cap headroom is reserved before the buy so
 // racing alerts cannot overshoot the daily cap; a failed buy refunds it.
 func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResult, float64, snipeAutoStatus) {
+	// Gate 1 (sport gate): auto-buy only esports; non-esports and
+	// unclassifiable markets stay alert-only. Checked before any wallet lookup
+	// or cap reservation — the classification alone decides.
+	if !snipeIsEsports(market.Question) {
+		log.Printf("Snipe auto-buy: sport-gated chat=%d token=%.12s… q=%q", chatID, market.TokenID, market.Question)
+		return snipeBuyResult{outcome: snipeBuyNotEsports}, 0, snipeAutoSkipped
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -468,12 +636,19 @@ func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResul
 		question: market.Question,
 		outcome:  market.Outcome,
 	}
-	res := b.snipeGuardedBuy(ctx, user, entry, snipeAutoBuyUSD)
+	// corpseGuard=true adds Gate 2 to the shared guarded buy.
+	res := b.snipeGuardedBuyRefuse(ctx, user, entry, snipeAutoBuyUSD, snipeRefuseBuy, true)
 	if res.outcome != snipeBuyFilled {
 		b.snipeSpend.release(chatID, snipeAutoBuyUSD)
 		log.Printf("Snipe auto-buy: skipped chat=%d token=%.12s… reason=%d err=%v msg=%s",
 			chatID, market.TokenID, res.outcome, res.err, res.errorMsg)
 		return res, 0, snipeAutoSkipped
+	}
+	// Record the holding so a later Deep Crash fire on this token is
+	// holdings-gated (Gate 3a). Only the in-band auto-buy and the one-tap feed
+	// this record — never the deep tier itself.
+	if b.snipeBought != nil {
+		b.snipeBought.mark(chatID, market.TokenID)
 	}
 	log.Printf("Snipe auto-buy: accepted chat=%d token=%.12s… $%.0f order=%s cap-left=$%.2f",
 		chatID, market.TokenID, snipeAutoBuyUSD, res.orderID, capLeft)
@@ -484,12 +659,15 @@ func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResul
 type snipeBuyOutcome int
 
 const (
-	snipeBuyFilled    snipeBuyOutcome = iota
-	snipeBuyRepriced                  // guard refusal: fresh ask missing or repriced
-	snipeBuyMarketErr                 // market fetch failed
-	snipeBuyMismatch                  // alert token not in the market's clobTokenIds
-	snipeBuyRejected                  // executor reported Success=false
-	snipeBuyNoWallet                  // recipient has no trading wallet — buy path never attempted
+	snipeBuyFilled       snipeBuyOutcome = iota
+	snipeBuyRepriced                     // guard refusal: fresh ask missing or repriced
+	snipeBuyMarketErr                    // market fetch failed
+	snipeBuyMismatch                     // alert token not in the market's clobTokenIds
+	snipeBuyRejected                     // executor reported Success=false
+	snipeBuyNoWallet                     // recipient has no trading wallet — buy path never attempted
+	snipeBuyNotEsports                   // sport gate: non-esports/unclassifiable — auto-buy is esports-only
+	snipeBuyCorpseSpread                 // corpse-spread gate: fresh bid far below ask (decided-game signature)
+	snipeBuyDeepHeld                     // deep holdings gate: recipient already holds the crashed token
 )
 
 // snipeBuyResult carries what each caller needs to message the user.
@@ -497,9 +675,10 @@ type snipeBuyResult struct {
 	outcome  snipeBuyOutcome
 	ask      float64 // fresh ask at guard time (snipeBuyRepriced)
 	askOK    bool
-	err      error  // snipeBuyMarketErr
-	orderID  string // snipeBuyFilled
-	errorMsg string // snipeBuyRejected
+	bid      float64 // fresh bid at guard time (snipeBuyCorpseSpread)
+	err      error   // snipeBuyMarketErr
+	orderID  string  // snipeBuyFilled
+	errorMsg string  // snipeBuyRejected
 }
 
 // snipeRefuseDeepBuy is the Deep Crash buy guard (ADR 0007): strict zone
@@ -511,24 +690,35 @@ func snipeRefuseDeepBuy(ask float64, ok bool) bool {
 	return !ok || ask < live.SnipeDeepFloor || ask >= live.SnipeMinAsk
 }
 
-// snipeGuardedBuy is the shared guarded snipe buy behind both the one-tap
-// callback and the v2 auto-buy: repricing guard on a fresh ask, market fetch,
+// snipeGuardedBuy is the shared guarded snipe buy behind the one-tap callback
+// (manual taps are never gated): repricing guard on a fresh ask, market fetch,
 // token-index verify, buy, MarkBought on success. Claiming the registry entry
 // and cap accounting stay with the callers.
 func (b *Bot) snipeGuardedBuy(ctx context.Context, user *database.User, entry snipeAlertEntry, amount float64) snipeBuyResult {
-	return b.snipeGuardedBuyRefuse(ctx, user, entry, amount, snipeRefuseBuy)
+	return b.snipeGuardedBuyRefuse(ctx, user, entry, amount, snipeRefuseBuy, false)
 }
 
-// snipeGuardedBuyRefuse is snipeGuardedBuy with a caller-chosen repricing
-// guard — the Deep Crash tier substitutes its strict zone check.
-func (b *Bot) snipeGuardedBuyRefuse(ctx context.Context, user *database.User, entry snipeAlertEntry, amount float64, refuse func(ask float64, ok bool) bool) snipeBuyResult {
-	var ask float64
-	var ok bool
+// snipeGuardedBuyRefuse is snipeGuardedBuy with a caller-chosen repricing guard
+// (the Deep Crash tier substitutes its strict zone check) and an optional
+// corpse-spread gate (Gate 2, in-band $10 only). When corpseGuard is set, the
+// same fresh-book read that feeds the repricing guard also reads the best bid
+// and skips the buy on corpse geometry.
+func (b *Bot) snipeGuardedBuyRefuse(ctx context.Context, user *database.User, entry snipeAlertEntry, amount float64, refuse func(ask float64, ok bool) bool, corpseGuard bool) snipeBuyResult {
+	var ask, bid float64
+	var ok, bidOK bool
 	if b.snipeFeed != nil {
 		ask, ok = b.snipeFeed.BestAsk(entry.tokenID)
+		if corpseGuard {
+			bid, bidOK = b.snipeFeed.BestBid(entry.tokenID)
+		}
 	}
 	if refuse(ask, ok) {
 		return snipeBuyResult{outcome: snipeBuyRepriced, ask: ask, askOK: ok}
+	}
+	if corpseGuard && snipeCorpseGeometry(bid, bidOK, ask) {
+		log.Printf("Snipe auto-buy: corpse-spread skip token=%.12s… bid=%.3f ask=%.3f (< ask/%.0f)",
+			entry.tokenID, bid, ask, snipeCorpseSpreadRatio)
+		return snipeBuyResult{outcome: snipeBuyCorpseSpread, ask: ask, askOK: ok, bid: bid}
 	}
 
 	mc := b.snipeMarkets
@@ -618,6 +808,11 @@ func (b *Bot) handleSnipeCallback(ctx context.Context, update *tgbotapi.Update) 
 			"❌ *Snipe failed*\n\n*Market:* %s\n*Error:* %s",
 			question, res.errorMsg))
 	case snipeBuyFilled:
+		// Record the holding so a later Deep Crash fire on this token is
+		// holdings-gated (Gate 3a), same as the in-band auto-buy.
+		if b.snipeBought != nil {
+			b.snipeBought.mark(chatID, entry.tokenID)
+		}
 		keyboard := tgbotapi.NewInlineKeyboardMarkup(
 			tgbotapi.NewInlineKeyboardRow(
 				tgbotapi.NewInlineKeyboardButtonData("🎯 Arm SL/TP", "sltp_list"),

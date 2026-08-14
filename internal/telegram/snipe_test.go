@@ -141,8 +141,8 @@ func testSnipeMarket() live.SnipeMarket {
 	return live.SnipeMarket{
 		TokenID:  strings.Repeat("7", 78), // real CLOB token IDs are ~78 digits
 		MarketID: "157417",
-		Question: "Lakers vs. Trail Blazers",
-		Outcome:  "Lakers",
+		Question: "LoL: T1 vs. Gen.G", // esports so the sport gate lets the auto-buy through
+		Outcome:  "T1",
 	}
 }
 
