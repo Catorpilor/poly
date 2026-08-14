@@ -225,6 +225,17 @@ settlement dust and never fires. Named distinctly from Lottery Ticket,
 which it is not: a Deep Crash doubles down on the same side; a Lottery
 Ticket buys the opposite side after our own ceiling exit.
 
+**Held Watch** — A TTL-bound registration of one user's held position
+with the snipe watcher, making that user a full alert recipient — pings
+*and* v2 auto-buys — for that token. Created whenever the user's
+positions are sighted (positions and SL/TP views) and on every
+successful BUY on any surface (web or Telegram); each sighting renews
+the TTL, which lapses 6 hours after the last renewal. In-memory only:
+unlike an Arm or a Live Watch it does not survive a restart. A plain buy
+never sets the token's bought latch — only a snipe alert buy (auto or
+one-tap) does.
+_Avoid_: holder registration, held-token watch
+
 **Live Watch** — A durable, per-user subscription to an event: it drives
 snipe watching, alerts, and (when its tape flag is set) the batched
 Telegram trade feed. v2: created from Telegram (`/live <slug>`) or the
