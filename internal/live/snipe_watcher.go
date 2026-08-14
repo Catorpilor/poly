@@ -40,6 +40,17 @@ func snipeResetAsk() float64 {
 // dust and never fires (observed winners bottomed at 0.0065 and 0.015).
 const SnipeDeepFloor = 0.005
 
+// SnipeBoxedMaxAsk bounds the boxed tier (feat/boxed-snipe-postpone): a
+// recipient who already holds the OTHER side of the market ("case 3") should
+// not take the in-band $10 at ~0.20 — with TP-only auto-arms the held side
+// harvests at the $0.95 ceiling, so the flip ticket is better bought deep. The
+// watcher re-offers the alerted token once its ask reaches
+// [SnipeDeepFloor, SnipeBoxedMaxAsk]; the bot decides who is case-3 and dedups
+// per recipient. Regime bet: the ledger's case-3-at-0.20 taps were historically
+// the best subclass — this deliberately trades them for deeper flip tickets
+// under the auto-arm-ceiling regime.
+const SnipeBoxedMaxAsk = 0.10
+
 // Shadow underdog-dip instrumentation (log-only, September review). The
 // Enterprise case (2026-08-07): a 0.365-high underdog dipped to 0.095 and won
 // the series — structurally excluded by SnipeCompetitiveBid. Whether that
@@ -94,6 +105,11 @@ type SnipeMarket struct {
 type SnipeNotifier interface {
 	NotifySnipeAlert(chatID int64, market SnipeMarket, sessionHigh, ask float64)
 	NotifySnipeDeepCrash(chatID int64, market SnipeMarket, sessionHigh, ask, alertAsk float64, sinceAlert time.Duration)
+	// NotifySnipeBoxed is the boxed tier (feat/boxed-snipe-postpone): the
+	// alerted token has reached the deep flip zone after an in-band alert. The
+	// bot acts only for case-3 recipients (those holding the other side) and
+	// dedups per recipient.
+	NotifySnipeBoxed(chatID int64, market SnipeMarket, sessionHigh, ask float64)
 }
 
 // SnipeHistorySeeder supplies a token's recent trade high so a Session High
@@ -149,6 +165,11 @@ type snipeTokenState struct {
 	// the same sustained recovery that clears alerted (ADR 0007). Deliberately
 	// NOT gated on bought — the in-band auto-buy usually already fired.
 	deepAlerted bool
+	// boxedAlerted latches the boxed tier: once per episode, cleared by the same
+	// sustained recovery that clears alerted. Like deepAlerted it ignores bought
+	// — case-3 recipients hold the OTHER side, so this token's bought latch does
+	// not describe them.
+	boxedAlerted bool
 	// Watch sources. A token stays watched while any source is live.
 	events  map[string]bool     // subscribed event slugs
 	armed   bool                // watched because an SL/TP arm exists
@@ -547,6 +568,7 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		} else if now.Sub(st.resetSince) >= snipeResetConfirm {
 			st.alerted = false
 			st.deepAlerted = false
+			st.boxedAlerted = false
 			st.shadowAlerted = false
 			st.resetSince = time.Time{}
 		}
@@ -587,6 +609,23 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		alertAsk = st.alertAsk
 	}
 
+	// Boxed tier (feat/boxed-snipe-postpone): re-offer the alerted token once it
+	// reaches the deep flip zone [SnipeDeepFloor, SnipeBoxedMaxAsk] so a case-3
+	// recipient (holds the OTHER side) can buy the flip ticket deep instead of
+	// at the ~0.20 in-band price. Requires this episode's in-band alert, fires
+	// once, ignores bought — the bot decides case-3 and dedups per recipient.
+	// The zone overlaps Deep Crash's on purpose: a crash that jumps straight
+	// below 0.03 must still offer case-3 its postponed $10. !dispatching keeps it
+	// exclusive with fire/deepFire within a single evaluate; across ticks it
+	// fires on the next one (intended — see the bot's per-recipient dedup).
+	boxedFire := st.alerted && !st.boxedAlerted && !st.dispatching && !fire && !deepFire &&
+		ask >= SnipeDeepFloor && ask <= SnipeBoxedMaxAsk &&
+		w.inPlay(st.market, now)
+	if boxedFire {
+		st.boxedAlerted = true
+		st.dispatching = true
+	}
+
 	// Shadow underdog-dip (log-only): sub-competitive high in [0.30, 0.40)
 	// printing at or below the shadow band. Never notifies, never buys,
 	// never touches the real tiers' state beyond its own latch.
@@ -603,7 +642,7 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 	high := st.sessionHigh
 	var eventSlugs []string
 	var holders []int64
-	if fire || deepFire {
+	if fire || deepFire || boxedFire {
 		for slug := range st.events {
 			eventSlugs = append(eventSlugs, slug)
 		}
@@ -632,11 +671,20 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		log.Printf("SnipeWatcher: deep-crash token=%.12s… high=%.3f ask=%.3f bid=%.3f sinceAlert=%s alertAsk=%.3f recipients=%d",
 			tokenID, high, ask, bid, sinceAlert.Round(time.Second), alertAsk, recipients)
 	}
+	if boxedFire {
+		recipients := 0
+		for _, chatID := range w.recipientOrder(market, eventSlugs, holders) {
+			w.notifier.NotifySnipeBoxed(chatID, market, high, ask)
+			recipients++
+		}
+		log.Printf("SnipeWatcher: boxed token=%.12s… high=%.3f ask=%.3f bid=%.3f recipients=%d",
+			tokenID, high, ask, bid, recipients)
+	}
 	if shadowFire {
 		log.Printf("SnipeWatcher: shadow-alert class=underdog-dip token=%.12s… high=%.3f ask=%.3f bid=%.3f impliedComplement=%.3f",
 			tokenID, high, ask, bid, 1-ask)
 	}
-	if fire || deepFire {
+	if fire || deepFire || boxedFire {
 		w.mu.Lock()
 		if st := w.tokens[tokenID]; st != nil {
 			st.dispatching = false
@@ -662,6 +710,28 @@ func (w *SnipeWatcher) pairLastAlertLocked(marketID, exceptTokenID string) (time
 		}
 	}
 	return latest, !latest.IsZero()
+}
+
+// SiblingTokenIDs returns the token IDs of OTHER watched tokens in the same
+// market (the complement side(s) of a binary market). The boxed tier's case-3
+// check uses it to look up a recipient's holding of the OTHER side without a
+// Gamma round-trip: a held favorite is watched via WatchHeld, which is exactly
+// the case-3 scenario. Only watched tokens are known; an unwatched sibling
+// yields no hit, and the bot then treats the recipient as non-case-3
+// (conservative toward existing buy behavior).
+func (w *SnipeWatcher) SiblingTokenIDs(marketID, tokenID string) []string {
+	if marketID == "" {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var out []string
+	for id, st := range w.tokens {
+		if id != tokenID && st.market.MarketID == marketID {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // inPlay gates alerts to started games: the scheduled start is known and has

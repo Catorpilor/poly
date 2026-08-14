@@ -241,6 +241,18 @@ fires. Named distinctly from Lottery Ticket,
 which it is not: a Deep Crash doubles down on the same side; a Lottery
 Ticket buys the opposite side after our own ceiling exit.
 
+**Boxed Snipe** — The case-3 variant of the Comeback Snipe (2026-08-15):
+when the alert's recipient already holds the OPPOSITE side of the
+market, the in-band $10 is postponed — the watcher re-offers the token
+once per episode when its ask reaches the deep flip zone (≤ $0.10,
+mirroring the held side's $0.95 ceiling), and only then buys. Holding
+the crashed side (case 1) or nothing (case 2) buys at the normal band.
+Alerts and tap buttons always deliver; a boxed-waited alert says so.
+Deliberate regime bet: pre-auto-arm, case-3 taps at ~0.20 were the
+ledger's best subclass; with the held side now ceiling-harvested, the
+flip ticket is bought deep instead.
+_Avoid_: case-3 snipe, hedge snipe
+
 **Held Watch** — A TTL-bound registration of one user's held position
 with the snipe watcher, making that user a full alert recipient — pings
 *and* v2 auto-buys — for that token. Created whenever the user's
