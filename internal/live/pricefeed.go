@@ -23,6 +23,18 @@ const (
 	priceFeedStaleTimeout      = 60 * time.Second
 	priceFeedReconnectBackoff  = 5 * time.Second
 	priceFeedFallbackThreshold = 30 * time.Second
+	// priceFeedReconnectDebounce coalesces a burst of membership changes (an
+	// event watch adding several tokens, a positions view registering more)
+	// into a single reconnect. The CLOB market WS rejects mid-session subscribe
+	// frames ("INVALID OPERATION", issue #42), so the only way to change the
+	// subscribed set is to reconnect and re-send the full list at connect time
+	// — the accepted path. Debouncing avoids one reconnect per token.
+	priceFeedReconnectDebounce = 750 * time.Millisecond
+	// priceFeedReconnectRequestedDelay is the short pause before a DELIBERATE
+	// (membership-driven) reconnect re-dials. It is NOT the failure backoff: a
+	// requested reconnect is expected, not an error, so it must re-dial promptly
+	// rather than inherit priceFeedReconnectBackoff.
+	priceFeedReconnectRequestedDelay = 100 * time.Millisecond
 )
 
 // orderBookFetcher fetches book snapshots via HTTP for seeding and fallback.
@@ -69,6 +81,17 @@ type PriceFeedManager struct {
 	// send a subscribe within a few seconds, so we don't dial until we have
 	// something to send.
 	subscribeSignal chan struct{}
+
+	// Membership-change reconnect (issue #42). All three guarded by m.mu.
+	// reconnectPending: a debounce timer is armed and further changes coalesce
+	// into it. reconnectRequested: the current disconnect was deliberate, so
+	// connectionLoop re-dials promptly instead of using the failure backoff.
+	// reconnectTimer: the pending debounce timer (nil when none).
+	reconnectPending   bool
+	reconnectRequested bool
+	reconnectTimer     *time.Timer
+	// reconnectInterval is the debounce window; a field so tests can shorten it.
+	reconnectInterval time.Duration
 }
 
 // NewPriceFeedManager creates a manager using the production CLOB market WS URL.
@@ -80,15 +103,16 @@ func NewPriceFeedManager(fetcher orderBookFetcher) *PriceFeedManager {
 func newPriceFeedManagerWithURL(fetcher orderBookFetcher, wsURL string) *PriceFeedManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &PriceFeedManager{
-		ctx:             ctx,
-		cancel:          cancel,
-		fetcher:         fetcher,
-		wsURL:           wsURL,
-		subCount:        make(map[string]int),
-		books:           make(map[string]*bookState),
-		lastUpdateAt:    make(map[string]time.Time),
-		tradeBids:       make(map[string]float64),
-		subscribeSignal: make(chan struct{}, 1),
+		ctx:               ctx,
+		cancel:            cancel,
+		fetcher:           fetcher,
+		wsURL:             wsURL,
+		subCount:          make(map[string]int),
+		books:             make(map[string]*bookState),
+		lastUpdateAt:      make(map[string]time.Time),
+		tradeBids:         make(map[string]float64),
+		subscribeSignal:   make(chan struct{}, 1),
+		reconnectInterval: priceFeedReconnectDebounce,
 	}
 }
 
@@ -97,10 +121,17 @@ func (m *PriceFeedManager) Start() {
 	go m.connectionLoop()
 }
 
-// Stop closes the connection and cancels all goroutines.
+// Stop closes the connection and cancels all goroutines. A pending
+// membership-reconnect timer is stopped so it can neither leak nor reconnect
+// after Stop (issue #42).
 func (m *PriceFeedManager) Stop() {
 	m.cancel()
 	m.mu.Lock()
+	if m.reconnectTimer != nil {
+		m.reconnectTimer.Stop()
+		m.reconnectTimer = nil
+	}
+	m.reconnectPending = false
 	if m.conn != nil {
 		_ = m.conn.Close()
 		m.conn = nil
@@ -130,7 +161,11 @@ func (m *PriceFeedManager) Subscribe(tokenID string) {
 		case m.subscribeSignal <- struct{}{}:
 		default:
 		}
-		m.resubscribeAll()
+		// The subscribed set changed: force a reconnect so the new list is sent
+		// at connect time (the accepted path). A mid-session subscribe frame is
+		// rejected by the server (issue #42). No-op when not yet connected — the
+		// (re)connect already sends the current full list.
+		m.requestReconnect()
 	}
 }
 
@@ -151,7 +186,10 @@ func (m *PriceFeedManager) Unsubscribe(tokenID string) {
 	m.mu.Unlock()
 
 	if zero {
-		m.resubscribeAll()
+		// The subscribed set shrank: reconnect so the next connect-time
+		// subscribe omits the dropped token (mid-session unsubscribe frames are
+		// rejected the same way, issue #42).
+		m.requestReconnect()
 	}
 }
 
@@ -360,13 +398,66 @@ func (m *PriceFeedManager) connectionLoop() {
 			_ = m.conn.Close()
 			m.conn = nil
 		}
+		// A deliberate membership reconnect is not a failure: re-dial promptly
+		// and do not inherit the error backoff (issue #42). The flag is consumed
+		// here so it applies to exactly this one re-dial.
+		requested := m.reconnectRequested
+		m.reconnectRequested = false
 		m.mu.Unlock()
 
+		wait := priceFeedReconnectBackoff
+		if requested {
+			wait = priceFeedReconnectRequestedDelay
+		}
 		select {
 		case <-m.ctx.Done():
 			return
-		case <-time.After(priceFeedReconnectBackoff):
+		case <-time.After(wait):
 		}
+	}
+}
+
+// requestReconnect schedules a debounced reconnect after a membership change.
+// The CLOB market WS rejects mid-session subscribe/unsubscribe frames (issue
+// #42), so the subscribed set can only change by reconnecting and re-sending
+// the full list at connect time. A burst of changes coalesces into one
+// reconnect: the first request arms the timer, later requests while it is
+// pending are no-ops. No-op when not connected — the pending/next connect()
+// already sends the current full list.
+func (m *PriceFeedManager) requestReconnect() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.connected || m.conn == nil {
+		return
+	}
+	if m.reconnectPending {
+		return
+	}
+	m.reconnectPending = true
+	m.reconnectTimer = time.AfterFunc(m.reconnectInterval, m.fireReconnect)
+}
+
+// fireReconnect runs when the debounce window elapses: it flags the disconnect
+// as deliberate (so connectionLoop skips the failure backoff) and closes the
+// connection, which makes readLoop return and connectionLoop re-dial. Bails
+// without reconnecting if Stop() cancelled the context while the timer was
+// pending.
+func (m *PriceFeedManager) fireReconnect() {
+	m.mu.Lock()
+	m.reconnectPending = false
+	m.reconnectTimer = nil
+	if m.ctx.Err() != nil {
+		m.mu.Unlock()
+		return
+	}
+	m.reconnectRequested = true
+	conn := m.conn
+	m.mu.Unlock()
+
+	if conn != nil {
+		// Close outside the lock (mirrors pingLoop). connectionLoop's fresh
+		// connect() sends the full current list at connect time.
+		_ = conn.Close()
 	}
 }
 
@@ -406,7 +497,13 @@ func (m *PriceFeedManager) connect() error {
 	return nil
 }
 
-// resubscribeAll sends the current full asset list to the WS. No-op if disconnected or empty.
+// resubscribeAll sends the current full asset list to the WS. No-op if
+// disconnected or empty.
+//
+// CONNECT-TIME ONLY: the CLOB market WS accepts a subscribe frame right after
+// the handshake but rejects any later one with "INVALID OPERATION" (issue #42).
+// Membership changes therefore go through requestReconnect, not this — the only
+// callers are connect() and the concurrency regression test (issue #48).
 func (m *PriceFeedManager) resubscribeAll() {
 	m.mu.RLock()
 	conn := m.conn

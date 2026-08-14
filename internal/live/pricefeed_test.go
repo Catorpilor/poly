@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -590,6 +591,260 @@ func TestPriceFeed_ConcurrentWSWrites_NoPanic(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// --- issue #42: reconnect-on-membership-change ---
+
+// recordedConn captures the subscribe frames seen on one WS connection.
+type recordedConn struct {
+	subFrames [][]string // each subscribe frame's asset list, in arrival order
+}
+
+// wsRecorder records every WS connection and the subscribe frames it received.
+// A mid-session subscribe (the rejected path we're removing) shows up as a
+// second frame on an already-established connection; the reconnect fix instead
+// produces a brand-new connection whose connect-time frame carries the full
+// list.
+type wsRecorder struct {
+	mu    sync.Mutex
+	conns []*recordedConn
+}
+
+func (r *wsRecorder) newConn() *recordedConn {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c := &recordedConn{}
+	r.conns = append(r.conns, c)
+	return c
+}
+
+func (r *wsRecorder) addSub(c *recordedConn, assets []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c.subFrames = append(c.subFrames, assets)
+}
+
+func (r *wsRecorder) connCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.conns)
+}
+
+// connSubs returns a copy of connection i's recorded subscribe frames.
+func (r *wsRecorder) connSubs(i int) [][]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if i < 0 || i >= len(r.conns) {
+		return nil
+	}
+	return append([][]string(nil), r.conns[i].subFrames...)
+}
+
+// startRecordingWSServer upgrades each connection and records its subscribe
+// frames, holding the connection open until the client closes it.
+func startRecordingWSServer(t *testing.T) (*wsRecorder, string) {
+	t.Helper()
+	rec := &wsRecorder{}
+	_, wsURL := startMockWSServer(t, func(c *websocket.Conn) {
+		rc := rec.newConn()
+		for {
+			mt, data, err := c.ReadMessage()
+			if err != nil {
+				return
+			}
+			if mt != websocket.TextMessage {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(string(data)), "PING") {
+				continue
+			}
+			var payload struct {
+				Type      string   `json:"type"`
+				AssetsIDs []string `json:"assets_ids"`
+			}
+			if err := json.Unmarshal(data, &payload); err == nil && payload.Type == "market" {
+				rec.addSub(rc, payload.AssetsIDs)
+			}
+		}
+	})
+	return rec, wsURL
+}
+
+// waitFor polls cond until it holds or the deadline passes.
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for: %s", what)
+}
+
+func waitConnected(t *testing.T, m *PriceFeedManager) {
+	t.Helper()
+	waitUntil(t, "ws connected", func() bool {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		return m.connected
+	})
+}
+
+func containsAll(list []string, want ...string) bool {
+	set := make(map[string]bool, len(list))
+	for _, s := range list {
+		set[s] = true
+	}
+	for _, w := range want {
+		if !set[w] {
+			return false
+		}
+	}
+	return true
+}
+
+func contains(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestPriceFeed_SubscribeAfterConnect_Reconnects: a mid-session Subscribe must
+// NOT push a subscribe frame onto the live connection (the server rejects that
+// with "INVALID OPERATION", issue #42). Instead it forces a fresh connection
+// whose connect-time subscribe carries the full list including the new token.
+func TestPriceFeed_SubscribeAfterConnect_Reconnects(t *testing.T) {
+	t.Parallel()
+	f := newStubFetcher()
+	rec, wsURL := startRecordingWSServer(t)
+	m := newPriceFeedManagerWithURL(f, wsURL)
+	m.reconnectInterval = 100 * time.Millisecond
+	defer m.Stop()
+
+	m.Subscribe("t1") // before Start → rides the connect-time subscribe
+	m.Start()
+	waitUntil(t, "conn #1 with its connect-time subscribe", func() bool {
+		return rec.connCount() == 1 && len(rec.connSubs(0)) == 1
+	})
+	waitConnected(t, m)
+
+	// Mid-session add.
+	m.Subscribe("t2")
+
+	waitUntil(t, "conn #2 (reconnect) with its subscribe", func() bool {
+		return rec.connCount() == 2 && len(rec.connSubs(1)) >= 1
+	})
+	subs2 := rec.connSubs(1)
+	if len(subs2) == 0 || !containsAll(subs2[0], "t1", "t2") {
+		t.Fatalf("conn #2 connect-time subscribe = %v, want it to include t1 and t2", subs2)
+	}
+	// The original connection must never have received a second subscribe frame.
+	if got := len(rec.connSubs(0)); got != 1 {
+		t.Errorf("conn #1 subscribe frames = %d, want 1 (no mid-session subscribe on a live conn)", got)
+	}
+}
+
+// TestPriceFeed_SubscribeBurst_CoalescesToOneReconnect: a burst of membership
+// changes must debounce into exactly ONE reconnect, not one per change.
+func TestPriceFeed_SubscribeBurst_CoalescesToOneReconnect(t *testing.T) {
+	t.Parallel()
+	f := newStubFetcher()
+	rec, wsURL := startRecordingWSServer(t)
+	m := newPriceFeedManagerWithURL(f, wsURL)
+	m.reconnectInterval = 250 * time.Millisecond
+	defer m.Stop()
+
+	m.Subscribe("t1")
+	m.Start()
+	waitUntil(t, "conn #1", func() bool { return rec.connCount() == 1 })
+	waitConnected(t, m)
+
+	// Rapid burst while connected — coalesces into one reconnect.
+	for _, tok := range []string{"t2", "t3", "t4", "t5"} {
+		m.Subscribe(tok)
+	}
+
+	waitUntil(t, "conn #2 (single coalesced reconnect) with its subscribe", func() bool {
+		return rec.connCount() == 2 && len(rec.connSubs(1)) >= 1
+	})
+	// No THIRD connection may appear after another debounce window elapses.
+	time.Sleep(3 * m.reconnectInterval)
+	if got := rec.connCount(); got != 2 {
+		t.Errorf("connections = %d, want exactly 2 (burst must coalesce to one reconnect)", got)
+	}
+	if subs := rec.connSubs(1); len(subs) == 0 || !containsAll(subs[0], "t1", "t2", "t3", "t4", "t5") {
+		t.Errorf("conn #2 subscribe = %v, want the full five-token list", subs)
+	}
+}
+
+// TestPriceFeed_Unsubscribe_ExcludedFromNextSubscribe: after Unsubscribe, the
+// next connection's connect-time subscribe must omit the dropped token.
+func TestPriceFeed_Unsubscribe_ExcludedFromNextSubscribe(t *testing.T) {
+	t.Parallel()
+	f := newStubFetcher()
+	rec, wsURL := startRecordingWSServer(t)
+	m := newPriceFeedManagerWithURL(f, wsURL)
+	m.reconnectInterval = 100 * time.Millisecond
+	defer m.Stop()
+
+	m.Subscribe("t1")
+	m.Subscribe("t2")
+	m.Start()
+	waitUntil(t, "conn #1 with both tokens", func() bool {
+		return rec.connCount() == 1 && len(rec.connSubs(0)) == 1 && containsAll(rec.connSubs(0)[0], "t1", "t2")
+	})
+	waitConnected(t, m)
+
+	m.Unsubscribe("t2")
+
+	waitUntil(t, "conn #2 (reconnect) with its subscribe", func() bool {
+		return rec.connCount() == 2 && len(rec.connSubs(1)) >= 1
+	})
+	got := rec.connSubs(1)
+	if len(got) == 0 || !contains(got[0], "t1") || contains(got[0], "t2") {
+		t.Errorf("conn #2 subscribe = %v, want [t1] without t2", got)
+	}
+}
+
+// TestPriceFeed_Stop_PendingDebounce_NoReconnect: Stop() during a pending
+// debounce must cancel the timer — no reconnect fires after Stop, and no
+// goroutine leaks (best-effort).
+func TestPriceFeed_Stop_PendingDebounce_NoReconnect(t *testing.T) {
+	baseline := runtime.NumGoroutine()
+	f := newStubFetcher()
+	rec, wsURL := startRecordingWSServer(t)
+	m := newPriceFeedManagerWithURL(f, wsURL)
+	m.reconnectInterval = 500 * time.Millisecond // long enough to Stop mid-pending
+	m.Subscribe("t1")
+	m.Start()
+	waitUntil(t, "conn #1", func() bool { return rec.connCount() == 1 })
+	waitConnected(t, m)
+
+	m.Subscribe("t2") // arms the debounce timer (connected)
+	m.Stop()          // before the timer fires
+
+	// Past the debounce window, no reconnect may have occurred.
+	time.Sleep(3 * m.reconnectInterval)
+	if got := rec.connCount(); got != 1 {
+		t.Errorf("connections = %d after Stop with a pending debounce, want 1 (no reconnect)", got)
+	}
+
+	// Best-effort goroutine-leak check: the loop/ping/timer goroutines should
+	// have wound down. Generous margin — the shared runtime carries other
+	// parallel tests' goroutines.
+	settled := baseline + 8
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && runtime.NumGoroutine() > settled {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := runtime.NumGoroutine(); got > settled {
+		t.Logf("goroutines after Stop = %d (baseline %d) — possible leak", got, baseline)
+	}
 }
 
 // startMockWSServer spins up an httptest server that upgrades to WebSocket and
