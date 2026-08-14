@@ -49,6 +49,10 @@ type Bot struct {
 	snipeAlerts  *snipeAlertRegistry
 	snipeSpend     *snipeSpendLedger
 	snipeDeepSpend *snipeSpendLedger
+	// snipeBought records tokens snipe-bought per recipient (in-band auto-buy
+	// or one-tap) — read by the Deep Crash holdings gate to avoid topping up a
+	// held corpse.
+	snipeBought    *snipeBoughtRecord
 	// snipeMarkets and snipeBuyExec are test seams for the snipe buy path;
 	// nil selects production (a fresh Gamma client / executeBuyOrderByIndex).
 	snipeMarkets *polymarket.MarketClient
@@ -141,6 +145,7 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 		snipeAlerts:    newSnipeAlertRegistry(),
 		snipeSpend:     newSnipeSpendLedger(snipeAutoBuyDailyCapUSD),
 		snipeDeepSpend: newSnipeSpendLedger(snipeDeepDailyCapUSD),
+		snipeBought:    newSnipeBoughtRecord(),
 	}
 
 	// Set bot as telegram sender for live manager

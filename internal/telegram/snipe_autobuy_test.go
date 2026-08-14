@@ -263,17 +263,25 @@ func (f *fakeSnipeUserRepo) GetByTelegramID(context.Context, int64) (*database.U
 
 // fakeAskSource is a fixed-answer SnipeAskSource.
 type fakeAskSource struct {
-	ask float64
-	ok  bool
+	ask   float64
+	askOK bool
+	bid   float64
+	bidOK bool
 }
 
-func (f *fakeAskSource) BestAsk(string) (float64, bool) { return f.ask, f.ok }
+func (f *fakeAskSource) BestAsk(string) (float64, bool) { return f.ask, f.askOK }
+func (f *fakeAskSource) BestBid(string) (float64, bool) { return f.bid, f.bidOK }
 
 type snipeHarnessConfig struct {
 	ask       float64
 	askOK     bool
+	bid       float64 // fresh best bid for Gate 2; used only when bidSet
+	bidOK     bool
+	bidSet    bool                    // false ⇒ harness defaults to a healthy bid == ask
 	user      *database.User          // nil = no wallet
 	buyResult *polymarket.TradeResult // nil = success with OrderID ord-auto
+	positions []*polymarket.Position  // Gate 3 positions-check seam (empty by default)
+	posErr    error                   // Gate 3 positions-check API error
 }
 
 // snipeAutoBuyHarness wires a Bot for NotifySnipeAlert / handleSnipeCallback
@@ -315,13 +323,21 @@ func newSnipeAutoBuyHarness(t *testing.T, cfg snipeHarnessConfig) *snipeAutoBuyH
 		buys.result = &polymarket.TradeResult{Success: true, OrderID: "ord-auto"}
 	}
 	watch := &fakeSnipeWatch{}
+	// Fresh bid for Gate 2 (corpse-spread). Default: a healthy tight book
+	// (bid == ask) so in-band auto-buys clear the gate; corpse tests set bidSet.
+	bid, bidOK := cfg.ask, true
+	if cfg.bidSet {
+		bid, bidOK = cfg.bid, cfg.bidOK
+	}
 	b := &Bot{
 		api:          api,
 		userRepo:     &fakeSnipeUserRepo{user: cfg.user},
-		snipeFeed:    &fakeAskSource{ask: cfg.ask, ok: cfg.askOK},
+		snipeFeed:    &fakeAskSource{ask: cfg.ask, askOK: cfg.askOK, bid: bid, bidOK: bidOK},
 		snipeAlerts:    newSnipeAlertRegistry(),
 		snipeSpend:     newSnipeSpendLedger(snipeAutoBuyDailyCapUSD),
 		snipeDeepSpend: newSnipeSpendLedger(snipeDeepDailyCapUSD),
+		snipeBought:    newSnipeBoughtRecord(),
+		snipePositions: &fakePositionSource{positions: cfg.positions, err: cfg.posErr},
 		snipeWatcher:   watch,
 		snipeMarkets: polymarket.NewMarketClientWithURL(gamma.URL),
 	}
