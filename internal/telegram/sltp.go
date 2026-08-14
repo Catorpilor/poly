@@ -110,6 +110,11 @@ func (b *Bot) handleSLTPList(ctx context.Context, update *tgbotapi.Update) {
 	}, 10*time.Minute)
 }
 
+// sltpCoverageTolerance is the dust threshold (shares) below which a TP-only
+// arm's SharesAtArm/position mismatch isn't worth flagging — matches the CLOB's
+// 2-decimal size precision and the monitor's reconciliation tolerance.
+const sltpCoverageTolerance = 0.01
+
 func sltpRowForPosition(i int, pos *polymarket.Position, existing *database.SLTPArm) []tgbotapi.InlineKeyboardButton {
 	title := truncateUTF8(pos.MarketTitle, 22)
 	sharesStr := polymarket.FormatShares(pos.Shares)
@@ -118,6 +123,13 @@ func sltpRowForPosition(i int, pos *polymarket.Position, existing *database.SLTP
 		prefix := "⏹ Disarm"
 		if existing.TPArmed && !existing.SLArmed {
 			prefix = "⏹ Disarm (SL only gone)"
+			// TP-only auto-arms extend coverage to the whole position; surface an
+			// honest marker while the snapshot still lags the wallet (the sweep
+			// reconciles it upward, so a mismatch is transient). Manual TP+SL arms
+			// (below) freeze their snapshot deliberately and are never flagged.
+			if posShares := sharesBigIntToFloat(pos.Shares); existing.SharesAtArm+sltpCoverageTolerance < posShares {
+				prefix = fmt.Sprintf("⏹ Disarm ⚠ %.0f/%.0f sh", existing.SharesAtArm, posShares)
+			}
 		} else if !existing.TPArmed && existing.SLArmed {
 			prefix = "⏹ Disarm (SL only)"
 		}
@@ -422,6 +434,33 @@ func (b *Bot) ExecuteSell(ctx context.Context, arm *database.SLTPArm, sharesRaw 
 	}
 
 	return b.executeSellOrderFromPosition(ctx, user, pos, 0, sharesRaw, limitPrice, orderType)
+}
+
+// CurrentSharesRaw implements live.HoldingReader: the recipient's current share
+// balance for the arm's token in 6-decimal raw units, read via the SAME Data
+// API positions source the snipe holdings checks use (no new read path). It
+// feeds TP-only auto-arm coverage extension. ok=false on any failure (no user
+// or proxy, API error, token not held) so the monitor falls back to the arm's
+// SharesAtArm snapshot.
+func (b *Bot) CurrentSharesRaw(ctx context.Context, arm *database.SLTPArm) (int64, bool) {
+	user, err := b.userRepo.GetByTelegramID(ctx, arm.TelegramID)
+	if err != nil || user == nil || user.ProxyAddress == "" {
+		return 0, false
+	}
+	scanner := b.snipePositions
+	if scanner == nil {
+		scanner = polymarket.NewUnifiedPositionScanner()
+	}
+	positions, err := scanner.GetPositions(ctx, common.HexToAddress(user.ProxyAddress))
+	if err != nil {
+		return 0, false
+	}
+	for _, pos := range positions {
+		if pos.TokenID == arm.TokenID && pos.Shares != nil && pos.Shares.Sign() > 0 {
+			return pos.Shares.Int64(), true
+		}
+	}
+	return 0, false
 }
 
 // NotifySLExitPending implements live.Notifier. Sent at most once per breach

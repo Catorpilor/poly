@@ -61,6 +61,13 @@ type SLTPArmRepository interface {
 	// clause is the monotonic ratchet guard under concurrent evaluations — or
 	// when the row is gone (disarmed mid-evaluation).
 	UpdateHWM(ctx context.Context, telegramID int64, tokenID string, hwm float64) error
+
+	// UpdateSharesAtArm raises shares_at_arm for (telegramID, tokenID) to shares.
+	// Monotonic UP only (WHERE shares_at_arm < $n): a TP-only auto-arm's coverage
+	// extends to the whole position as manual tranches are added, but never
+	// shrinks (the reactive shortfall clamp handles a smaller wallet). Used by
+	// the sweep reconciliation; AvgPrice/HWM/flags are never touched.
+	UpdateSharesAtArm(ctx context.Context, telegramID int64, tokenID string, shares float64) error
 }
 
 type sltpArmRepo struct {
@@ -253,6 +260,17 @@ func (r *sltpArmRepo) UpdateHWM(ctx context.Context, telegramID int64, tokenID s
 		WHERE telegram_id = $1 AND token_id = $2 AND high_water_mark < $3`
 	if _, err := r.db.Pool.Exec(ctx, query, telegramID, tokenID, hwm); err != nil {
 		return fmt.Errorf("failed to update high_water_mark: %w", err)
+	}
+	return nil
+}
+
+// UpdateSharesAtArm raises shares_at_arm monotonically (mirrors UpdateHWM's
+// guard). See the interface doc for the coverage rationale.
+func (r *sltpArmRepo) UpdateSharesAtArm(ctx context.Context, telegramID int64, tokenID string, shares float64) error {
+	query := `UPDATE sltp_arms SET shares_at_arm = $3
+		WHERE telegram_id = $1 AND token_id = $2 AND shares_at_arm < $3`
+	if _, err := r.db.Pool.Exec(ctx, query, telegramID, tokenID, shares); err != nil {
+		return fmt.Errorf("failed to update shares_at_arm: %w", err)
 	}
 	return nil
 }

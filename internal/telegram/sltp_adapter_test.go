@@ -180,6 +180,50 @@ func TestSLTPRowForPosition_ArmedShowsDisarm(t *testing.T) {
 	}
 }
 
+// TestSLTPRowForPosition_Coverage covers feat/auto-arm-full-coverage's honest
+// list: a TP-only arm whose SharesAtArm lags the position's shares shows a
+// coverage marker; a covered TP-only arm and a manual TP+SL arm do not.
+func TestSLTPRowForPosition_Coverage(t *testing.T) {
+	t.Parallel()
+	pos := &polymarket.Position{
+		MarketTitle: "LoL final",
+		TokenID:     "tokX",
+		Outcome:     "T1",
+		Shares:      big.NewInt(93_000_000), // 93 shares
+	}
+
+	t.Run("TP-only under-covered shows coverage warning", func(t *testing.T) {
+		t.Parallel()
+		arm := &database.SLTPArm{ID: 7, TPArmed: true, SLArmed: false, SharesAtArm: 50}
+		row := sltpRowForPosition(0, pos, arm)
+		text := row[0].Text
+		if !strings.Contains(text, "⚠") || !strings.Contains(text, "50/93") {
+			t.Errorf("under-covered TP-only row missing coverage marker: %q", text)
+		}
+		if *row[0].CallbackData != "sltp:off:7" {
+			t.Errorf("callback = %v, want sltp:off:7", row[0].CallbackData)
+		}
+	})
+
+	t.Run("TP-only fully covered shows no warning", func(t *testing.T) {
+		t.Parallel()
+		arm := &database.SLTPArm{ID: 8, TPArmed: true, SLArmed: false, SharesAtArm: 93}
+		text := sltpRowForPosition(0, pos, arm)[0].Text
+		if strings.Contains(text, "⚠") {
+			t.Errorf("covered TP-only row must not warn: %q", text)
+		}
+	})
+
+	t.Run("manual TP+SL under-covered is NOT flagged (deliberate freeze)", func(t *testing.T) {
+		t.Parallel()
+		arm := &database.SLTPArm{ID: 9, TPArmed: true, SLArmed: true, SharesAtArm: 50}
+		text := sltpRowForPosition(0, pos, arm)[0].Text
+		if strings.Contains(text, "⚠") {
+			t.Errorf("manual arm coverage is a deliberate freeze, must not warn: %q", text)
+		}
+	})
+}
+
 func TestSLTPRowForPosition_UnarmedShowsArm(t *testing.T) {
 	t.Parallel()
 	pos := &polymarket.Position{

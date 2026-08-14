@@ -24,6 +24,8 @@ type fakeStore struct {
 	disarmCalls  int
 	// updateHWMCalls records every UpdateHWM invocation's hwm argument.
 	updateHWMCalls []float64
+	// updateSharesCalls records every UpdateSharesAtArm invocation's argument.
+	updateSharesCalls []float64
 	// disarmFailN makes the next N Disarm calls fail with a generic error
 	// (simulates a transient DB outage; not ErrSLTPArmNotFound).
 	disarmFailN int
@@ -110,6 +112,29 @@ func (s *fakeStore) UpdateHWM(_ context.Context, telegramID int64, tokenID strin
 		}
 	}
 	return nil
+}
+
+func (s *fakeStore) UpdateSharesAtArm(_ context.Context, telegramID int64, tokenID string, shares float64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.updateSharesCalls = append(s.updateSharesCalls, shares)
+	for _, a := range s.byToken[tokenID] {
+		// Monotonic up, mirroring the SQL guard.
+		if a.TelegramID == telegramID && a.SharesAtArm < shares {
+			a.SharesAtArm = shares
+		}
+	}
+	return nil
+}
+
+// storedSharesAtArm returns the fake's shares_at_arm for the first arm on tokenID.
+func (s *fakeStore) storedSharesAtArm(tokenID string) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if arms := s.byToken[tokenID]; len(arms) > 0 {
+		return arms[0].SharesAtArm
+	}
+	return -1
 }
 
 // storedHWM returns the fake's high_water_mark for the first arm on tokenID.
@@ -282,6 +307,26 @@ func (f *fakeFeed) emit(tokenID string) {
 	for _, l := range listeners {
 		l(tokenID)
 	}
+}
+
+// fakeHoldings is a scripted HoldingReader: per-token current balance in raw
+// 6-decimal units, and a failure flag to exercise the fall-back-to-snapshot path.
+type fakeHoldings struct {
+	mu    sync.Mutex
+	raw   map[string]int64
+	fail  bool
+	calls int
+}
+
+func (h *fakeHoldings) CurrentSharesRaw(_ context.Context, arm *database.SLTPArm) (int64, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.calls++
+	if h.fail {
+		return 0, false
+	}
+	raw, ok := h.raw[arm.TokenID]
+	return raw, ok
 }
 
 type fakeExecutor struct {

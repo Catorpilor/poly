@@ -25,6 +25,22 @@ type SLTPArmStore interface {
 	// UpdateHWM raises high_water_mark; a no-op when the stored value is
 	// already >= hwm (monotonic ratchet, guarded in SQL).
 	UpdateHWM(ctx context.Context, telegramID int64, tokenID string, hwm float64) error
+
+	// UpdateSharesAtArm raises shares_at_arm monotonically up (SQL-guarded).
+	// Used by the sweep to reconcile TP-only auto-arm coverage to the whole
+	// position.
+	UpdateSharesAtArm(ctx context.Context, telegramID int64, tokenID string, shares float64) error
+}
+
+// HoldingReader reports a recipient's CURRENT share balance for an arm's token,
+// in 6-decimal raw units. It is the coverage source for TP-only auto-arms
+// (SLArmed=false): those extend their sell coverage to the whole live position
+// (manual tranches included) rather than the fill snapshot, because SharesAtArm
+// there is a mechanical fill number, not a deliberate user freeze. ok=false on
+// any failure ⇒ callers fall back to SharesAtArm (today's behavior). The
+// production impl reuses the bot's existing positions read — no new source.
+type HoldingReader interface {
+	CurrentSharesRaw(ctx context.Context, arm *database.SLTPArm) (int64, bool)
 }
 
 // PriceFeedSubscriber is the subset of PriceFeedManager the monitor needs.
@@ -141,6 +157,11 @@ const sltpSweepInitialDelay = 2 * time.Minute
 // Resolution lags the game by minutes-to-hours, so hourly is plenty.
 const sltpSweepInterval = 1 * time.Hour
 
+// sltpShareCoverageTolerance is the dust threshold (in shares) below which a
+// TP-only coverage gain is ignored — the CLOB truncates sizes to 2 decimals, so
+// sub-0.01-share deltas can't matter and would only churn reconciliation writes.
+const sltpShareCoverageTolerance = 0.01
+
 // minSellSizeRaw is the smallest order size the CLOB can express, in 6-decimal
 // raw units: sizes are truncated to 2 decimals, so anything below 0.01 shares
 // can never be part of a valid order.
@@ -216,6 +237,10 @@ type SLTPMonitor struct {
 	// nil (the default) disables the sweeper. Set before Start — read
 	// unguarded, matching the SetX wiring pattern.
 	closedChecker ClosedMarketChecker
+	// holdings reads a user's current share balance for TP-only auto-arm
+	// coverage. nil (the default) disables coverage extension — fire/sweep use
+	// SharesAtArm exactly as today. Set before Start, like closedChecker.
+	holdings HoldingReader
 
 	mu            sync.Mutex
 	pauseNotified map[int64]bool      // telegramID -> notified at window start
@@ -256,6 +281,29 @@ func NewSLTPMonitor(
 // called before Start.
 func (m *SLTPMonitor) SetClosedMarketChecker(c ClosedMarketChecker) {
 	m.closedChecker = c
+}
+
+// SetHoldingReader wires the current-holding source for TP-only auto-arm
+// coverage. nil keeps coverage extension disabled (fire/sweep use SharesAtArm).
+// Must be called before Start.
+func (m *SLTPMonitor) SetHoldingReader(h HoldingReader) {
+	m.holdings = h
+}
+
+// tpOnlyCurrentShares returns the recipient's current holding (in shares) for a
+// TP-only auto-arm, or (0,false) for a manual TP+SL arm, an unset reader, or any
+// read failure. Callers take max(this, SharesAtArm-derived): coverage only ever
+// extends up, and the reactive shortfall clamp still caps a Data-API-lag
+// over-request. Manual (SLArmed=true) arms keep their deliberate frozen snapshot.
+func (m *SLTPMonitor) tpOnlyCurrentShares(arm *database.SLTPArm) (float64, bool) {
+	if arm.SLArmed || m.holdings == nil {
+		return 0, false
+	}
+	raw, ok := m.holdings.CurrentSharesRaw(m.ctx, arm)
+	if !ok {
+		return 0, false
+	}
+	return float64(raw) / 1e6, true
 }
 
 // Start seeds WS subscriptions from the DB, registers the update handler, and
@@ -434,6 +482,7 @@ func (m *SLTPMonitor) sweepClosedArms() {
 	for _, arm := range arms {
 		if !closedByCondition[arm.ConditionID] {
 			kept++
+			m.reconcileCoverage(arm)
 			continue
 		}
 		// ErrSLTPArmNotFound is tolerated: the row vanished under us (manual
@@ -462,6 +511,23 @@ func (m *SLTPMonitor) sweepClosedArms() {
 	// A quiet no-op sweep (everything open, no errors) logs nothing.
 	if swept > 0 || errCount > 0 {
 		log.Printf("SLTPMonitor sweep: swept=%d kept=%d errors=%d", swept, kept, errCount)
+	}
+}
+
+// reconcileCoverage keeps a TP-only auto-arm's SharesAtArm in step with the
+// whole position: if the wallet now holds more than the fill snapshot (manual
+// tranches added after the auto-arm), persist SharesAtArm upward so the list
+// shows honest coverage and a fire before the next holdings read still sizes
+// close. Upward only; AvgPrice/HWM/flags are never touched. Manual TP+SL arms
+// keep their deliberate frozen snapshot (tpOnlyCurrentShares returns false for
+// them). A dust-sized gain is ignored so the sweep doesn't churn writes.
+func (m *SLTPMonitor) reconcileCoverage(arm *database.SLTPArm) {
+	cur, ok := m.tpOnlyCurrentShares(arm)
+	if !ok || cur <= arm.SharesAtArm+sltpShareCoverageTolerance {
+		return
+	}
+	if err := m.store.UpdateSharesAtArm(m.ctx, arm.TelegramID, arm.TokenID, cur); err != nil {
+		log.Printf("SLTPMonitor sweep: reconcile shares for %d/%s: %v", arm.TelegramID, arm.TokenID, err)
 	}
 }
 
@@ -567,7 +633,15 @@ func (m *SLTPMonitor) fireTP(arm *database.SLTPArm, bid float64) {
 		return
 	}
 
-	sharesRaw := int64(arm.SharesAtArm * database.TPSellFraction * 1e6)
+	// Coverage basis: SharesAtArm for a manual TP+SL arm (deliberate freeze);
+	// max(snapshot, current holding) for a TP-only auto-arm so the fraction is
+	// taken off the WHOLE position (manual tranches included), never just the
+	// fill snapshot. The reactive shortfall clamp still caps a shrunken wallet.
+	basis := arm.SharesAtArm
+	if cur, ok := m.tpOnlyCurrentShares(arm); ok && cur > basis {
+		basis = cur
+	}
+	sharesRaw := int64(basis * database.TPSellFraction * 1e6)
 	if sharesRaw <= 0 {
 		return
 	}
@@ -889,9 +963,18 @@ func (m *SLTPMonitor) fireCeilingTP(arm *database.SLTPArm, bid float64) {
 		return
 	}
 
+	// Frozen-snapshot remainder (manual TP+SL, unchanged): the whole snapshot if
+	// the 2× TP hasn't fired, else the post-TP remainder.
 	remaining := arm.SharesAtArm
 	if !arm.TPArmed {
 		remaining = arm.SharesAtArm * (1 - database.TPSellFraction)
+	}
+	// TP-only auto-arms sell the whole CURRENT holding. The live balance already
+	// nets any earlier TP sale, so it replaces the snapshot remainder when
+	// larger (manual tranches); the reactive clamp caps a Data-API-lag
+	// over-request. Manual arms keep the frozen remainder above.
+	if cur, ok := m.tpOnlyCurrentShares(arm); ok && cur > remaining {
+		remaining = cur
 	}
 	sharesRaw := int64(remaining * 1e6)
 	if sharesRaw <= 0 {
