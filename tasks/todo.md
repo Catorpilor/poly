@@ -1,29 +1,24 @@
-# Snipe auto-buy gates — stop catching falling knives
+# Auto-arm TP+ceiling on snipe fills (no trailing SL)
 
-Decisions (grilled 2026-08-14, evidence: ledger + monitor tape Aug 4–14):
-- Knife rate since Aug 13: 14/22 alert episodes collapsed to corpse zone; deep tier 0/11 fires, −$54.78
-- NO dwell-delay: the biggest winners (HANJIN +$84, WE +$56) bounced within minutes — a delay + the ≤0.30 repricing guard would have missed them
-- Gate 1 — **Sport gate**: auto-buy ($10 in-band AND $5 deep) only for esports markets; tennis (0/5), football (0/1), and unclassifiable markets become alert-only with tap buttons intact
-- Gate 2 — **Spread-geometry gate** (in-band $10 only): at buy time fetch the fresh book; skip the auto-buy when fresh bid < ask/3 (Tempo corpse signature ≈0.22×, 2/2 on funded losers). Alert still sends, falls back to manual buttons
-- Gate 3 — **Deep holdings gate** ($5 deep only): skip the $5 when the recipient already holds shares of the crashed side — positions API check OR the bot's own in-episode buy record (Data API can lag a just-filled buy). Deep alert + corpse warning still send. Deep buy remains as catch-up entry when the in-band buy never funded
-- Alerts and manual tap buttons unchanged everywhere; gates apply to auto-buys only
-- Ledger memory must record the policy-regime boundary (2026-08-14) for the September review
-- Implementation by opus subagent, TDD, branch + PR + deploy
+Decisions (grilled 2026-08-14 PM, after the AL episode):
+- AL revisit verdict: SL exit was correct (game over, salvaged ~$1) — but the ledger says trailing SLs on snipe tranches truncate the 5× tail the band needs (r22 −$31 counterfactual; wick-amputations r12/r17). TP+ceiling exits made every big winner.
+- Every snipe fill (in-band $10 auto, deep $5 auto, one-tap $10/$25) auto-arms **TP + ceiling only** (`TPArmed=true, SLArmed=false`) — max loss stays the stake; winners get harvested mechanically.
+- Existing arm for (user, token) ⇒ skip (never clobber; a later manual arm re-arms normally and wins).
+- Arm data must not race the Data API (the #67 lesson): prefer fill data (VWAP price, fill shares); position read only as enrichment when fresh.
+- Auto-arm failure is log-only — never blocks the buy or the alert.
+- User gets the standard "Armed" confirmation, worded TP-only.
+- Version v0.17.0; CONTEXT.md Comeback Snipe + Arm entries updated; ledger memory gets the second same-day regime note.
 
 ## Plan
 
-- [x] RED: failing tests for the three gates + sport classifier
-- [x] GREEN: minimal implementation
-- [x] REFACTOR + `go test ./...` + `-race`
-- [x] CONTEXT.md: update Comeback Snipe / Deep Crash entries with gate semantics
-- [ ] PR, merge, tag, deploy
-- [ ] Mark policy boundary in snipe ledger memory
+- [x] RED: failing tests (arm created TP-only from fill data; skip when arm exists; failure is log-only; watcher registration)
+- [x] GREEN + REFACTOR, full suite + -race (verified independently)
+- [x] CONTEXT.md + ledger memory regime note
+- [ ] PR, merge, tag v0.17.0, deploy
 
 ## Review
 
-All in `internal/telegram/snipe.go` (+ Bot field wiring, test seams):
-- Gate 1 hooks at the top of `snipeAutoBuy` and `snipeDeepAutoBuy`; classifier is a word-boundary regex over a tunable marker allowlist (hardened post-subagent: bare substrings false-positived on "Lecce"/"Alec" — caught in review, fixed TDD).
-- Gate 2 lives in `snipeGuardedBuyRefuse` behind a `corpseGuard` flag — only the in-band auto-buy passes true; deep and manual taps unaffected. `SnipeAskSource` gained `BestBid` (same fresh-book read as the ask guard). Missing/zero bid ⇒ treated as corpse ⇒ skip.
-- Gate 3: `snipeBoughtRecord` (in-memory per-chat token set, written on in-band auto-buy + tap buy, never on deep) + `snipeHoldsPosition` (Data API via the existing `snipePositions` seam). Either showing exposure skips the $5; positions error falls back to the record alone.
-- Distinct skip outcomes/log lines (`snipeBuyNotEsports`, `snipeBuyCorpseSpread`, `snipeBuyDeepHeld`) so the ledger can attribute skips.
-- 18 new tests; full suite + `-race -count=1` green, verified independently.
+- New repo method `ArmTPOnly` (sl_armed=FALSE; upsert mirrors `Arm`, so manual re-arm restores full TP+SL) — required because `Arm`'s SQL hardcodes both flags TRUE.
+- `snipeAutoArmTPOnly` helper wired after all three snipe fill sites (in-band, deep, tap), async, log-only failures, no-clobber via GetByUserAndToken.
+- Arm data from the fill itself (#67 lesson): filledPrice or fresh-ask fallback (delayed orders report no fill fields — the 07-20 lesson), shares = stake/price fallback; `WatchArmed` reuses the in-hand Gamma market, no refetch.
+- 6 new tests incl. no-clobber, repo-error isolation, and TP-only message wording; one test-side race fixed (await terminal DM, not intermediate effect).

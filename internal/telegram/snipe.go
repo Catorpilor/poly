@@ -564,6 +564,9 @@ func (b *Bot) snipeDeepAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyR
 			chatID, market.TokenID, res.outcome, res.err, res.errorMsg)
 		return res, 0, snipeAutoSkipped
 	}
+	// Auto-arm TP + ceiling (no trailing SL) from the fill — async, never blocks
+	// alert delivery.
+	go b.snipeAutoArmTPOnly(chatID, market.TokenID, market.Question, market.Outcome, res, snipeDeepBuyUSD)
 	log.Printf("Snipe deep-buy: accepted chat=%d token=%.12s… $%.0f order=%s pool-left=$%.2f",
 		chatID, market.TokenID, snipeDeepBuyUSD, res.orderID, poolLeft)
 	return res, poolLeft, snipeAutoBought
@@ -593,6 +596,95 @@ func (b *Bot) snipeHoldsPosition(ctx context.Context, user *database.User, token
 		}
 	}
 	return false, true
+}
+
+// snipeAutoArmTPOnly arms TP + ceiling only (no trailing SL) on a freshly
+// snipe-bought token. Rationale (user-ratified): a trailing SL on a snipe
+// tranche amputates the 5× tail the band's economics need (wick-amputations in
+// gapped in-play books), while TP + the $0.95 ceiling harvested every big
+// winner. One arm per user per token: an existing arm is never clobbered — a
+// later MANUAL arm re-arms over it with the full TP+SL.
+//
+// Run with `go`: the tick-size fetch and DB write must never block alert
+// delivery or the buy flow (design constraint), and every failure here is
+// log-only. Arm data comes from the FILL, never a Data API positions read
+// (issue #67 lag): price is the confirmed fill VWAP, or the guard's fresh ask
+// for a delayed in-play order; shares are the filled size, or stake/price when
+// the fill size is still unconfirmed.
+func (b *Bot) snipeAutoArmTPOnly(chatID int64, tokenID, question, outcome string, res snipeBuyResult, stake float64) {
+	if b.sltpArmRepo == nil || res.market == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if existing, _ := b.sltpArmRepo.GetByUserAndToken(ctx, chatID, tokenID); existing != nil {
+		log.Printf("Snipe auto-arm: arm already exists chat=%d token=%.12s… — skipping", chatID, tokenID)
+		return
+	}
+
+	price := res.filledPrice
+	if price <= 0 {
+		price = res.ask // delayed in-play fill: the guard ask is our best price estimate
+	}
+	if price <= 0 {
+		log.Printf("Snipe auto-arm: no fill price chat=%d token=%.12s… — skipping", chatID, tokenID)
+		return
+	}
+	shares := res.filledSize
+	if shares <= 0 {
+		shares = stake / price // derive from stake when the executor didn't confirm a size
+	}
+
+	marketID := res.market.ID
+	arm := &database.SLTPArm{
+		TelegramID:  chatID,
+		TokenID:     tokenID,
+		ConditionID: res.market.ConditionID,
+		MarketID:    &marketID,
+		Outcome:     normalizeOutcome(outcome),
+		AvgPrice:    price,
+		SharesAtArm: shares,
+		TickSize:    b.armTickSize(ctx, tokenID),
+		NegRisk:     res.market.NegRisk,
+		TPArmed:     true,
+		SLArmed:     false,
+	}
+	saved, err := b.sltpArmRepo.ArmTPOnly(ctx, arm)
+	if err != nil {
+		log.Printf("Snipe auto-arm: %d/%.12s…: %v", chatID, tokenID, err)
+		return
+	}
+
+	// Mirror the manual arm flow: inform the SL/TP monitor and add the snipe
+	// watcher's armed source — but reuse the market already in hand rather than
+	// re-fetching Gamma (the manual path's registerSnipeArmed does), keeping it
+	// lag-free (issue #67).
+	if b.sltpMonitor != nil {
+		b.sltpMonitor.SubscribeFor(saved.TokenID)
+	}
+	if b.snipeWatcher != nil {
+		b.snipeWatcher.WatchArmed(snipeMarketFromGamma(res.market, tokenID, outcome))
+	}
+	b.sendMessage(chatID, snipeAutoArmedText(question, outcome, saved))
+}
+
+// snipeAutoArmedText is the TP-only auto-arm confirmation — no trailing-stop
+// line, and it states plainly that the stake is the max loss (there is no
+// stop). Pure — table-tested.
+func snipeAutoArmedText(title, outcome string, arm *database.SLTPArm) string {
+	return fmt.Sprintf(
+		"🎯 *Auto-armed (TP only)* %s %s\n\n"+
+			"• Entry: $%.4f\n"+
+			"• TP: bid ≥ $%.4f → sell %.0f%%, then ride to the $%.2f ceiling\n"+
+			"• No stop-loss — max loss is your ~$%.2f stake.\n\n"+
+			"Snipe tranches keep their tail; tap 🎯 SL/TP to manage it manually.",
+		title, outcome,
+		arm.AvgPrice,
+		arm.TPTriggerPrice(), database.TPSellFraction*100,
+		database.CeilingTPPrice,
+		arm.SharesAtArm*arm.AvgPrice,
+	)
 }
 
 // snipeAutoStatus classifies a snipeAutoBuy attempt for messaging.
@@ -650,6 +742,9 @@ func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResul
 	if b.snipeBought != nil {
 		b.snipeBought.mark(chatID, market.TokenID)
 	}
+	// Auto-arm TP + ceiling (no trailing SL) from the fill — async, never blocks
+	// alert delivery.
+	go b.snipeAutoArmTPOnly(chatID, market.TokenID, market.Question, market.Outcome, res, snipeAutoBuyUSD)
 	log.Printf("Snipe auto-buy: accepted chat=%d token=%.12s… $%.0f order=%s cap-left=$%.2f",
 		chatID, market.TokenID, snipeAutoBuyUSD, res.orderID, capLeft)
 	return res, capLeft, snipeAutoBought
@@ -679,6 +774,16 @@ type snipeBuyResult struct {
 	err      error   // snipeBuyMarketErr
 	orderID  string  // snipeBuyFilled
 	errorMsg string  // snipeBuyRejected
+	// Fill context for the TP-only auto-arm (snipeBuyFilled only). market
+	// supplies ConditionID / NegRisk / outcomes / gameStart without a refetch;
+	// idx is the bought token's outcome index. filledSize/filledPrice come from
+	// the executor but are 0 for a delayed in-play order — the auto-arm then
+	// derives shares from stake and price from the guard ask (issue #67: never
+	// block on a Data API positions read).
+	market      *polymarket.GammaMarket
+	idx         int
+	filledSize  float64
+	filledPrice float64
 }
 
 // snipeRefuseDeepBuy is the Deep Crash buy guard (ADR 0007): strict zone
@@ -753,7 +858,10 @@ func (b *Bot) snipeGuardedBuyRefuse(ctx context.Context, user *database.User, en
 	if b.snipeWatcher != nil {
 		b.snipeWatcher.MarkBought(entry.tokenID)
 	}
-	return snipeBuyResult{outcome: snipeBuyFilled, ask: ask, orderID: result.OrderID}
+	return snipeBuyResult{
+		outcome: snipeBuyFilled, ask: ask, orderID: result.OrderID,
+		market: market, idx: idx, filledSize: result.FilledSize, filledPrice: result.AveragePrice,
+	}
 }
 
 // handleSnipeCallback executes the one-tap snipe buy.
@@ -813,6 +921,8 @@ func (b *Bot) handleSnipeCallback(ctx context.Context, update *tgbotapi.Update) 
 		if b.snipeBought != nil {
 			b.snipeBought.mark(chatID, entry.tokenID)
 		}
+		// Auto-arm TP + ceiling (no trailing SL) from the fill — async.
+		go b.snipeAutoArmTPOnly(chatID, entry.tokenID, entry.question, entry.outcome, res, amount)
 		keyboard := tgbotapi.NewInlineKeyboardMarkup(
 			tgbotapi.NewInlineKeyboardRow(
 				tgbotapi.NewInlineKeyboardButtonData("🎯 Arm SL/TP", "sltp_list"),
