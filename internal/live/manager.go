@@ -546,6 +546,29 @@ func (m *LiveTradeManager) snipeWatchEvent(eventSlug string, eventInfo *EventInf
 	m.snipeWatcher.WatchEventMarkets(eventSlug, snipeMarketsFor(m.eventSnipeMarkets(eventSlug, eventInfo)))
 }
 
+// RegisterHeldBuy makes the buyer of tokenID a Held Watch holder, so a
+// comeback-snipe crash on the token they just bought reaches them even without
+// an open positions/SLTP view (issue #64). Nil-safe (no watcher or no event is
+// a no-op). It searches ALL of the event's markets — the buy may target a
+// sub-market that the Moneyline resolution excludes — and never touches the
+// bought latch, which is token-level and would silence every holder.
+func (m *LiveTradeManager) RegisterHeldBuy(telegramID int64, eventSlug, tokenID string, eventInfo *EventInfo) {
+	if m.snipeWatcher == nil || eventInfo == nil {
+		return
+	}
+	markets := make([]*MarketInfo, 0, len(eventInfo.Markets))
+	for i := range eventInfo.Markets {
+		markets = append(markets, &eventInfo.Markets[i])
+	}
+	for _, sm := range snipeMarketsFor(markets) {
+		if sm.TokenID == tokenID {
+			m.snipeWatcher.WatchHeld(telegramID, sm, SnipeHeldTTL)
+			return
+		}
+	}
+	log.Printf("LiveTradeManager: RegisterHeldBuy unknown token=%.12s… event=%s", tokenID, eventSlug)
+}
+
 // snipeUnwatchIfUnsubscribed releases an event's snipe watch when its last
 // subscriber (telegram or web) is gone.
 func (m *LiveTradeManager) snipeUnwatchIfUnsubscribed(eventSlugs ...string) {

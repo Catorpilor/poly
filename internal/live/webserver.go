@@ -2,6 +2,7 @@ package live
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -67,6 +68,12 @@ type liveWatchManager interface {
 // deliberately uncapped.
 const maxLiveWatchesPerUser = 30
 
+// webTradeExecutor is the slice of the trade executor the web buy path drives.
+// *polymarket.TradeExecutor satisfies it in production; tests inject a fake.
+type webTradeExecutor interface {
+	Execute(ctx context.Context, privateKey *ecdsa.PrivateKey, proxyAddress common.Address, req *polymarket.TradeRequest) (*polymarket.TradeResult, error)
+}
+
 // WebServer serves the live monitoring web interface
 type WebServer struct {
 	liveManager    *LiveTradeManager
@@ -79,8 +86,11 @@ type WebServer struct {
 	userRepo       repositories.UserRepository
 	walletManager  *wallet.Manager
 	tradingClient  *polymarket.TradingClient
-	tradeExecutor  *polymarket.TradeExecutor
-	allowedHost    string // hostname from LIVE_WEB_URL, allowed alongside localhost/IP literals
+	// tradeExecutor runs the per-trade ceremony. Held behind an interface so
+	// handler tests can inject a fake; in production it is a
+	// *polymarket.TradeExecutor.
+	tradeExecutor webTradeExecutor
+	allowedHost   string // hostname from LIVE_WEB_URL, allowed alongside localhost/IP literals
 	// watches is the Live Watch surface of liveManager, held behind an
 	// interface so handler tests can inject a fake. In production it is the
 	// same *LiveTradeManager as liveManager.
@@ -979,6 +989,11 @@ func (ws *WebServer) handleTrade(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(webTradeResponse{Success: false, Error: result.ErrorMsg})
 		return
 	}
+
+	// Every successful buy makes the buyer a Held Watch holder, so a
+	// comeback-snipe crash on the token they now hold reaches them even without
+	// an open positions view (issue #64). Off the response path.
+	go ws.liveManager.RegisterHeldBuy(user.TelegramID, req.Trade.EventSlug, tokenID, eventInfo)
 
 	json.NewEncoder(w).Encode(webTradeResponse{
 		Success: true,

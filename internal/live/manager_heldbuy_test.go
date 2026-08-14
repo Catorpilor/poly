@@ -1,0 +1,85 @@
+package live
+
+import (
+	"testing"
+	"time"
+)
+
+// heldStateOf reads a token's snipe state directly (white-box, same package).
+func heldStateOf(t *testing.T, w *SnipeWatcher, tokenID string) *snipeTokenState {
+	t.Helper()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.tokens[tokenID]
+}
+
+// RegisterHeldBuy is the buy-side seam of the Held Watch invariant (issue #64):
+// a successful BUY makes its buyer a holder, so a comeback-snipe crash on the
+// token they now hold reaches them even without an open positions view.
+func TestRegisterHeldBuy(t *testing.T) {
+	t.Parallel()
+
+	wantStart := time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC)
+
+	t.Run("nil watcher is a no-op", func(t *testing.T) {
+		t.Parallel()
+		m := &LiveTradeManager{} // no snipeWatcher wired
+		// Must not panic.
+		m.RegisterHeldBuy(7, pinnedFeedEventSlug, "ml-blg", snipeWiringEvent())
+	})
+
+	t.Run("moneyline token registers the buyer as holder", func(t *testing.T) {
+		t.Parallel()
+		m, w, _ := newSnipeWiredManager(t)
+		clock := newFakeClock()
+		w.now = clock.now
+
+		m.RegisterHeldBuy(7, pinnedFeedEventSlug, "ml-blg", snipeWiringEvent())
+
+		st := heldStateOf(t, w, "ml-blg")
+		if st == nil {
+			t.Fatal("ml-blg not registered after RegisterHeldBuy")
+		}
+		if st.market.MarketID != "ml" || st.market.Outcome != "BLG" || !st.market.GameStart.Equal(wantStart) {
+			t.Errorf("held market = %+v, want MarketID=ml Outcome=BLG GameStart=%v", st.market, wantStart)
+		}
+		exp, ok := st.holders[7]
+		if !ok {
+			t.Fatal("chatID 7 not among holders")
+		}
+		if want := clock.now().Add(SnipeHeldTTL); !exp.Equal(want) {
+			t.Errorf("holder expiry = %v, want now+SnipeHeldTTL %v", exp, want)
+		}
+	})
+
+	t.Run("sub-market token registers even though ML resolution excludes it", func(t *testing.T) {
+		t.Parallel()
+		m, w, _ := newSnipeWiredManager(t)
+
+		// g3-blg lives in the Game 3 sub-market, which eventSnipeMarkets/
+		// GetAllMLMarkets never returns — the buy may still target it.
+		m.RegisterHeldBuy(7, pinnedFeedEventSlug, "g3-blg", snipeWiringEvent())
+
+		st := heldStateOf(t, w, "g3-blg")
+		if st == nil {
+			t.Fatal("sub-market token g3-blg not registered — RegisterHeldBuy must search all markets")
+		}
+		if st.market.MarketID != "g3" || st.market.Outcome != "BLG" {
+			t.Errorf("held market = %+v, want MarketID=g3 Outcome=BLG", st.market)
+		}
+		if _, ok := st.holders[7]; !ok {
+			t.Error("chatID 7 not among holders")
+		}
+	})
+
+	t.Run("token not in event does not register", func(t *testing.T) {
+		t.Parallel()
+		m, w, _ := newSnipeWiredManager(t)
+
+		m.RegisterHeldBuy(7, pinnedFeedEventSlug, "not-a-token", snipeWiringEvent())
+
+		if st := heldStateOf(t, w, "not-a-token"); st != nil {
+			t.Errorf("unknown token registered: %+v", st)
+		}
+	})
+}

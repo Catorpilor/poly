@@ -53,6 +53,16 @@ type Bot struct {
 	// nil selects production (a fresh Gamma client / executeBuyOrderByIndex).
 	snipeMarkets *polymarket.MarketClient
 	snipeBuyExec func(ctx context.Context, user *database.User, market *polymarket.GammaMarket, idx int, amount float64) *polymarket.TradeResult
+	// snipePositions is a test seam for the held-registration position fetch;
+	// nil selects production (a fresh UnifiedPositionScanner).
+	snipePositions snipePositionSource
+}
+
+// snipePositionSource is the slice of the position scanner the held-registration
+// path needs. *polymarket.UnifiedPositionScanner satisfies it; tests inject a
+// fake so no Data API call is made.
+type snipePositionSource interface {
+	GetPositions(ctx context.Context, proxyAddress common.Address) ([]*polymarket.Position, error)
 }
 
 // CommandHandler is a function that handles a command
@@ -1325,6 +1335,9 @@ Please wait...`, marketName, outcomeName, amount))
 
 	// Show result
 	if result.Success {
+		// A successful buy makes the buyer a Held Watch holder (issue #64), off
+		// the render path.
+		go b.snipeRegisterHeldForUser(chatID, common.HexToAddress(user.ProxyAddress))
 		message := fmt.Sprintf(`✅ *Order Executed Successfully!*
 
 *Market:* %s
@@ -1487,6 +1500,10 @@ Please wait...`, marketName, outcomeName, amount, limitPrice))
 
 	// Show result
 	if result.Success {
+		// Register the buyer's held positions as Held Watches (issue #64), off
+		// the render path. This scans actual positions, so a resting limit order
+		// only refreshes existing holdings until it fills.
+		go b.snipeRegisterHeldForUser(chatID, common.HexToAddress(user.ProxyAddress))
 		message := fmt.Sprintf(`✅ *Limit Buy Order Placed!*
 
 *Market:* %s

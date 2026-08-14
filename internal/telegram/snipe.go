@@ -760,7 +760,11 @@ func (b *Bot) snipeRegisterHeldForUser(chatID int64, proxyAddr common.Address) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	positions, err := polymarket.NewUnifiedPositionScanner().GetPositions(ctx, proxyAddr)
+	scanner := b.snipePositions
+	if scanner == nil {
+		scanner = polymarket.NewUnifiedPositionScanner()
+	}
+	positions, err := scanner.GetPositions(ctx, proxyAddr)
 	if err != nil {
 		log.Printf("Snipe: fetch positions for held registration: %v", err)
 		return
