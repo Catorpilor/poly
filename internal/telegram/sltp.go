@@ -460,7 +460,7 @@ func sltpStaleSizeText(arm *database.SLTPArm, availableRaw int64) string {
 	return fmt.Sprintf(
 		"⚠️ *Position is smaller than when armed*\n\n"+
 			"Your %s wallet holds %.2f shares, but SL/TP was armed on %.2f — "+
-			"part was sold outside the bot. The stop now covers %.2f shares (was %.2f).\n\n"+
+			"part was sold outside the bot. The arm now covers %.2f shares (was %.2f).\n\n"+
 			"Disarm and re-arm to refresh the snapshot.",
 		arm.Outcome, available, arm.SharesAtArm, available, arm.SharesAtArm)
 }
@@ -520,13 +520,23 @@ func sltpFiredText(kind string, arm *database.SLTPArm, bid float64, result *poly
 	}
 	switch kind {
 	case "TP":
-		// By TP time the bid reached 2× entry, so the trailing stop is
-		// necessarily active; show where it protects the remainder.
+		// A trailing stop only exists on a full TP+SL arm; a TP-only auto-arm
+		// (v0.17.0+, SLArmed=false) has no stop — the monitor gates SL on
+		// SLArmed — so its remainder rides to the ceiling. Branch on SLArmed so
+		// the confirmation never promises a stop that will not fire.
+		if arm.SLArmed {
+			return fmt.Sprintf(
+				"✅ *TP hit* at $%.4f\n\n"+
+					"Sold %.0f%% of %s position.\n"+
+					"Trailing stop ($%.4f, follows the peak) watching the remainder.",
+				bid, database.TPSellFraction*100, arm.Outcome, arm.SLTriggerPrice(),
+			)
+		}
 		return fmt.Sprintf(
 			"✅ *TP hit* at $%.4f\n\n"+
 				"Sold %.0f%% of %s position.\n"+
-				"Trailing stop ($%.4f, follows the peak) watching the remainder.",
-			bid, database.TPSellFraction*100, arm.Outcome, arm.SLTriggerPrice(),
+				"No stop-loss — the remainder rides to the $%.2f ceiling; max loss is the remaining stake.",
+			bid, database.TPSellFraction*100, arm.Outcome, database.CeilingTPPrice,
 		)
 	case "TP-ceiling":
 		return fmt.Sprintf(

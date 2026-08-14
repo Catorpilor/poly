@@ -246,10 +246,32 @@ func TestNormalizeOutcome(t *testing.T) {
 	}
 }
 
+// TestSLTPFiredText_TPOnlyNoStop covers the v0.17.0 TP-only auto-arm
+// (SLArmed=false): a TP fire must NOT promise a trailing stop that will never
+// run (the monitor gates SL on SLArmed). The remainder rides to the ceiling.
+func TestSLTPFiredText_TPOnlyNoStop(t *testing.T) {
+	t.Parallel()
+	arm := &database.SLTPArm{AvgPrice: 0.50, HighWaterMark: 1.00, Outcome: "KNICKS", TPArmed: true, SLArmed: false}
+	got := sltpFiredText("TP", arm, 1.00, &polymarket.TradeResult{Success: true})
+
+	for _, w := range []string{"TP hit", "KNICKS", "0.95", "ceiling", "max loss"} {
+		if !strings.Contains(got, w) {
+			t.Errorf("TP-only text missing %q:\n%s", w, got)
+		}
+	}
+	for _, notWant := range []string{"Trailing stop", "follows the peak", "watching the remainder", "stop $"} {
+		if strings.Contains(got, notWant) {
+			t.Errorf("TP-only text must not promise a stop (%q):\n%s", notWant, got)
+		}
+	}
+}
+
 func TestSLTPFiredText(t *testing.T) {
 	t.Parallel()
-	// Post-TP-fire arm: entry 0.50, peak ratcheted to 1.00 → stop 0.80.
-	arm := &database.SLTPArm{AvgPrice: 0.50, HighWaterMark: 1.00, Outcome: "KNICKS"}
+	// Post-TP-fire TP+SL arm (SLArmed=true): entry 0.50, peak ratcheted to
+	// 1.00 → stop 0.80. The TP-only (SLArmed=false) TP message is covered
+	// separately by TestSLTPFiredText_TPOnlyNoStop.
+	arm := &database.SLTPArm{AvgPrice: 0.50, HighWaterMark: 1.00, Outcome: "KNICKS", SLArmed: true}
 	ok := &polymarket.TradeResult{Success: true}
 	fail := &polymarket.TradeResult{Success: false, ErrorMsg: "boom"}
 
