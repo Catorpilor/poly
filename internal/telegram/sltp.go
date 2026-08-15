@@ -620,15 +620,34 @@ func sltpArmedText(title, outcome string, arm *database.SLTPArm) string {
 	return fmt.Sprintf(
 		"🎯 *Armed* %s %s\n\n"+
 			"• Entry: $%.4f\n"+
-			"• TP: bid ≥ $%.4f → sell %.0f%%\n"+
+			"%s\n"+
 			"• SL: trailing — wakes once bid ≥ $%.4f, then stops at\n"+
 			"  max(entry, peak − 20%%) → sell 100%% (FOK, floored)\n\n"+
 			"⚠️ No stop until the bid reaches $%.4f — max loss is your stake.",
 		title, outcome,
 		arm.AvgPrice,
-		arm.TPTriggerPrice(), database.TPSellFraction*100,
+		sltpTPLine(arm),
 		activation, activation,
 	)
+}
+
+// sltpTPLine renders an arm confirmation's take-profit line honestly (issue
+// #74): the monitor checks the 0.95 ceiling before the partial TP, so a capped
+// 2× trigger at/above the ceiling can never fire — for those arms the real
+// behavior is the ceiling's sell-everything, and that is what gets promised.
+func sltpTPLine(arm *database.SLTPArm) string {
+	if arm.TPTriggerPrice() >= database.CeilingTPPrice {
+		return sltpCeilingTPLine()
+	}
+	return fmt.Sprintf("• TP: bid ≥ $%.4f → sell %.0f%%",
+		arm.TPTriggerPrice(), database.TPSellFraction*100)
+}
+
+// sltpCeilingTPLine is the shared unreachable-TP wording: the arm's only
+// take-profit is the ceiling, which sells the whole position.
+func sltpCeilingTPLine() string {
+	return fmt.Sprintf("• TP: bid ≥ $%.2f → sell 100%% (ceiling — the 2× partial target sits at or above it)",
+		database.CeilingTPPrice)
 }
 
 // ResolveOtherToken implements live.TradeExecutor. Returns the second CTF

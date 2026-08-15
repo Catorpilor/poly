@@ -472,19 +472,65 @@ func TestSLTPSweptText(t *testing.T) {
 
 func TestSLTPArmedText(t *testing.T) {
 	t.Parallel()
-	// Fresh arm: HWM == entry (dormant).
-	arm := &database.SLTPArm{AvgPrice: 0.50, HighWaterMark: 0.50, Outcome: "KNICKS"}
-	got := sltpArmedText("Knicks vs. Spurs", "KNICKS", arm)
-
-	for _, w := range []string{
-		"$0.5000",  // entry
-		"$0.6000",  // activation = entry × 1.20
-		"20%",      // trail distance below peak
-		"max loss", // explicit no-stop-below-activation caveat
-		"$0.9900",  // TP trigger (capped)
-	} {
-		if !strings.Contains(got, w) {
-			t.Errorf("armed text missing %q:\n%s", w, got)
-		}
+	tests := []struct {
+		name    string
+		arm     *database.SLTPArm
+		want    []string
+		notWant []string
+	}{
+		{
+			// Fresh arm: HWM == entry (dormant). TP 2× = 0.60 < ceiling.
+			name: "reachable TP shows the partial",
+			arm:  &database.SLTPArm{AvgPrice: 0.30, HighWaterMark: 0.30, Outcome: "KNICKS"},
+			want: []string{
+				"$0.3000",  // entry
+				"$0.3600",  // activation = entry × 1.20
+				"20%",      // trail distance below peak
+				"max loss", // explicit no-stop-below-activation caveat
+				"$0.6000",  // TP trigger
+				"sell 25%", // the partial promise, honest here
+			},
+			notWant: []string{"ceiling"},
+		},
+		{
+			// Issue #74: entry > 0.475 caps the 2× trigger above the 0.95
+			// ceiling, which the monitor checks first — the partial can never
+			// fire, so the confirmation must promise the ceiling, not the TP.
+			name: "unreachable TP shows the ceiling instead",
+			arm:  &database.SLTPArm{AvgPrice: 0.50, HighWaterMark: 0.50, Outcome: "KNICKS"},
+			want: []string{
+				"$0.5000", // entry
+				"$0.6000", // activation = entry × 1.20
+				"max loss",
+				"$0.95",    // ceiling threshold
+				"sell 100", // ceiling sells everything
+				"ceiling",
+			},
+			notWant: []string{"sell 25%", "$0.9900"},
+		},
+		{
+			// Boundary: trigger == ceiling exactly — ceiling still fires first.
+			name:    "trigger equal to ceiling is unreachable",
+			arm:     &database.SLTPArm{AvgPrice: 0.475, HighWaterMark: 0.475, Outcome: "KNICKS"},
+			want:    []string{"$0.95", "sell 100", "ceiling"},
+			notWant: []string{"sell 25%"},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := sltpArmedText("Knicks vs. Spurs", "KNICKS", tt.arm)
+			for _, w := range tt.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("armed text missing %q:\n%s", w, got)
+				}
+			}
+			for _, nw := range tt.notWant {
+				if strings.Contains(got, nw) {
+					t.Errorf("armed text must not contain %q:\n%s", nw, got)
+				}
+			}
+		})
 	}
 }

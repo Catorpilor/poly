@@ -799,16 +799,22 @@ func (b *Bot) snipeAutoArmTPOnly(chatID int64, tokenID, question, outcome string
 // line, and it states plainly that the stake is the max loss (there is no
 // stop). Pure — table-tested.
 func snipeAutoArmedText(title, outcome string, arm *database.SLTPArm) string {
+	// Same honesty rule as sltpTPLine (issue #74): a trigger at/above the
+	// ceiling never fires, so promise the ceiling's sell-everything instead.
+	tpLine := sltpCeilingTPLine()
+	if arm.TPTriggerPrice() < database.CeilingTPPrice {
+		tpLine = fmt.Sprintf("• TP: bid ≥ $%.4f → sell %.0f%%, then ride to the $%.2f ceiling",
+			arm.TPTriggerPrice(), database.TPSellFraction*100, database.CeilingTPPrice)
+	}
 	return fmt.Sprintf(
 		"🎯 *Auto-armed (TP only)* %s %s\n\n"+
 			"• Entry: $%.4f\n"+
-			"• TP: bid ≥ $%.4f → sell %.0f%%, then ride to the $%.2f ceiling\n"+
+			"%s\n"+
 			"• No stop-loss — max loss is your ~$%.2f stake.\n\n"+
 			"Snipe tranches keep their tail; tap 🎯 SL/TP to manage it manually.",
 		title, outcome,
 		arm.AvgPrice,
-		arm.TPTriggerPrice(), database.TPSellFraction*100,
-		database.CeilingTPPrice,
+		tpLine,
 		arm.SharesAtArm*arm.AvgPrice,
 	)
 }
