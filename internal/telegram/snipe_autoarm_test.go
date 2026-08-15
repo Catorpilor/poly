@@ -105,6 +105,25 @@ func TestSnipeAutoArmedText(t *testing.T) {
 	}
 }
 
+// TestSnipeAutoArmedTextUnreachableTP: issue #74 — an entry high enough that
+// the capped 2× trigger sits at/above the 0.95 ceiling must not promise the
+// 25% partial; the ceiling (sell 100%) is what actually fires.
+func TestSnipeAutoArmedTextUnreachableTP(t *testing.T) {
+	t.Parallel()
+	arm := &database.SLTPArm{AvgPrice: 0.50, HighWaterMark: 0.50, SharesAtArm: 20, Outcome: "LAKERS"}
+	got := snipeAutoArmedText("LoL: T1 vs. Gen.G", "LAKERS", arm)
+	for _, w := range []string{"Auto-armed (TP only)", "$0.5000", "$0.95", "sell 100", "ceiling", "max loss", "$10.00"} {
+		if !strings.Contains(got, w) {
+			t.Errorf("auto-armed text missing %q:\n%s", w, got)
+		}
+	}
+	for _, notWant := range []string{"sell 25%", "$0.9900", "trailing", "wakes"} {
+		if strings.Contains(got, notWant) {
+			t.Errorf("auto-armed text must not contain %q:\n%s", notWant, got)
+		}
+	}
+}
+
 // TestSnipeAutoArmInBand: a successful in-band auto-buy TP-only-arms from the
 // fill — TPArmed true, SLArmed false, price = guard ask, shares = stake/price,
 // HWM = AvgPrice — informs the snipe watcher, and DMs the confirmation.
