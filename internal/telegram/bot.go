@@ -77,7 +77,7 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 	api, err := tgbotapi.NewBotAPIWithClient(
 		cfg.Telegram.BotToken,
 		tgbotapi.APIEndpoint,
-		&http.Client{Timeout: 75 * time.Second},
+		&http.Client{Timeout: pollHTTPTimeout(cfg.Telegram.PollTimeoutSeconds)},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create bot API: %w", err)
@@ -2652,4 +2652,13 @@ func (b *Bot) executeSellOrderFromPosition(ctx context.Context, user *database.U
 	}
 
 	return result
+}
+
+// pollHTTPTimeout sizes the Telegram API client's HTTP timeout from the
+// getUpdates hold: poll + 10s transit grace. The client must outlive a full
+// healthy long-poll but no more — on a proxy-killed connection the request
+// hangs until exactly this timeout, so every excess second here is added
+// lag per dead poll before the retry loop can act.
+func pollHTTPTimeout(pollSeconds int) time.Duration {
+	return time.Duration(pollSeconds+10) * time.Second
 }
