@@ -385,3 +385,72 @@ sudo systemctl enable polybot
 sudo systemctl start polybot
 sudo systemctl status polybot
 ```
+
+## 10. Network Path: Proxy Environment (GFW)
+
+The production Pi sits behind the GFW. **There is no working direct path from
+this network to Telegram or to ANY polymarket.com host** — earlier "CLOB works
+direct" observations were the LAN's transparent SNI proxy silently rescuing
+that traffic. All external traffic must ride the explicit proxy.
+
+### Compose environment (production values)
+
+```yaml
+environment:
+  - HTTP_PROXY=http://192.168.1.108:7890
+  - HTTPS_PROXY=http://192.168.1.108:7890
+  # ONLY local addresses — every external host needs the proxy
+  - NO_PROXY=host.docker.internal,localhost,127.0.0.1
+```
+
+And in `.env`:
+
+```bash
+# The proxy tunnels kill ~60s idle connections; short polls survive.
+# Default is 60 (fine on unproxied networks). Clamped to [1,90].
+TELEGRAM_POLL_TIMEOUT_SECONDS=15
+```
+
+### The proxy box (mihomo on rasp1)
+
+- `ssh zeh@192.168.1.108` (passwordless sudo). Service: `mihomo.service`,
+  binary `/opt/mihomo/mihomo`, config `/etc/mihomo/config.yaml`,
+  API `http://192.168.1.108:9090` (unauthenticated), explicit port `:7890`.
+- The `Telegram` selector defaults to **TG-Auto** — a `url-test` group probing
+  `https://api.telegram.org` every 120s over HK/JP/SG/TW/US with automatic
+  failover. `profile.store-selected: true` persists selections across restarts.
+- After editing the config: validate with
+  `sudo /opt/mihomo/mihomo -t -d /etc/mihomo`, then hot-reload with
+  `curl -X PUT "http://192.168.1.108:9090/configs?force=true" -d '{"path": "/etc/mihomo/config.yaml"}'`.
+
+### Failure signatures
+
+| Symptom in bot logs | Meaning | Fix |
+|---|---|---|
+| `getUpdates ... context deadline exceeded` repeatedly, offset frozen | proxy's Telegram route down or long-polls exceed the tunnel's idle-kill threshold | check TG-Auto via the :9090 API; confirm `TELEGRAM_POLL_TIMEOUT_SECONDS` is short |
+| replies sent with EMPTY text; `data-api`/`gamma` timeouts | a Polymarket host forced onto the (nonexistent) direct path | check NO_PROXY only lists local addresses |
+| orders rejected `Trading restricted in your region` | proxy exit country is Polymarket-restricted (US/SG/UK/FR…) | repoint the `Proxies` group at an allowed-country exit |
+| `answerCallbackQuery ... query is too old` | updates delivered late (path degraded); taps DID process | same as row 1 — latency, not loss |
+
+## 11. EC2 Warm Standby & Cutover Runbook
+
+An AWS m5.large (ap-southeast-1) holds a ready deployment, reachable only via
+Tailscale: `ssh ec2-user@100.77.31.77`, dir `~/poly_deploy/` (note: the
+hyphenated `docker-compose` binary there). Stack: polybot + `postgres:17`
+(`poly_postgres`) + `redis:7-alpine` on an internal network, web UI bound to
+the Tailscale IP only (`:8083`).
+
+**⚠️ Polymarket geoblocks ORDER PLACEMENT from Singapore AWS IPs** — data
+APIs, WS, and alerts all work, so reachability checks pass while trading is
+dead. Before any future cutover to a new egress, verify an actual order from
+there first. Tokyo (ap-northeast-1) is the vetted relocation candidate.
+
+Cutover sequence (proven 2026-08-16, 43s bot-down window):
+1. Prep everything while the old host runs: compose up db containers, copy
+   `.env`, rehearsal `pg_dump`/`pg_restore`, compare row counts.
+2. Old host `docker compose down` → final dump → restore → new host up.
+   Two instances must NEVER poll `getUpdates` concurrently.
+3. Verify: `Authorized`, getUpdates responses, `SLTPMonitor: Started with N
+   armed token(s)` matching the arms table, SnipeWatcher, RTDS, web UI probe.
+4. Old host stays down but intact — it is the rollback path (proven same-day:
+   stop new bot, `docker compose up -d` on old).

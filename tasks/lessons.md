@@ -175,3 +175,60 @@ QuoteMeta'd), never Contains; (2) write the harmful-direction false-
 positive cases as explicit tests (Lecce, Alec) before fixing; (3) when a
 subagent flags a residual risk in its report, resolve it in review —
 relaying the flag to the user unfixed is not review.
+
+## 2026-08-16 — Behind a transparent proxy, "direct-reachable" is an illusion
+Two days of debugging rested on "Polymarket works direct from China; only
+Telegram needs the proxy" — false. The transparent SNI proxy had been
+silently rescuing every polymarket.com host all along, so plain curls
+"proved" a direct path that didn't exist, and a NO_PROXY built on that
+model forced genuinely-blocked hosts direct: /wallet replies went out
+with EMPTY text (upstream fetches dead, Telegram fine). Rules: (1) to
+test the true direct path, bypass the proxy explicitly (`curl --noproxy
+"*"`) — an unqualified probe tests the interception, not the route;
+(2) empty outbound message text = the handler's upstream data call died,
+not the messaging layer; (3) when a reachability belief becomes load-
+bearing for config, re-verify it at the moment of use — the 08-15
+"CLOB is fine" observation was true-but-misattributed and silently
+poisoned the 08-16 rollback config.
+
+## 2026-08-16 — Validate the traffic pattern, not the endpoint
+Quick probes through a node scored 8/8 while the bot's getUpdates failed
+on that same node at the same moment: the tunnels pass sub-second
+requests but kill connections held idle ~60s, and a 60s long-poll is
+precisely a held-idle connection. Node-shopping couldn't fix it (every
+exit dropped holds); shortening the poll to 15s fixed it everywhere
+(0 failures thereafter). Rules: (1) a path is only validated by
+reproducing the client's actual pattern — hold duration, streaming,
+WS — a fast 200 validates nothing about held connections; (2) protocol
+timing knobs that interact with infrastructure tolerance belong in
+config (TELEGRAM_POLL_TIMEOUT_SECONDS), not constants; (3) a low-rate
+version of the failure had been in the logs for days (isolated
+"Failed to get updates" retries) — a retry loop that usually absorbs an
+error is also hiding its rate; alert on rate, not occurrence.
+
+## 2026-08-16 — "APIs reachable" ≠ "trading permitted": verify geoblocks from the new egress
+The Pi→EC2 migration was mechanically flawless (43s window, byte-faithful
+DB) and dead on arrival: Polymarket geoblocks ORDER PLACEMENT from
+Singapore IPs while serving data/WS/alerts normally, so every
+reachability check passed and only live orders failed ("Trading
+restricted in your region"). Rules: (1) before relocating execution
+infra, place a real (minimal) order from the new egress — read paths
+prove nothing about write permission; (2) the migration discipline that
+made this survivable is the keeper: prep slow, cut fast, never two
+pollers, old host preserved intact = same-day free rollback; (3) region
+choice for trading infra is a compliance surface — check the venue's
+restricted list before choosing the datacenter.
+
+## 2026-08-16 — Shared boxes and runtime state: enumerate first, persist deliberately
+Two near-misses in one migration: (a) the "new" EC2 was already running a
+forgotten April polybot container — 3 months up, holding a live bot
+token, the target container name, AND a publicly-exposed 0.0.0.0:8081 —
+discovered only because compose ps showed a stranger; (b) the mihomo
+node switch applied via API was runtime-only (`store-selected` absent),
+so any service restart would have silently reverted Telegram to the
+broken default. Rules: (1) on shared/long-lived hosts, enumerate
+running containers/ports/services BEFORE deploying — name collisions
+and forgotten token-holders are found by looking, not by luck;
+(2) an operational fix applied through a runtime API isn't done until
+the equivalent lives in config (or persistence is verified) — restart
+amnesia turns today's fix into next month's mystery regression.
