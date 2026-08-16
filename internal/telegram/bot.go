@@ -197,7 +197,7 @@ func (b *Bot) registerHandlers() {
 // Start starts the bot and begins listening for updates
 func (b *Bot) Start(ctx context.Context) error {
 	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
+	u.Timeout = b.config.Telegram.PollTimeoutSeconds
 
 	updates := b.api.GetUpdatesChan(u)
 
