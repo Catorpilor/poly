@@ -47,6 +47,10 @@ type Config struct {
 type TelegramConfig struct {
 	BotToken    string
 	BotUsername string // Bot username for deep links (without @)
+	// PollTimeoutSeconds is the getUpdates long-poll hold. Telegram allows up
+	// to 90; proxies that kill idle connections make long holds die with
+	// "context deadline exceeded", so proxied deployments set this short.
+	PollTimeoutSeconds int
 }
 
 // DatabaseConfig holds database configuration
@@ -142,6 +146,10 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("TELEGRAM_BOT_TOKEN is required")
 	}
 	cfg.Telegram.BotUsername = getEnv("TELEGRAM_BOT_USERNAME", "poly_trade_test_bot")
+	cfg.Telegram.PollTimeoutSeconds = getEnvInt("TELEGRAM_POLL_TIMEOUT_SECONDS", 60)
+	if cfg.Telegram.PollTimeoutSeconds < 1 || cfg.Telegram.PollTimeoutSeconds > 90 {
+		cfg.Telegram.PollTimeoutSeconds = 60
+	}
 
 	// Load Database configuration
 	cfg.Database.URL = getEnv("DATABASE_URL", "")
