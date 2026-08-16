@@ -232,3 +232,20 @@ and forgotten token-holders are found by looking, not by luck;
 (2) an operational fix applied through a runtime API isn't done until
 the equivalent lives in config (or persistence is verified) — restart
 amnesia turns today's fix into next month's mystery regression.
+
+## 2026-08-16 — Timeouts are a stack; tuning one leaves its coupled twins ruling the worst case
+v0.19.2 shortened the getUpdates hold to 15s and was declared working —
+but the lag persisted, because the HTTP client's hardcoded 75s timeout
+(sized as 60s poll + 15s grace) still governed how long a proxy-killed
+connection hung before the retry loop could act. The tell was in the
+failure SPACING: dead polls landed exactly ~78s apart, the old constant's
+fingerprint, visible in the logs even while success counts looked
+improved. Rules: (1) a timeout that encodes an assumption about another
+timeout (75 = 60 + 15) must be a derivation, not a literal — when the
+source value became configurable, the derived one silently became a bug
+(fixed: pollHTTPTimeout = poll + 10s); (2) when tuning any timing knob,
+enumerate the full chain around it (server hold, client timeout, dial,
+retry delay) and re-derive each from the same source; (3) verify latency
+fixes by measuring the WORST case (spacing/duration of failures), not
+the success rate — "more polls succeed" and "dead polls still cost 78s"
+were both true at once.
