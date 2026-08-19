@@ -33,7 +33,10 @@ type snipeWatch interface {
 	WatchArmed(m live.SnipeMarket)
 	UnwatchArmed(tokenID string)
 	WatchHeld(chatID int64, m live.SnipeMarket, ttl time.Duration)
-	RenewHeld(chatID int64, tokenID string, ttl time.Duration) bool
+	// RenewHeldMarket extends the holder TTL for the token AND its watched
+	// siblings (issue #78), so a position refresh keeps both sides of a held
+	// market alive. False ⇒ unwatched, caller must WatchHeld with metadata.
+	RenewHeldMarket(chatID int64, tokenID string, ttl time.Duration) bool
 	MarkBought(tokenID string)
 	// SiblingTokenIDs returns other watched token IDs in the same market — the
 	// boxed tier's case-3 sibling lookup.
@@ -164,41 +167,123 @@ func (r *snipeBoughtRecord) held(chatID int64, tokenID string) bool {
 	return r.bought[chatID][tokenID]
 }
 
-// snipeBoxedLatch records, per recipient, which alerted token they are
-// boxed-eligible for in the current episode. It is set at in-band alert time —
-// true when that recipient was case-3 (held the other side) and the ask was
-// still above the boxed zone (outcome snipeBuyBoxedWait), false otherwise — and
-// overwritten on every in-band alert for that (chatID, tokenID). The watcher
-// fires the in-band alert once per episode, so that per-alert overwrite IS the
-// episode boundary. On a boxed tranche fire the notifier consults THIS latch
-// instead of re-checking sibling holdings (issue #78): a mid-episode ceiling
-// harvest of the held winner — exactly the moment the flip ticket is most wanted
-// (ledger r72) — must not cancel the postponed flip buy. In-memory, never
-// cleared during a run; matches end with their markets, so staleness is bounded.
+// snipeBoxedLatchTTL bounds how long a boxed latch stays live (issue #78 F4).
+// Episodes last minutes; a latch older than this belongs to an episode the
+// recipient never saw a fresh alert for (e.g. a held TTL lapse then a
+// mid-episode re-register) and must not fire. Far below SnipeHeldTTL (6h).
+const snipeBoxedLatchTTL = time.Hour
+
+// snipeBoxedEntry is a recipient's per-episode boxed eligibility: one live flag
+// per ladder rung, plus the set time for staleness. Per-tranche state (not one
+// bool) lets an immediate case-3 buy take rung 1 now while leaving rung 2 for
+// the watcher's ≤0.05 fire — $10 max, never stacked (issue #78 F3).
+type snipeBoxedEntry struct {
+	t1, t2 bool
+	at     time.Time
+}
+
+// snipeBoxedLatch records, per recipient, which boxed rungs an alerted token is
+// still eligible for this episode. It is armed at in-band alert time (case-3)
+// and overwritten on every in-band alert for that (chatID, tokenID) — the
+// watcher fires the in-band alert once per episode, so that per-alert overwrite
+// IS the episode boundary. On a boxed tranche fire the notifier claims the rung
+// from THIS latch instead of re-checking sibling holdings (issue #78): a
+// mid-episode ceiling harvest of the held winner — exactly when the flip ticket
+// is most wanted (ledger r72) — must not cancel the buy. A manual tap or an
+// in-band fill of the token clears it (tap supersedes the ladder, F2). Entries
+// carry a set time and expire after snipeBoxedLatchTTL (F4); stale entries are
+// pruned opportunistically on write.
 type snipeBoxedLatch struct {
 	mu      sync.Mutex
-	latched map[int64]map[string]bool // chatID -> tokenID -> boxed-eligible
+	latched map[int64]map[string]*snipeBoxedEntry
+	now     func() time.Time
+	ttl     time.Duration
 }
 
 func newSnipeBoxedLatch() *snipeBoxedLatch {
-	return &snipeBoxedLatch{latched: make(map[int64]map[string]bool)}
+	return &snipeBoxedLatch{
+		latched: make(map[int64]map[string]*snipeBoxedEntry),
+		now:     time.Now,
+		ttl:     snipeBoxedLatchTTL,
+	}
 }
 
-// set overwrites (chatID, tokenID)'s boxed-eligibility for the current episode.
-func (l *snipeBoxedLatch) set(chatID int64, tokenID string, eligible bool) {
+// arm overwrites (chatID, tokenID)'s boxed eligibility for a fresh episode: t1/t2
+// mark which rungs the watcher's fires should still buy, stamped now. Every
+// in-band alert re-arms (or clears via the caller), which is the episode
+// boundary. Prunes stale entries opportunistically to bound growth.
+func (l *snipeBoxedLatch) arm(chatID int64, tokenID string, t1, t2 bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.pruneLocked()
 	if l.latched[chatID] == nil {
-		l.latched[chatID] = make(map[string]bool)
+		l.latched[chatID] = make(map[string]*snipeBoxedEntry)
 	}
-	l.latched[chatID][tokenID] = eligible
+	l.latched[chatID][tokenID] = &snipeBoxedEntry{t1: t1, t2: t2, at: l.now()}
 }
 
-// eligible reports whether (chatID, tokenID) is boxed-eligible this episode.
+// clear disarms both rungs (a manual tap or an in-band buy of the token
+// supersedes the ladder, F2). Absent entry is a no-op.
+func (l *snipeBoxedLatch) clear(chatID int64, tokenID string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if toks := l.latched[chatID]; toks != nil {
+		delete(toks, tokenID)
+		if len(toks) == 0 {
+			delete(l.latched, chatID)
+		}
+	}
+}
+
+// claim atomically reports whether (chatID, tokenID) may still buy the given
+// tranche and consumes that rung, so a duplicate fire cannot double-buy. A stale
+// entry (older than ttl, F4) or a consumed/absent rung yields false.
+func (l *snipeBoxedLatch) claim(chatID int64, tokenID string, tranche int) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e := l.latched[chatID][tokenID]
+	if e == nil || l.now().Sub(e.at) > l.ttl {
+		return false
+	}
+	switch tranche {
+	case 1:
+		if !e.t1 {
+			return false
+		}
+		e.t1 = false
+	case 2:
+		if !e.t2 {
+			return false
+		}
+		e.t2 = false
+	default:
+		return false
+	}
+	return true
+}
+
+// eligible reports whether any rung of (chatID, tokenID) is still live and not
+// stale — a read-only view for tests and messaging.
 func (l *snipeBoxedLatch) eligible(chatID int64, tokenID string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.latched[chatID][tokenID]
+	e := l.latched[chatID][tokenID]
+	return e != nil && l.now().Sub(e.at) <= l.ttl && (e.t1 || e.t2)
+}
+
+// pruneLocked drops entries older than ttl. Callers hold mu.
+func (l *snipeBoxedLatch) pruneLocked() {
+	cutoff := l.now().Add(-l.ttl)
+	for chatID, toks := range l.latched {
+		for tok, e := range toks {
+			if e.at.Before(cutoff) {
+				delete(toks, tok)
+			}
+		}
+		if len(toks) == 0 {
+			delete(l.latched, chatID)
+		}
+	}
 }
 
 // The bot is the snipe watcher's notifier (wired in cmd/bot/main.go).
@@ -488,16 +573,21 @@ func (b *Bot) NotifySnipeAlert(chatID int64, market live.SnipeMarket, sessionHig
 // confirmation when the auto-buy filled, otherwise the unchanged manual alert
 // (with a one-line note when the daily cap was the blocker).
 func (b *Bot) snipeAlertMessage(chatID int64, alertID string, market live.SnipeMarket, sessionHigh, ask float64) (string, tgbotapi.InlineKeyboardMarkup) {
+	// snipeAutoBuy owns the boxed latch (it holds the case-3 decision): it clears
+	// the latch for the episode and re-arms it for case-3 recipients (issue #78).
 	res, capLeft, status := b.snipeAutoBuy(chatID, market)
-	// Latch this recipient's boxed eligibility for the episode: true only when
-	// the in-band buy was postponed as case-3 (snipeBuyBoxedWait). The overwrite
-	// on every in-band alert IS the episode boundary — the boxed ladder later
-	// consults this instead of re-checking sibling holdings (issue #78).
-	if b.snipeBoxedLatch != nil {
-		b.snipeBoxedLatch.set(chatID, market.TokenID, res.outcome == snipeBuyBoxedWait)
-	}
 	switch status {
 	case snipeAutoBought:
+		if res.boxedTranche == 1 {
+			// Immediate case-3 rung 1: report the $5 tranche, not the flat $10, and
+			// the deep fill price. The second $5 rung is still armed for ≤ $0.05.
+			price := res.ask
+			if price <= 0 {
+				price = ask
+			}
+			return snipeBoxedBoughtText(market.Question, market.Outcome, price, snipeBoxedTrancheUSD, 1, res.orderID, capLeft),
+				snipeAutoBoughtKeyboard(alertID)
+		}
 		return snipeAutoBoughtText(market.Question, market.Outcome, sessionHigh, ask, snipeAutoBuyUSD, res.orderID, capLeft),
 			snipeAutoBoughtKeyboard(alertID)
 	case snipeAutoCapReached:
@@ -525,12 +615,12 @@ func (b *Bot) snipeAlertMessage(chatID int64, alertID string, market live.SnipeM
 // identical post-fill ceremony as the in-band buy (mark, TP-only auto-arm) via
 // snipeAutoBuyExec at the $5 tranche stake, and DMs a boxed confirmation.
 func (b *Bot) NotifySnipeBoxed(chatID int64, market live.SnipeMarket, sessionHigh, ask float64, tranche int) {
-	// Eligibility is the alert-time latch alone: a recipient not case-3 when the
-	// episode alerted never boxed-buys, and a latched one buys BOTH tranches even
-	// if the held side was sold since. No snipeBought dedup here — the latch is
-	// false for anyone who bought the flip at the alert (immediate case-3) or in
-	// band (case-2), so the two rungs are the only boxed buys this episode.
-	if b.snipeBoxedLatch == nil || !b.snipeBoxedLatch.eligible(chatID, market.TokenID) {
+	// Eligibility is the alert-time latch alone, claimed per rung: a recipient not
+	// case-3 when the episode alerted never boxed-buys, a latched one buys their
+	// still-live rungs even if the held side was sold since, and claiming consumes
+	// the rung so a duplicate fire can't double-buy. A stale latch from an episode
+	// the recipient never saw a fresh alert for is rejected here too (F4).
+	if b.snipeBoxedLatch == nil || !b.snipeBoxedLatch.claim(chatID, market.TokenID, tranche) {
 		return
 	}
 	// Sport gate (esports-only), mirroring the other tiers.
@@ -559,10 +649,11 @@ func (b *Bot) NotifySnipeBoxed(chatID int64, market live.SnipeMarket, sessionHig
 // the ladder, but the manual tap buttons remain live.
 const snipeBoxedWaitNote = "\n\n📦 You already hold the other side. The auto-buy is *waiting to buy the flip deep — $5 at ≤ $0.10 + $5 at ≤ $0.05* — your held side rides to the ceiling. Tap below to buy now anyway."
 
-// snipeBoxedBoughtText is the boxed ladder confirmation for one tranche. Pure —
-// table-tested.
+// snipeBoxedBoughtText is the boxed ladder confirmation for one tranche. Rung 1
+// notes the second $5 still armed for ≤ $0.05 so the user reads the $5 (not $10)
+// as deliberate. Pure — table-tested.
 func snipeBoxedBoughtText(question, outcome string, ask, amount float64, tranche int, orderID string, capLeft float64) string {
-	return fmt.Sprintf(
+	body := fmt.Sprintf(
 		"📦 *Boxed flip tranche %d — auto-sniped $%.0f*\n\n"+
 			"*%s*\n"+
 			"*Side:* Buy %s\n"+
@@ -570,6 +661,10 @@ func snipeBoxedBoughtText(question, outcome string, ask, amount float64, tranche
 			"*Order ID:* %s\n"+
 			"Auto-snipe cap left today: $%.0f",
 		tranche, amount, truncateUTF8(question, 60), outcome, ask, orderID, capLeft)
+	if tranche == 1 {
+		body += fmt.Sprintf("\n\n_A second $%.0f rung is armed for ≤ $%.2f._", snipeBoxedTrancheUSD, live.SnipeBoxedDeepAsk)
+	}
+	return body
 }
 
 // snipeDeepText builds the Deep Crash body — blunt about the base rate: this
@@ -886,6 +981,14 @@ const (
 // double-tap safety is preserved. Cap headroom is reserved before the buy so
 // racing alerts cannot overshoot the daily cap; a failed buy refunds it.
 func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResult, float64, snipeAutoStatus) {
+	// Reset this recipient's boxed latch for the new episode — every in-band
+	// alert overwrites it (the overwrite IS the episode boundary, issue #78). The
+	// case-3 branches below re-arm it; a non-case-3 alert leaves it cleared, so a
+	// stale latch from a prior episode can never fire against this token.
+	if b.snipeBoxedLatch != nil {
+		b.snipeBoxedLatch.clear(chatID, market.TokenID)
+	}
+
 	// Gate 1 (sport gate): auto-buy only esports; non-esports and
 	// unclassifiable markets stay alert-only. Checked before any wallet lookup
 	// or cap reservation — the classification alone decides.
@@ -902,17 +1005,12 @@ func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResul
 		return snipeBuyResult{outcome: snipeBuyNoWallet}, 0, snipeAutoSkipped
 	}
 
-	// Case 3 (boxed): the recipient already holds the OTHER side of this market.
-	// With TP-only auto-arms the held side harvests at the $0.95 ceiling, so the
-	// flip ticket is better bought deep — postpone into the boxed ladder ($5 at
-	// ≤ $0.10 + $5 at ≤ $0.05) instead of the in-band $10. Returning
-	// snipeBuyBoxedWait here latches this recipient boxed-eligible for the episode
-	// (snipeAlertMessage), so the watcher's tranches buy for them even if the held
-	// side is harvested mid-episode (issue #78). If the ask is ALREADY ≤ 0.10 at
-	// the alert, fall through and buy the $10 now (the bought-record mark and a
-	// false latch then keep the ladder from double-buying). Regime bet: the
-	// ledger's case-3-at-0.20 taps were historically the best subclass — we
-	// deliberately trade them for deeper flip tickets under the ceiling regime.
+	// Case 3 (boxed ladder): the recipient already holds the OTHER side of this
+	// market. With TP-only auto-arms the held side harvests at the $0.95 ceiling,
+	// so the flip ticket is better bought deep — as the two-rung ladder ($5 at
+	// ≤ $0.10 + $5 at ≤ $0.05) rather than the in-band $10 (issue #78). The
+	// per-tranche latch, not a fire-time sibling re-check, drives the watcher's
+	// later fires, so a mid-episode ceiling harvest cannot cancel the flip.
 	if b.snipeHoldsSibling(ctx, user, chatID, market) {
 		var ask float64
 		var ok bool
@@ -920,9 +1018,32 @@ func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResul
 			ask, ok = b.snipeFeed.BestAsk(market.TokenID)
 		}
 		if !ok || ask > live.SnipeBoxedMaxAsk {
+			// Postponed: the ask is not yet in the boxed zone. Latch BOTH rungs;
+			// the watcher buys them at ≤ 0.10 and ≤ 0.05.
+			if b.snipeBoxedLatch != nil {
+				b.snipeBoxedLatch.arm(chatID, market.TokenID, true, true)
+			}
 			log.Printf("Snipe auto-buy: boxed-wait chat=%d token=%.12s… ask=%.3f ok=%v", chatID, market.TokenID, ask, ok)
 			return snipeBuyResult{outcome: snipeBuyBoxedWait, ask: ask, askOK: ok}, 0, snipeAutoSkipped
 		}
+		// Immediate: the ask is already ≤ 0.10. Buy tranche 1 ($5) now and leave
+		// tranche 2 live for the watcher's ≤ 0.05 fire — the ladder joins ALL
+		// case-3 flips, never a flat $10 that then stacks $5+$5 (issue #78 F3).
+		res, capLeft, status := b.snipeAutoBuyExec(ctx, chatID, user, market, snipeBoxedTrancheUSD)
+		if status == snipeAutoBought {
+			if b.snipeBoxedLatch != nil {
+				b.snipeBoxedLatch.arm(chatID, market.TokenID, false, true) // rung 1 taken, rung 2 live
+			}
+			res.boxedTranche = 1
+			return res, capLeft, status
+		}
+		// The immediate $5 failed (repriced/rejected/corpse/cap): latch BOTH rungs
+		// so the watcher's boxed re-offers retry — restoring main's
+		// retry-at-re-offer behavior instead of dropping the recipient (F3).
+		if b.snipeBoxedLatch != nil {
+			b.snipeBoxedLatch.arm(chatID, market.TokenID, true, true)
+		}
+		return res, capLeft, status
 	}
 
 	return b.snipeAutoBuyExec(ctx, chatID, user, market, snipeAutoBuyUSD)
@@ -1003,6 +1124,10 @@ type snipeBuyResult struct {
 	idx         int
 	filledSize  float64
 	filledPrice float64
+	// boxedTranche marks an immediate case-3 buy as ladder rung 1 (issue #78 F3),
+	// so snipeAlertMessage renders the $5 boxed confirmation instead of the flat
+	// $10 auto-sniped copy. 0 for every other buy.
+	boxedTranche int
 }
 
 // snipeRefuseDeepBuy is the Deep Crash buy guard (ADR 0007): strict zone
@@ -1140,6 +1265,12 @@ func (b *Bot) handleSnipeCallback(ctx context.Context, update *tgbotapi.Update) 
 		if b.snipeBought != nil {
 			b.snipeBought.mark(chatID, entry.tokenID)
 		}
+		// A manual tap supersedes the boxed ladder: clear the latch so the
+		// watcher's tranche fires don't stack another $5+$5 on top of the manual
+		// buy the user just made from the "buy now anyway" button (issue #78 F2).
+		if b.snipeBoxedLatch != nil {
+			b.snipeBoxedLatch.clear(chatID, entry.tokenID)
+		}
 		// Auto-arm TP + ceiling (no trailing SL) from the fill — async.
 		go b.snipeAutoArmTPOnly(chatID, entry.tokenID, entry.question, entry.outcome, res, amount)
 		keyboard := tgbotapi.NewInlineKeyboardMarkup(
@@ -1215,22 +1346,52 @@ func (b *Bot) SeedSnipeArmed() {
 	}()
 }
 
+// snipeWatchHeldMarket registers EVERY token of market as a Held Watch for
+// chatID — the held/bought token AND its siblings (issue #78). The flip side is
+// where a comeback crash and the boxed case-3 buy actually land, and every
+// auto-buy tier hangs off that token's own in-band alert, so both sides must be
+// watched. Empty token IDs are skipped; the bought latch is never touched.
+// Shared by the buy path (snipeRegisterBoughtToken) and the position-refresh
+// path (registerSnipeHeld) so the sibling fan-out lives in one place.
+func (b *Bot) snipeWatchHeldMarket(chatID int64, market *polymarket.GammaMarket, ttl time.Duration) {
+	if b.snipeWatcher == nil || market == nil {
+		return
+	}
+	outcomes := market.GetOutcomes()
+	for i, tokenID := range market.GetClobTokenIds() {
+		if tokenID == "" {
+			continue
+		}
+		outcome := ""
+		if i < len(outcomes) {
+			outcome = outcomes[i]
+		}
+		b.snipeWatcher.WatchHeld(chatID, snipeMarketFromGamma(market, tokenID, outcome), ttl)
+	}
+}
+
 // registerSnipeHeld registers fetched positions as held-token watches with a
-// TTL. Metadata is fetched once per market and skipped entirely for tokens the
-// watcher already knows (TTL renewal only). Call with `go` from handlers.
+// TTL. Each position's WHOLE market is registered (both sides, issue #78);
+// metadata is fetched once per market and skipped entirely for tokens the
+// watcher already knows — RenewHeldMarket then renews the held token AND its
+// watched sibling, so the flip side's TTL never lapses out from under it. Call
+// with `go` from handlers.
 func (b *Bot) registerSnipeHeld(chatID int64, positions []*polymarket.Position) {
 	if b.snipeWatcher == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	marketClient := polymarket.NewMarketClient()
+	marketClient := b.snipeMarkets
+	if marketClient == nil {
+		marketClient = polymarket.NewMarketClient()
+	}
 	markets := make(map[string]*polymarket.GammaMarket)
 	for _, pos := range positions {
 		if pos.TokenID == "" {
 			continue
 		}
-		if b.snipeWatcher.RenewHeld(chatID, pos.TokenID, live.SnipeHeldTTL) {
+		if b.snipeWatcher.RenewHeldMarket(chatID, pos.TokenID, live.SnipeHeldTTL) {
 			continue
 		}
 		if pos.MarketID == "" {
@@ -1246,7 +1407,7 @@ func (b *Bot) registerSnipeHeld(chatID int64, positions []*polymarket.Position) 
 			market = m
 			markets[pos.MarketID] = m
 		}
-		b.snipeWatcher.WatchHeld(chatID, snipeMarketFromGamma(market, pos.TokenID, pos.Outcome), live.SnipeHeldTTL)
+		b.snipeWatchHeldMarket(chatID, market, live.SnipeHeldTTL)
 	}
 }
 
@@ -1289,18 +1450,13 @@ func (b *Bot) snipeRegisterBoughtToken(chatID int64, market *polymarket.GammaMar
 		return
 	}
 	tokenIDs := market.GetClobTokenIds()
-	if idx < 0 || idx >= len(tokenIDs) {
+	// idx validates the buy is real (the caller's bought outcome); the fan-out
+	// then registers BOTH sides of the market, since the flip side is where the
+	// comeback crash and the boxed case-3 buy land (issue #78).
+	if idx < 0 || idx >= len(tokenIDs) || tokenIDs[idx] == "" {
 		return
 	}
-	tokenID := tokenIDs[idx]
-	if tokenID == "" {
-		return
-	}
-	outcome := ""
-	if outcomes := market.GetOutcomes(); idx < len(outcomes) {
-		outcome = outcomes[idx]
-	}
-	b.snipeWatcher.WatchHeld(chatID, snipeMarketFromGamma(market, tokenID, outcome), live.SnipeHeldTTL)
+	b.snipeWatchHeldMarket(chatID, market, live.SnipeHeldTTL)
 }
 
 // snipeRegisterHeldForUser fetches the user's positions and registers them as

@@ -1084,6 +1084,38 @@ func TestSnipeWatcher_RenewHeld(t *testing.T) {
 	}
 }
 
+// TestSnipeWatcher_RenewHeldMarket: renewing a held token also renews every
+// watched token sharing its market (the sibling watch, issue #78), so a position
+// refresh that only sees the held side keeps the flip side alive too — otherwise
+// the sibling's TTL lapses and only one side stays watched.
+func TestSnipeWatcher_RenewHeldMarket(t *testing.T) {
+	t.Parallel()
+	w, _, _, notif, clock := snipeHarness()
+	if w.RenewHeldMarket(404, "A", time.Hour) {
+		t.Fatal("RenewHeldMarket on unknown token = true, want false")
+	}
+
+	a := startedMarket("A")
+	sib := startedMarket("B")
+	sib.MarketID = a.MarketID // two outcomes of one market
+	w.WatchHeld(404, a, time.Hour)
+	w.WatchHeld(404, sib, time.Hour)
+
+	clock.advance(30 * time.Minute)
+	if !w.RenewHeldMarket(404, "A", time.Hour) {
+		t.Fatal("RenewHeldMarket on watched token = false, want true")
+	}
+	clock.advance(45 * time.Minute) // original TTLs (60m) passed; renewed ones (90m) have not
+
+	// The SIBLING — never itself refreshed as a position — still alerts: its TTL
+	// rode the held token's market renewal.
+	w.evaluate("B", 0.45, 0.50)
+	w.evaluate("B", 0.10, 0.17)
+	if notif.count() != 1 {
+		t.Errorf("sibling alerts after market renew = %d, want 1 (TTL renewed with the market)", notif.count())
+	}
+}
+
 func TestSnipeWatcher_ArmedWatchDoesNotOwnFeedSubscription(t *testing.T) {
 	t.Parallel()
 	// Armed tokens already ride the SL/TP monitor's feed subscription; the

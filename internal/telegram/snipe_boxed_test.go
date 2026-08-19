@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Catorpilor/poly/internal/database"
 	"github.com/Catorpilor/poly/internal/database/repositories"
@@ -130,10 +131,11 @@ func TestNotifySnipeAlertCase3BoxedWait(t *testing.T) {
 	}
 }
 
-// TestNotifySnipeAlertCase3ImmediateWhenDeep: a case-3 recipient whose alert
-// ask is ALREADY ≤ 0.10 buys now (no postponement) and the flip token is
-// recorded (so the later boxed offer dedups).
-func TestNotifySnipeAlertCase3ImmediateWhenDeep(t *testing.T) {
+// TestNotifySnipeAlertCase3ImmediateLadders (issue #78 F3): a case-3 recipient
+// whose alert ask is ALREADY ≤ 0.10 buys tranche 1 ($5) at the alert — NOT a
+// flat $10 — and stays latched for tranche 2, which the watcher's ≤0.05 fire
+// adds. The watcher's tranche-1 fire must not re-buy. Total $10, never $15.
+func TestNotifySnipeAlertCase3ImmediateLadders(t *testing.T) {
 	t.Parallel()
 	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.09, askOK: true, user: snipeWalletUser()})
 	h.watch.siblings = []string{"sibB"}
@@ -142,16 +144,35 @@ func TestNotifySnipeAlertCase3ImmediateWhenDeep(t *testing.T) {
 
 	h.bot.NotifySnipeAlert(7, m, 0.45, 0.09)
 
+	// Immediate rung 1: exactly one $5 buy, flip token recorded, rung 2 latched.
 	if got := h.buys.count(); got != 1 {
-		t.Fatalf("buy calls = %d, want 1 (already ≤ 0.10 ⇒ buy now)", got)
+		t.Fatalf("immediate buys = %d, want 1", got)
+	}
+	if c := h.buys.call(t, 0); c.amount != snipeBoxedTrancheUSD {
+		t.Errorf("immediate case-3 amount = %v, want $5 (not the flat $10)", c.amount)
 	}
 	if !h.bot.snipeBought.held(7, m.TokenID) {
 		t.Error("immediate case-3 buy did not record the flip token")
 	}
-	// An immediate buy is NOT boxed-wait, so the latch is false — the ladder must
-	// not double-buy on top of the $10 already taken.
-	if h.bot.snipeBoxedLatch.eligible(7, m.TokenID) {
-		t.Error("immediate case-3 buy must leave the recipient NOT boxed-eligible")
+	if !h.bot.snipeBoxedLatch.eligible(7, m.TokenID) {
+		t.Error("immediate case-3 must leave tranche 2 latched")
+	}
+	if sent := h.tg.sentAt(t, 0); !strings.Contains(sent.text, "Boxed flip tranche 1") || strings.Contains(sent.text, "$10") {
+		t.Errorf("immediate case-3 alert must report the $5 tranche-1 buy, not $10:\n%s", sent.text)
+	}
+
+	// The watcher's tranche-1 fire must not re-buy (rung 1 consumed).
+	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.09, 1)
+	if got := h.buys.count(); got != 1 {
+		t.Fatalf("tranche-1 re-fire bought again: buys = %d, want 1 (no stacking to $15)", got)
+	}
+	// The watcher's tranche-2 fire adds the second $5 — total $10.
+	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.045, 2)
+	if got := h.buys.count(); got != 2 {
+		t.Fatalf("tranche-2 buys = %d, want 2 (total $10)", got)
+	}
+	if c := h.buys.call(t, 1); c.amount != snipeBoxedTrancheUSD {
+		t.Errorf("tranche-2 amount = %v, want $5", c.amount)
 	}
 }
 
@@ -187,7 +208,7 @@ func TestNotifySnipeBoxedTrancheBuysLatched(t *testing.T) {
 	t.Parallel()
 	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.09, askOK: true, user: snipeWalletUser()})
 	m := testSnipeMarket()
-	h.bot.snipeBoxedLatch.set(7, m.TokenID, true) // latched case-3 at alert time
+	h.bot.snipeBoxedLatch.arm(7, m.TokenID, true, true) // latched case-3 at alert time
 
 	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.09, 1)
 
@@ -313,11 +334,97 @@ func TestNotifySnipeBoxedSportGate(t *testing.T) {
 	t.Parallel()
 	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.09, askOK: true, user: snipeWalletUser()})
 	m := nonEsportsMarket()
-	h.bot.snipeBoxedLatch.set(7, m.TokenID, true)
+	h.bot.snipeBoxedLatch.arm(7, m.TokenID, true, true)
 
 	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.09, 1)
 
 	if got := h.buys.count(); got != 0 {
 		t.Fatalf("boxed buy calls = %d, want 0 (sport gate)", got)
+	}
+}
+
+// TestSnipeManualTapClearsBoxedLatch (issue #78 F2): a latched case-3 recipient
+// who taps the advertised "buy now anyway" button must not then get the ladder
+// stacked on top — the manual fill clears the latch, so later tranche fires are
+// no-ops.
+func TestSnipeManualTapClearsBoxedLatch(t *testing.T) {
+	t.Parallel()
+	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.18, askOK: true, user: snipeWalletUser()})
+	h.watch.siblings = []string{"sibB"}
+	h.bot.snipeBought.mark(7, "sibB")
+	m := testSnipeMarket()
+
+	// Case-3 boxed-wait alert latches both rungs and advertises the manual tap.
+	h.bot.NotifySnipeAlert(7, m, 0.45, 0.18)
+	tapData := callbackData(t, h.tg.sentAt(t, 0).markup, "⚡ Snipe $25")
+
+	// The user taps "buy now anyway" — a successful manual snipe.
+	h.bot.handleSnipeCallback(context.Background(), snipeTapUpdate(7, tapData))
+	if h.bot.snipeBoxedLatch.eligible(7, m.TokenID) {
+		t.Fatal("a manual tap must clear the boxed latch (F2)")
+	}
+
+	buysAfterTap := h.buys.count()
+	// The watcher's later tranche fires must NOT stack more buys.
+	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.09, 1)
+	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.045, 2)
+	if got := h.buys.count(); got != buysAfterTap {
+		t.Errorf("tranche fires after a manual tap bought %d more, want 0 (F2)", got-buysAfterTap)
+	}
+}
+
+// TestNotifySnipeAlertCase3ImmediateFailureRetries (issue #78 F3): when the
+// immediate case-3 $5 buy FAILS, BOTH rungs stay latched so the watcher's boxed
+// re-offers retry — the recipient is not dropped for the episode.
+func TestNotifySnipeAlertCase3ImmediateFailureRetries(t *testing.T) {
+	t.Parallel()
+	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{
+		ask: 0.09, askOK: true, user: snipeWalletUser(),
+		buyResult: &polymarket.TradeResult{Success: false, ErrorMsg: "rejected"},
+	})
+	h.watch.siblings = []string{"sibB"}
+	h.bot.snipeBought.mark(7, "sibB")
+	m := testSnipeMarket()
+
+	h.bot.NotifySnipeAlert(7, m, 0.45, 0.09)
+
+	// The immediate $5 was attempted and failed; both rungs stay armed for retry.
+	if got := h.buys.count(); got != 1 {
+		t.Fatalf("immediate attempts = %d, want 1", got)
+	}
+	if !h.bot.snipeBoxedLatch.eligible(7, m.TokenID) {
+		t.Fatal("a failed immediate case-3 buy must keep the recipient latched (retry)")
+	}
+	// Both tranche fires retry.
+	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.09, 1)
+	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.045, 2)
+	if got := h.buys.count(); got != 3 {
+		t.Errorf("retry attempts = %d, want 3 (immediate + both tranches)", got)
+	}
+}
+
+// TestNotifySnipeBoxedStaleLatchSkipped (issue #78 F4): a latch older than its
+// TTL belongs to an episode the recipient never saw a fresh alert for and must
+// not fire; a fresh arm re-enables it.
+func TestNotifySnipeBoxedStaleLatchSkipped(t *testing.T) {
+	t.Parallel()
+	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.09, askOK: true, user: snipeWalletUser()})
+	m := testSnipeMarket()
+	base := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	clock := base
+	h.bot.snipeBoxedLatch.now = func() time.Time { return clock }
+
+	h.bot.snipeBoxedLatch.arm(7, m.TokenID, true, true) // stamped at base
+	clock = base.Add(snipeBoxedLatchTTL + time.Minute)  // latch now stale
+	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.09, 1)
+	if got := h.buys.count(); got != 0 {
+		t.Fatalf("stale-latch tranche bought (%d), want 0 (F4)", got)
+	}
+
+	// A fresh arm re-enables the buy.
+	h.bot.snipeBoxedLatch.arm(7, m.TokenID, true, true)
+	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.09, 1)
+	if got := h.buys.count(); got != 1 {
+		t.Errorf("fresh-latch tranche buys = %d, want 1", got)
 	}
 }

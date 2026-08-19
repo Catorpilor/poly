@@ -404,6 +404,31 @@ func (w *SnipeWatcher) RenewHeld(chatID int64, tokenID string, ttl time.Duration
 	return true
 }
 
+// RenewHeldMarket extends chatID's holder TTL for tokenID AND every currently
+// watched token sharing its market (the sibling watch, issue #78). A position
+// refresh usually sees only the held side; without renewing the flip side too,
+// the sibling's TTL lapses and only one side stays watched — regressing the
+// sibling registration. Returns false when tokenID is not watched (the caller
+// must WatchHeld with full metadata, which co-registers the siblings).
+func (w *SnipeWatcher) RenewHeldMarket(chatID int64, tokenID string, ttl time.Duration) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	st := w.tokens[tokenID]
+	if st == nil {
+		return false
+	}
+	exp := w.now().Add(ttl)
+	st.holders[chatID] = exp
+	if marketID := st.market.MarketID; marketID != "" {
+		for id, other := range w.tokens {
+			if id != tokenID && other.market.MarketID == marketID {
+				other.holders[chatID] = exp
+			}
+		}
+	}
+	return true
+}
+
 // MarkBought latches the bought flag: a snipe buy silences the token's alerts
 // for the rest of the match (state is per-session; matches end with the
 // market, so no un-latch is needed).

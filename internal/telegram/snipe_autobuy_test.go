@@ -240,9 +240,9 @@ func (f *fakeSnipeWatch) WatchArmed(m live.SnipeMarket) {
 	f.armed = append(f.armed, m)
 	f.mu.Unlock()
 }
-func (f *fakeSnipeWatch) UnwatchArmed(string)                              {}
-func (f *fakeSnipeWatch) WatchHeld(int64, live.SnipeMarket, time.Duration) {}
-func (f *fakeSnipeWatch) RenewHeld(int64, string, time.Duration) bool      { return true }
+func (f *fakeSnipeWatch) UnwatchArmed(string)                               {}
+func (f *fakeSnipeWatch) WatchHeld(int64, live.SnipeMarket, time.Duration)  {}
+func (f *fakeSnipeWatch) RenewHeldMarket(int64, string, time.Duration) bool { return true }
 
 func (f *fakeSnipeWatch) MarkBought(tokenID string) {
 	f.mu.Lock()
