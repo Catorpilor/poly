@@ -1064,26 +1064,6 @@ func TestSnipeWatcher_HeldTTLExpires(t *testing.T) {
 	}
 }
 
-func TestSnipeWatcher_RenewHeld(t *testing.T) {
-	t.Parallel()
-	w, _, _, notif, clock := snipeHarness()
-	if w.RenewHeld(404, "T1", time.Hour) {
-		t.Fatal("RenewHeld on unknown token = true, want false")
-	}
-	w.WatchHeld(404, startedMarket("T1"), time.Hour)
-	clock.advance(30 * time.Minute)
-	if !w.RenewHeld(404, "T1", time.Hour) {
-		t.Fatal("RenewHeld on watched token = false, want true")
-	}
-	clock.advance(45 * time.Minute) // original TTL passed, renewed one has not
-
-	w.evaluate("T1", 0.45, 0.50)
-	w.evaluate("T1", 0.10, 0.17)
-	if notif.count() != 1 {
-		t.Errorf("alerts after renew = %d, want 1 (registration still live)", notif.count())
-	}
-}
-
 // TestSnipeWatcher_RenewHeldMarket: renewing a held token also renews every
 // watched token sharing its market (the sibling watch, issue #78), so a position
 // refresh that only sees the held side keeps the flip side alive too — otherwise

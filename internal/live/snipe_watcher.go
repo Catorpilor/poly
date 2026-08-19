@@ -390,20 +390,6 @@ func (w *SnipeWatcher) WatchHeld(chatID int64, m SnipeMarket, ttl time.Duration)
 	}
 }
 
-// RenewHeld extends a holder's TTL when the token is already watched, so
-// callers can skip re-fetching market metadata. Returns false for unknown
-// tokens (caller must WatchHeld with full metadata instead).
-func (w *SnipeWatcher) RenewHeld(chatID int64, tokenID string, ttl time.Duration) bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	st := w.tokens[tokenID]
-	if st == nil {
-		return false
-	}
-	st.holders[chatID] = w.now().Add(ttl)
-	return true
-}
-
 // RenewHeldMarket extends chatID's holder TTL for tokenID AND every currently
 // watched token sharing its market (the sibling watch, issue #78). A position
 // refresh usually sees only the held side; without renewing the flip side too,
