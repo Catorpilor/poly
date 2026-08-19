@@ -104,7 +104,7 @@ func TestHandleTradeRegistersHeldOnSuccess(t *testing.T) {
 	if !waitWatched(w, "ml-blg", time.Second) {
 		t.Fatal("ml-blg not registered as held after a successful web buy")
 	}
-	if !w.RenewHeld(42, "ml-blg", SnipeHeldTTL) {
+	if !w.RenewHeldMarket(42, "ml-blg", SnipeHeldTTL) {
 		t.Error("buyer chatID 42 is not a holder of ml-blg")
 	}
 }

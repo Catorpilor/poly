@@ -552,6 +552,16 @@ func (m *LiveTradeManager) snipeWatchEvent(eventSlug string, eventInfo *EventInf
 // a no-op). It searches ALL of the event's markets — the buy may target a
 // sub-market that the Moneyline resolution excludes — and never touches the
 // bought latch, which is token-level and would silence every holder.
+//
+// Sibling watch (issue #78): once the bought token's market is identified, ALL
+// of that market's tokens are registered — not just the bought one. The flip
+// side is where the crash actually lands (hold NSEA at ~0.80, the DNS flip
+// crashes to 0.035 and wins), and every auto-buy tier — including the boxed
+// case-3 flip buy that IS the whole point of holding one side — hangs off the
+// SAME token's in-band alert. Registering only the bought token left the
+// sibling out of the watcher entirely, so no tier could ever fire on it. Held
+// watchers thereby get full recipient semantics identical to event subscribers,
+// whose WatchEventMarkets already registers both sides.
 func (m *LiveTradeManager) RegisterHeldBuy(telegramID int64, eventSlug, tokenID string, eventInfo *EventInfo) {
 	if m.snipeWatcher == nil || eventInfo == nil {
 		return
@@ -560,13 +570,23 @@ func (m *LiveTradeManager) RegisterHeldBuy(telegramID int64, eventSlug, tokenID 
 	for i := range eventInfo.Markets {
 		markets = append(markets, &eventInfo.Markets[i])
 	}
-	for _, sm := range snipeMarketsFor(markets) {
+	sms := snipeMarketsFor(markets)
+	marketID, found := "", false
+	for _, sm := range sms {
 		if sm.TokenID == tokenID {
-			m.snipeWatcher.WatchHeld(telegramID, sm, SnipeHeldTTL)
-			return
+			marketID, found = sm.MarketID, true
+			break
 		}
 	}
-	log.Printf("LiveTradeManager: RegisterHeldBuy unknown token=%.12s… event=%s", tokenID, eventSlug)
+	if !found {
+		log.Printf("LiveTradeManager: RegisterHeldBuy unknown token=%.12s… event=%s", tokenID, eventSlug)
+		return
+	}
+	for _, sm := range sms {
+		if sm.MarketID == marketID {
+			m.snipeWatcher.WatchHeld(telegramID, sm, SnipeHeldTTL)
+		}
+	}
 }
 
 // snipeUnwatchIfUnsubscribed releases an event's snipe watch when its last

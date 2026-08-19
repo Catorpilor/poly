@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -25,7 +26,7 @@ type heldWatchCall struct {
 
 func (c *capturingHeldWatch) WatchArmed(live.SnipeMarket) {}
 func (c *capturingHeldWatch) UnwatchArmed(string)         {}
-func (c *capturingHeldWatch) RenewHeld(int64, string, time.Duration) bool {
+func (c *capturingHeldWatch) RenewHeldMarket(int64, string, time.Duration) bool {
 	return false
 }
 func (c *capturingHeldWatch) WatchHeld(chatID int64, m live.SnipeMarket, ttl time.Duration) {
@@ -58,8 +59,9 @@ func boughtTokenMarket() *polymarket.GammaMarket {
 	}
 }
 
-// TestSnipeRegisterBoughtToken: the helper registers the bought token as a Held
-// Watch directly from the Gamma market, lag-free (issue #67).
+// TestSnipeRegisterBoughtToken: the helper registers the bought token AND its
+// flip sibling as Held Watches directly from the Gamma market, lag-free (issue
+// #67) — the sibling watch (issue #78) means both sides enter the watcher.
 func TestSnipeRegisterBoughtToken(t *testing.T) {
 	t.Parallel()
 	wantStart := boughtTokenMarket().GetGameStartTime()
@@ -67,49 +69,46 @@ func TestSnipeRegisterBoughtToken(t *testing.T) {
 		t.Fatal("fixture gameStartTime did not parse — test would be meaningless")
 	}
 
-	tests := []struct {
-		name        string
-		idx         int
-		wantToken   string
-		wantOutcome string
-	}{
-		{"index 0 registers T1", 0, "tok-t1", "T1"},
-		{"index 1 registers Gen.G", 1, "tok-geng", "Gen.G"},
-	}
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
+	// Either bought index registers BOTH tokens of the market.
+	for _, idx := range []int{0, 1} {
+		idx := idx
+		t.Run(fmt.Sprintf("bought idx %d registers both sides", idx), func(t *testing.T) {
 			t.Parallel()
 			watch := &capturingHeldWatch{}
 			b := &Bot{snipeWatcher: watch}
 
-			b.snipeRegisterBoughtToken(7, boughtTokenMarket(), tt.idx)
+			b.snipeRegisterBoughtToken(7, boughtTokenMarket(), idx)
 
 			calls := watch.heldCalls()
-			if len(calls) != 1 {
-				t.Fatalf("WatchHeld calls = %d, want 1", len(calls))
+			if len(calls) != 2 {
+				t.Fatalf("WatchHeld calls = %d, want 2 (both sides)", len(calls))
 			}
-			got := calls[0]
-			if got.chatID != 7 {
-				t.Errorf("chatID = %d, want 7", got.chatID)
+			byToken := map[string]heldWatchCall{}
+			for _, c := range calls {
+				byToken[c.market.TokenID] = c
 			}
-			if got.ttl != live.SnipeHeldTTL {
-				t.Errorf("ttl = %v, want %v", got.ttl, live.SnipeHeldTTL)
-			}
-			if got.market.TokenID != tt.wantToken {
-				t.Errorf("TokenID = %q, want %q", got.market.TokenID, tt.wantToken)
-			}
-			if got.market.Outcome != tt.wantOutcome {
-				t.Errorf("Outcome = %q, want %q", got.market.Outcome, tt.wantOutcome)
-			}
-			if got.market.MarketID != "157417" {
-				t.Errorf("MarketID = %q, want 157417", got.market.MarketID)
-			}
-			if got.market.Question != "LoL: T1 vs. Gen.G" {
-				t.Errorf("Question = %q, want the market question", got.market.Question)
-			}
-			if !got.market.GameStart.Equal(wantStart) {
-				t.Errorf("GameStart = %v, want %v", got.market.GameStart, wantStart)
+			for _, want := range []struct{ token, outcome string }{
+				{"tok-t1", "T1"}, {"tok-geng", "Gen.G"},
+			} {
+				got, ok := byToken[want.token]
+				if !ok {
+					t.Fatalf("token %q not registered; got %v", want.token, calls)
+				}
+				if got.chatID != 7 {
+					t.Errorf("%s chatID = %d, want 7", want.token, got.chatID)
+				}
+				if got.ttl != live.SnipeHeldTTL {
+					t.Errorf("%s ttl = %v, want %v", want.token, got.ttl, live.SnipeHeldTTL)
+				}
+				if got.market.Outcome != want.outcome {
+					t.Errorf("%s Outcome = %q, want %q", want.token, got.market.Outcome, want.outcome)
+				}
+				if got.market.MarketID != "157417" {
+					t.Errorf("%s MarketID = %q, want 157417", want.token, got.market.MarketID)
+				}
+				if !got.market.GameStart.Equal(wantStart) {
+					t.Errorf("%s GameStart = %v, want %v", want.token, got.market.GameStart, wantStart)
+				}
 			}
 			if len(watch.bought) != 0 {
 				t.Errorf("MarkBought called %d time(s), want 0 — a manual buy is not a snipe fill", len(watch.bought))
