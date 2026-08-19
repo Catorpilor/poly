@@ -249,3 +249,21 @@ retry delay) and re-derive each from the same source; (3) verify latency
 fixes by measuring the WORST case (spacing/duration of failures), not
 the success rate — "more polls succeed" and "dead polls still cost 78s"
 were both true at once.
+
+## 2026-08-19 — Search for the existing feature before designing its replacement
+Designing the #78 fix (buy the flip side cheap), I proposed new
+mechanisms through two grill rounds before the user pointed at the
+existing Lottery toggle ("other side @ ≤$0.05") — which I had even SEEN
+in that morning's logs (the sltp:lot button) without connecting it. Its
+mechanics (ceiling-triggered, $5, ≤0.05, opt-in) changed the whole
+option space: the final ladder design deliberately absorbed its unique
+coverage row. Rules: (1) before proposing any new mechanism, grep the
+domain vocabulary for prior art (the feature was one `grep -rn lottery`
+away) and read what surfaced in today's own logs; (2) present overlap
+as a coverage matrix (which scenario does each mechanism catch) — it
+converts "new feature vs old feature" into a factual gap analysis;
+(3) when a fix targets a dispatch/registration gap, enumerate ALL call
+sites of the behavior, not the one function named in the diagnosis —
+round 1 fixed only the web path because the spec said "RegisterHeldBuy"
+while telegram buys registered elsewhere (caught by independent verify,
+would have shipped the bug unfixed for the primary path).
