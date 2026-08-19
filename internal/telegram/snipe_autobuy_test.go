@@ -350,16 +350,17 @@ func newSnipeAutoBuyHarness(t *testing.T, cfg snipeHarnessConfig) *snipeAutoBuyH
 		bid, bidOK = cfg.bid, cfg.bidOK
 	}
 	b := &Bot{
-		api:          api,
-		userRepo:     &fakeSnipeUserRepo{user: cfg.user},
-		snipeFeed:    &fakeAskSource{ask: cfg.ask, askOK: cfg.askOK, bid: bid, bidOK: bidOK},
-		snipeAlerts:    newSnipeAlertRegistry(),
-		snipeSpend:     newSnipeSpendLedger(snipeAutoBuyDailyCapUSD),
-		snipeDeepSpend: newSnipeSpendLedger(snipeDeepDailyCapUSD),
-		snipeBought:    newSnipeBoughtRecord(),
-		snipePositions: &fakePositionSource{positions: cfg.positions, err: cfg.posErr},
-		snipeWatcher:   watch,
-		snipeMarkets: polymarket.NewMarketClientWithURL(gamma.URL),
+		api:             api,
+		userRepo:        &fakeSnipeUserRepo{user: cfg.user},
+		snipeFeed:       &fakeAskSource{ask: cfg.ask, askOK: cfg.askOK, bid: bid, bidOK: bidOK},
+		snipeAlerts:     newSnipeAlertRegistry(),
+		snipeSpend:      newSnipeSpendLedger(snipeAutoBuyDailyCapUSD),
+		snipeDeepSpend:  newSnipeSpendLedger(snipeDeepDailyCapUSD),
+		snipeBought:     newSnipeBoughtRecord(),
+		snipeBoxedLatch: newSnipeBoxedLatch(),
+		snipePositions:  &fakePositionSource{positions: cfg.positions, err: cfg.posErr},
+		snipeWatcher:    watch,
+		snipeMarkets:    polymarket.NewMarketClientWithURL(gamma.URL),
 	}
 	b.snipeBuyExec = func(_ context.Context, user *database.User, _ *polymarket.GammaMarket, idx int, amount float64) *polymarket.TradeResult {
 		return buys.record(user, idx, amount)

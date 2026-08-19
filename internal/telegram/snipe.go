@@ -52,6 +52,11 @@ const (
 	// (ADR 0007) — deliberately half the in-band stake: the base rate below
 	// the corpse floor is worse and the payoff floor is 33×.
 	snipeDeepBuyUSD = 5.0
+	// snipeBoxedTrancheUSD is the stake per boxed ladder rung (issue #78): the
+	// case-3 flip is bought as two $5 tranches ($5 at ≤ $0.10, $5 at ≤ $0.05)
+	// instead of a single $10 at ≤ $0.10 — same $10 max exposure, half the corpse
+	// bleed on the shallower rung. Each tranche draws the main daily cap.
+	snipeBoxedTrancheUSD = 5.0
 	// snipeDeepDailyCapUSD bounds Deep Crash spend in its own pool, isolating
 	// corpse false-positives from the main band's budget.
 	snipeDeepDailyCapUSD = 20.0
@@ -157,6 +162,43 @@ func (r *snipeBoughtRecord) held(chatID int64, tokenID string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.bought[chatID][tokenID]
+}
+
+// snipeBoxedLatch records, per recipient, which alerted token they are
+// boxed-eligible for in the current episode. It is set at in-band alert time —
+// true when that recipient was case-3 (held the other side) and the ask was
+// still above the boxed zone (outcome snipeBuyBoxedWait), false otherwise — and
+// overwritten on every in-band alert for that (chatID, tokenID). The watcher
+// fires the in-band alert once per episode, so that per-alert overwrite IS the
+// episode boundary. On a boxed tranche fire the notifier consults THIS latch
+// instead of re-checking sibling holdings (issue #78): a mid-episode ceiling
+// harvest of the held winner — exactly the moment the flip ticket is most wanted
+// (ledger r72) — must not cancel the postponed flip buy. In-memory, never
+// cleared during a run; matches end with their markets, so staleness is bounded.
+type snipeBoxedLatch struct {
+	mu      sync.Mutex
+	latched map[int64]map[string]bool // chatID -> tokenID -> boxed-eligible
+}
+
+func newSnipeBoxedLatch() *snipeBoxedLatch {
+	return &snipeBoxedLatch{latched: make(map[int64]map[string]bool)}
+}
+
+// set overwrites (chatID, tokenID)'s boxed-eligibility for the current episode.
+func (l *snipeBoxedLatch) set(chatID int64, tokenID string, eligible bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.latched[chatID] == nil {
+		l.latched[chatID] = make(map[string]bool)
+	}
+	l.latched[chatID][tokenID] = eligible
+}
+
+// eligible reports whether (chatID, tokenID) is boxed-eligible this episode.
+func (l *snipeBoxedLatch) eligible(chatID int64, tokenID string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.latched[chatID][tokenID]
 }
 
 // The bot is the snipe watcher's notifier (wired in cmd/bot/main.go).
@@ -368,7 +410,7 @@ func snipeSkipNote(res snipeBuyResult) string {
 	case snipeBuyDeepHeld:
 		reason = "you already hold this token — not topping up a held position"
 	case snipeBuyBoxedWait:
-		reason = "you hold the other side — waiting for ≤ $0.10 to buy the flip deep"
+		reason = "you hold the other side — laddering the flip deep ($5 at ≤ $0.10 + $5 at ≤ $0.05)"
 	default:
 		reason = "auto-buy unavailable"
 	}
@@ -447,6 +489,13 @@ func (b *Bot) NotifySnipeAlert(chatID int64, market live.SnipeMarket, sessionHig
 // (with a one-line note when the daily cap was the blocker).
 func (b *Bot) snipeAlertMessage(chatID int64, alertID string, market live.SnipeMarket, sessionHigh, ask float64) (string, tgbotapi.InlineKeyboardMarkup) {
 	res, capLeft, status := b.snipeAutoBuy(chatID, market)
+	// Latch this recipient's boxed eligibility for the episode: true only when
+	// the in-band buy was postponed as case-3 (snipeBuyBoxedWait). The overwrite
+	// on every in-band alert IS the episode boundary — the boxed ladder later
+	// consults this instead of re-checking sibling holdings (issue #78).
+	if b.snipeBoxedLatch != nil {
+		b.snipeBoxedLatch.set(chatID, market.TokenID, res.outcome == snipeBuyBoxedWait)
+	}
 	switch status {
 	case snipeAutoBought:
 		return snipeAutoBoughtText(market.Question, market.Outcome, sessionHigh, ask, snipeAutoBuyUSD, res.orderID, capLeft),
@@ -466,17 +515,22 @@ func (b *Bot) snipeAlertMessage(chatID int64, alertID string, market live.SnipeM
 	}
 }
 
-// NotifySnipeBoxed implements the boxed tier (feat/boxed-snipe-postpone): the
-// watcher re-offers the alerted token in the deep flip zone. Only a case-3
-// recipient (holds the OTHER side) acts, and only if they haven't already bought
-// the flip token this episode; everyone else had their chance at the in-band
-// alert and gets nothing here (no message). On a fill it runs the identical
-// post-fill ceremony as the in-band buy (mark, TP-only auto-arm) via
-// snipeAutoBuyExec, and DMs a boxed confirmation.
-func (b *Bot) NotifySnipeBoxed(chatID int64, market live.SnipeMarket, sessionHigh, ask float64) {
-	// Dedup: an immediate in-band buy (ask already ≤ 0.10) or a manual tap
-	// already funded the flip token this episode.
-	if b.snipeBought != nil && b.snipeBought.held(chatID, market.TokenID) {
+// NotifySnipeBoxed implements one rung of the boxed ladder (issue #78): the
+// watcher re-offers the alerted token in a boxed flip zone (tranche 1 at
+// ≤ $0.10, tranche 2 at ≤ $0.05). Only a recipient latched case-3 at this
+// episode's in-band alert acts — the latch, not a fire-time sibling re-check, is
+// the decision, so a mid-episode ceiling harvest of the held winner cannot
+// cancel the flip buy (ledger r72). Everyone else had their chance at the
+// in-band alert and gets nothing here (no message). On a fill it runs the
+// identical post-fill ceremony as the in-band buy (mark, TP-only auto-arm) via
+// snipeAutoBuyExec at the $5 tranche stake, and DMs a boxed confirmation.
+func (b *Bot) NotifySnipeBoxed(chatID int64, market live.SnipeMarket, sessionHigh, ask float64, tranche int) {
+	// Eligibility is the alert-time latch alone: a recipient not case-3 when the
+	// episode alerted never boxed-buys, and a latched one buys BOTH tranches even
+	// if the held side was sold since. No snipeBought dedup here — the latch is
+	// false for anyone who bought the flip at the alert (immediate case-3) or in
+	// band (case-2), so the two rungs are the only boxed buys this episode.
+	if b.snipeBoxedLatch == nil || !b.snipeBoxedLatch.eligible(chatID, market.TokenID) {
 		return
 	}
 	// Sport gate (esports-only), mirroring the other tiers.
@@ -489,35 +543,33 @@ func (b *Bot) NotifySnipeBoxed(chatID int64, market live.SnipeMarket, sessionHig
 	if err != nil || user == nil {
 		return
 	}
-	if !b.snipeHoldsSibling(ctx, user, chatID, market) {
-		return // case-1/case-2: no message, no buy
-	}
-	res, capLeft, status := b.snipeAutoBuyExec(ctx, chatID, user, market)
+	res, capLeft, status := b.snipeAutoBuyExec(ctx, chatID, user, market, snipeBoxedTrancheUSD)
 	if status != snipeAutoBought {
-		log.Printf("Snipe boxed-buy: skipped chat=%d token=%.12s… reason=%d", chatID, market.TokenID, res.outcome)
+		log.Printf("Snipe boxed-buy: skipped chat=%d token=%.12s… tranche=%d reason=%d", chatID, market.TokenID, tranche, res.outcome)
 		return
 	}
 	alertID := b.snipeAlerts.add(market)
 	b.sendMessageWithKeyboard(chatID,
-		snipeBoxedBoughtText(market.Question, market.Outcome, ask, snipeAutoBuyUSD, res.orderID, capLeft),
+		snipeBoxedBoughtText(market.Question, market.Outcome, ask, snipeBoxedTrancheUSD, tranche, res.orderID, capLeft),
 		snipeAutoBoughtKeyboard(alertID))
 }
 
 // snipeBoxedWaitNote is appended to the in-band alert for a case-3 recipient
-// whose ask is still above the boxed threshold: the auto-buy is postponed, but
-// the manual tap buttons remain live.
-const snipeBoxedWaitNote = "\n\n📦 You already hold the other side. The auto-buy is *waiting for ≤ $0.10* to grab this flip ticket deep — your held side rides to the ceiling. Tap below to buy now anyway."
+// whose ask is still above the boxed threshold: the auto-buy is postponed into
+// the ladder, but the manual tap buttons remain live.
+const snipeBoxedWaitNote = "\n\n📦 You already hold the other side. The auto-buy is *waiting to buy the flip deep — $5 at ≤ $0.10 + $5 at ≤ $0.05* — your held side rides to the ceiling. Tap below to buy now anyway."
 
-// snipeBoxedBoughtText is the boxed auto-buy confirmation. Pure — table-tested.
-func snipeBoxedBoughtText(question, outcome string, ask, amount float64, orderID string, capLeft float64) string {
+// snipeBoxedBoughtText is the boxed ladder confirmation for one tranche. Pure —
+// table-tested.
+func snipeBoxedBoughtText(question, outcome string, ask, amount float64, tranche int, orderID string, capLeft float64) string {
 	return fmt.Sprintf(
-		"📦 *Boxed flip — auto-sniped $%.0f*\n\n"+
+		"📦 *Boxed flip tranche %d — auto-sniped $%.0f*\n\n"+
 			"*%s*\n"+
 			"*Side:* Buy %s\n"+
 			"You hold the other side; grabbed this flip ticket deep at $%.3f.\n\n"+
 			"*Order ID:* %s\n"+
 			"Auto-snipe cap left today: $%.0f",
-		amount, truncateUTF8(question, 60), outcome, ask, orderID, capLeft)
+		tranche, amount, truncateUTF8(question, 60), outcome, ask, orderID, capLeft)
 }
 
 // snipeDeepText builds the Deep Crash body — blunt about the base rate: this
@@ -852,10 +904,13 @@ func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResul
 
 	// Case 3 (boxed): the recipient already holds the OTHER side of this market.
 	// With TP-only auto-arms the held side harvests at the $0.95 ceiling, so the
-	// flip ticket is better bought deep — postpone the $10 until ask ≤
-	// SnipeBoxedMaxAsk. The watcher's boxed tier re-offers the token in that
-	// zone. If it is already there at the alert, fall through and buy now (the
-	// bought-record mark below then dedups the boxed offer). Regime bet: the
+	// flip ticket is better bought deep — postpone into the boxed ladder ($5 at
+	// ≤ $0.10 + $5 at ≤ $0.05) instead of the in-band $10. Returning
+	// snipeBuyBoxedWait here latches this recipient boxed-eligible for the episode
+	// (snipeAlertMessage), so the watcher's tranches buy for them even if the held
+	// side is harvested mid-episode (issue #78). If the ask is ALREADY ≤ 0.10 at
+	// the alert, fall through and buy the $10 now (the bought-record mark and a
+	// false latch then keep the ladder from double-buying). Regime bet: the
 	// ledger's case-3-at-0.20 taps were historically the best subclass — we
 	// deliberately trade them for deeper flip tickets under the ceiling regime.
 	if b.snipeHoldsSibling(ctx, user, chatID, market) {
@@ -870,16 +925,17 @@ func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResul
 		}
 	}
 
-	return b.snipeAutoBuyExec(ctx, chatID, user, market)
+	return b.snipeAutoBuyExec(ctx, chatID, user, market, snipeAutoBuyUSD)
 }
 
-// snipeAutoBuyExec is the shared in-band $10 buy ceremony — cap reserve/refund,
+// snipeAutoBuyExec is the shared main-pool buy ceremony — cap reserve/refund,
 // the guarded buy with the corpse-spread gate, bought-record bookkeeping, and
-// the TP-only auto-arm. Reused by the in-band alert path (snipeAutoBuy) and the
-// boxed dispatch (NotifySnipeBoxed) so the reserve/refund cap logic lives in one
-// place. Callers own the sport gate, wallet lookup, and case-3 decision.
-func (b *Bot) snipeAutoBuyExec(ctx context.Context, chatID int64, user *database.User, market live.SnipeMarket) (snipeBuyResult, float64, snipeAutoStatus) {
-	capLeft, ok := b.snipeSpend.reserve(chatID, snipeAutoBuyUSD)
+// the TP-only auto-arm. Reused by the in-band alert path (snipeAutoBuy, $10) and
+// each boxed ladder tranche (NotifySnipeBoxed, $5) so the reserve/refund cap
+// logic lives in one place; amount is the per-call stake. Callers own the sport
+// gate, wallet lookup, and case-3 decision.
+func (b *Bot) snipeAutoBuyExec(ctx context.Context, chatID int64, user *database.User, market live.SnipeMarket, amount float64) (snipeBuyResult, float64, snipeAutoStatus) {
+	capLeft, ok := b.snipeSpend.reserve(chatID, amount)
 	if !ok {
 		log.Printf("Snipe auto-buy: cap reached chat=%d", chatID)
 		return snipeBuyResult{}, capLeft, snipeAutoCapReached
@@ -891,24 +947,24 @@ func (b *Bot) snipeAutoBuyExec(ctx context.Context, chatID int64, user *database
 		outcome:  market.Outcome,
 	}
 	// corpseGuard=true adds Gate 2 to the shared guarded buy.
-	res := b.snipeGuardedBuyRefuse(ctx, user, entry, snipeAutoBuyUSD, snipeRefuseBuy, true)
+	res := b.snipeGuardedBuyRefuse(ctx, user, entry, amount, snipeRefuseBuy, true)
 	if res.outcome != snipeBuyFilled {
-		b.snipeSpend.release(chatID, snipeAutoBuyUSD)
+		b.snipeSpend.release(chatID, amount)
 		log.Printf("Snipe auto-buy: skipped chat=%d token=%.12s… reason=%d err=%v msg=%s",
 			chatID, market.TokenID, res.outcome, res.err, res.errorMsg)
 		return res, 0, snipeAutoSkipped
 	}
 	// Record the holding so a later Deep Crash fire on this token is
-	// holdings-gated (Gate 3a), and so the boxed offer dedups. Only the in-band
-	// auto-buy and the one-tap feed this record — never the deep tier itself.
+	// holdings-gated (Gate 3a). Only the in-band auto-buy, one-tap, and boxed
+	// tranches feed this record — never the deep tier itself.
 	if b.snipeBought != nil {
 		b.snipeBought.mark(chatID, market.TokenID)
 	}
 	// Auto-arm TP + ceiling (no trailing SL) from the fill — async, never blocks
 	// alert delivery.
-	go b.snipeAutoArmTPOnly(chatID, market.TokenID, market.Question, market.Outcome, res, snipeAutoBuyUSD)
+	go b.snipeAutoArmTPOnly(chatID, market.TokenID, market.Question, market.Outcome, res, amount)
 	log.Printf("Snipe auto-buy: accepted chat=%d token=%.12s… $%.0f order=%s cap-left=$%.2f",
-		chatID, market.TokenID, snipeAutoBuyUSD, res.orderID, capLeft)
+		chatID, market.TokenID, amount, res.orderID, capLeft)
 	return res, capLeft, snipeAutoBought
 }
 

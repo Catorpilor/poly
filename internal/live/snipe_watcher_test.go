@@ -1,11 +1,34 @@
 package live
 
 import (
+	"bytes"
+	"log"
 	"math"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// syncBuffer is a concurrency-safe bytes.Buffer for capturing the global logger
+// while parallel siblings are paused (the log-line test is non-parallel).
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // --- fakes ---
 
@@ -29,6 +52,7 @@ type snipeBoxedRec struct {
 	tokenID string
 	high    float64
 	ask     float64
+	tranche int
 }
 
 type fakeSnipeNotifier struct {
@@ -50,10 +74,10 @@ func (n *fakeSnipeNotifier) NotifySnipeDeepCrash(chatID int64, market SnipeMarke
 	n.deeps = append(n.deeps, snipeDeepRec{chatID: chatID, tokenID: market.TokenID, ask: ask, alertAsk: alertAsk, sinceAlert: sinceAlert})
 }
 
-func (n *fakeSnipeNotifier) NotifySnipeBoxed(chatID int64, market SnipeMarket, sessionHigh, ask float64) {
+func (n *fakeSnipeNotifier) NotifySnipeBoxed(chatID int64, market SnipeMarket, sessionHigh, ask float64, tranche int) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.boxeds = append(n.boxeds, snipeBoxedRec{chatID: chatID, tokenID: market.TokenID, high: sessionHigh, ask: ask})
+	n.boxeds = append(n.boxeds, snipeBoxedRec{chatID: chatID, tokenID: market.TokenID, high: sessionHigh, ask: ask, tranche: tranche})
 }
 
 func (n *fakeSnipeNotifier) deepCount() int {
@@ -256,7 +280,7 @@ func TestSnipeWatcher_PairAlertInstrumentation(t *testing.T) {
 	rec.eventSubs["evt"] = []int64{101}
 	a := startedMarket("TA")
 	b := startedMarket("TB")
-	b.MarketID = a.MarketID // two outcomes of one market share the market ID
+	b.MarketID = a.MarketID      // two outcomes of one market share the market ID
 	other := startedMarket("TC") // unrelated market
 	w.WatchEventMarkets("evt", []SnipeMarket{a, b, other})
 
@@ -423,7 +447,7 @@ func TestSnipeWatcher_ResetRequiresSustainedRecovery(t *testing.T) {
 				{bid: 0.10, ask: 0.17}, // alert #1
 				{bid: 0.12, ask: 0.34},
 				{bid: 0.12, ask: 0.34, advance: snipeResetConfirm + time.Second}, // held above reset
-				{bid: 0.08, ask: 0.16},                                           // alert #2
+				{bid: 0.08, ask: 0.16}, // alert #2
 			},
 			want: 2,
 		},
@@ -491,8 +515,8 @@ func (n *reentrantSnipeNotifier) NotifySnipeDeepCrash(chatID int64, market Snipe
 	n.inner.NotifySnipeDeepCrash(chatID, market, sessionHigh, ask, alertAsk, sinceAlert)
 }
 
-func (n *reentrantSnipeNotifier) NotifySnipeBoxed(chatID int64, market SnipeMarket, sessionHigh, ask float64) {
-	n.inner.NotifySnipeBoxed(chatID, market, sessionHigh, ask)
+func (n *reentrantSnipeNotifier) NotifySnipeBoxed(chatID int64, market SnipeMarket, sessionHigh, ask float64, tranche int) {
+	n.inner.NotifySnipeBoxed(chatID, market, sessionHigh, ask, tranche)
 }
 
 // TestSnipeWatcher_DeepCrash covers ADR 0007: the sub-corpse-floor tier fires
@@ -546,8 +570,8 @@ func TestSnipeWatcher_DeepCrash(t *testing.T) {
 		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
 
 		w.evaluate("T1", 0.45, 0.50)
-		w.evaluate("T1", 0.10, 0.17)   // in-band alert
-		w.evaluate("T1", 0.01, 0.004)  // below SnipeDeepFloor: dust, silent
+		w.evaluate("T1", 0.10, 0.17)  // in-band alert
+		w.evaluate("T1", 0.01, 0.004) // below SnipeDeepFloor: dust, silent
 		if notif.deepCount() != 0 {
 			t.Fatalf("deep fired below the floor")
 		}
@@ -601,14 +625,15 @@ func TestSnipeWatcher_DeepCrash(t *testing.T) {
 	})
 }
 
-// TestSnipeWatcher_Boxed covers the boxed tier (feat/boxed-snipe-postpone): the
-// alerted token is re-offered once its ask reaches [SnipeDeepFloor,
-// SnipeBoxedMaxAsk] within an episode that already produced an in-band alert,
-// fires once per episode, ignores the bought latch, and resets with the episode.
+// TestSnipeWatcher_Boxed covers the boxed ladder (issue #78): after an in-band
+// alert, the alerted token is re-offered as two independent $5 rungs — tranche 1
+// at the first touch of [SnipeDeepFloor, SnipeBoxedMaxAsk], tranche 2 at the
+// deeper [SnipeDeepFloor, SnipeBoxedDeepAsk]. Each rung fires once per episode,
+// ignores the bought latch, and resets with the episode.
 func TestSnipeWatcher_Boxed(t *testing.T) {
 	t.Parallel()
 
-	t.Run("fires once at the 0.10 cross after an in-band alert, past the bought latch", func(t *testing.T) {
+	t.Run("tranche 1 fires once at the 0.10 cross, tranche 2 stays silent above 0.05", func(t *testing.T) {
 		t.Parallel()
 		w, _, rec, notif, _ := snipeHarness()
 		rec.eventSubs["evt"] = []int64{101}
@@ -620,13 +645,99 @@ func TestSnipeWatcher_Boxed(t *testing.T) {
 			t.Fatalf("boxed fired in the same evaluate as the in-band alert")
 		}
 		w.MarkBought("T1")           // someone bought the crashed side
-		w.evaluate("T1", 0.02, 0.09) // now ≤ 0.10 → boxed fires
-		w.evaluate("T1", 0.02, 0.08) // still in zone → already latched
+		w.evaluate("T1", 0.02, 0.09) // ≤ 0.10 but > 0.05 → tranche 1 only
+		w.evaluate("T1", 0.02, 0.08) // still > 0.05, tranche 1 latched → nothing
 		if notif.count() != 1 || notif.boxedCount() != 1 {
 			t.Fatalf("alerts=%d boxed=%d, want 1 and 1", notif.count(), notif.boxedCount())
 		}
-		if bx := notif.boxedAt(0); bx.ask != 0.09 || bx.chatID != 101 {
-			t.Errorf("boxed record = %+v, want ask 0.09 chat 101", bx)
+		if bx := notif.boxedAt(0); bx.ask != 0.09 || bx.chatID != 101 || bx.tranche != 1 {
+			t.Errorf("boxed record = %+v, want ask 0.09 chat 101 tranche 1", bx)
+		}
+	})
+
+	t.Run("gradual fall fires tranche 1 then tranche 2 on separate ticks", func(t *testing.T) {
+		t.Parallel()
+		w, _, rec, notif, _ := snipeHarness()
+		rec.eventSubs["evt"] = []int64{101}
+		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+
+		w.evaluate("T1", 0.585, 0.50)
+		w.evaluate("T1", 0.10, 0.17) // in-band alert
+		w.evaluate("T1", 0.02, 0.09) // tranche 1 (≤ 0.10, > 0.05)
+		if notif.boxedCount() != 1 {
+			t.Fatalf("after the 0.10 cross boxed=%d, want 1", notif.boxedCount())
+		}
+		w.evaluate("T1", 0.02, 0.045) // tranche 2 (≤ 0.05)
+		if notif.boxedCount() != 2 {
+			t.Fatalf("after the 0.05 cross boxed=%d, want 2", notif.boxedCount())
+		}
+		if a, b := notif.boxedAt(0), notif.boxedAt(1); a.tranche != 1 || b.tranche != 2 || b.ask != 0.045 {
+			t.Errorf("tranches = [%d@%.3f, %d@%.3f], want [1@0.090, 2@0.045]", a.tranche, a.ask, b.tranche, b.ask)
+		}
+	})
+
+	t.Run("gap straight to ≤ 0.05 fires BOTH tranches in one evaluate", func(t *testing.T) {
+		t.Parallel()
+		w, _, rec, notif, _ := snipeHarness()
+		rec.eventSubs["evt"] = []int64{101}
+		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+
+		w.evaluate("T1", 0.585, 0.50)
+		w.evaluate("T1", 0.10, 0.17) // in-band alert
+		// Gap past both zones but above the deep zone (≥ 0.03, so deep does not
+		// pre-empt): one evaluate fires tranche 1 AND tranche 2.
+		w.evaluate("T1", 0.02, 0.045)
+		if notif.deepCount() != 0 {
+			t.Fatalf("deep fired at 0.045 (should be ≥ SnipeMinAsk)")
+		}
+		if notif.boxedCount() != 2 {
+			t.Fatalf("gap-to-deep boxed=%d, want 2 (both tranches one tick)", notif.boxedCount())
+		}
+		if a, b := notif.boxedAt(0), notif.boxedAt(1); a.tranche != 1 || b.tranche != 2 {
+			t.Errorf("tranches on the gap tick = [%d, %d], want [1, 2]", a.tranche, b.tranche)
+		}
+	})
+
+	t.Run("gap into the deep zone: deep pre-empts, both tranches fire the next tick", func(t *testing.T) {
+		t.Parallel()
+		w, _, rec, notif, _ := snipeHarness()
+		rec.eventSubs["evt"] = []int64{101}
+		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+
+		w.evaluate("T1", 0.45, 0.50)
+		w.evaluate("T1", 0.10, 0.17)  // in-band alert
+		w.evaluate("T1", 0.01, 0.004) // below SnipeDeepFloor: nothing fires
+		if notif.boxedCount() != 0 || notif.deepCount() != 0 {
+			t.Fatalf("something fired below the deep floor (deep=%d boxed=%d)", notif.deepCount(), notif.boxedCount())
+		}
+		// Inside [SnipeDeepFloor, SnipeMinAsk) deep and both boxed rungs all apply;
+		// the dispatching latch makes deep win the first tick, both rungs the next.
+		w.evaluate("T1", 0.01, 0.02)
+		if notif.deepCount() != 1 || notif.boxedCount() != 0 {
+			t.Fatalf("first deep-zone tick: deep=%d boxed=%d, want 1 and 0", notif.deepCount(), notif.boxedCount())
+		}
+		w.evaluate("T1", 0.01, 0.02)
+		if notif.deepCount() != 1 || notif.boxedCount() != 2 {
+			t.Errorf("deep=%d boxed=%d, want 1 and 2 (both rungs after deep)", notif.deepCount(), notif.boxedCount())
+		}
+	})
+
+	t.Run("boxed is mutually exclusive with the in-band fire in one evaluate", func(t *testing.T) {
+		t.Parallel()
+		w, _, rec, notif, _ := snipeHarness()
+		rec.eventSubs["evt"] = []int64{101}
+		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+
+		w.evaluate("T1", 0.585, 0.50)
+		// A first crash straight into the fire∩boxed overlap [0.03, 0.10]: fire
+		// takes the tick (sets dispatching); boxed must wait.
+		w.evaluate("T1", 0.10, 0.08)
+		if notif.count() != 1 || notif.boxedCount() != 0 {
+			t.Fatalf("overlap tick: alerts=%d boxed=%d, want 1 and 0", notif.count(), notif.boxedCount())
+		}
+		w.evaluate("T1", 0.10, 0.08) // next tick: tranche 1 fires
+		if notif.boxedCount() != 1 || notif.boxedAt(0).tranche != 1 {
+			t.Errorf("post-fire boxed=%d tranche=%d, want 1 and tranche 1", notif.boxedCount(), notif.boxedAt(0).tranche)
 		}
 	})
 
@@ -636,38 +747,16 @@ func TestSnipeWatcher_Boxed(t *testing.T) {
 		rec.eventSubs["evt"] = []int64{101}
 		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
 
-		// Sub-competitive high: never fires the in-band alert, so the boxed tier
-		// (which requires it) must stay silent even at a ≤ 0.10 ask.
+		// Sub-competitive high: never fires the in-band alert, so the boxed ladder
+		// (which requires it) must stay silent even at a ≤ 0.05 ask.
 		w.evaluate("T1", 0.30, 0.35)
-		w.evaluate("T1", 0.02, 0.09)
+		w.evaluate("T1", 0.02, 0.04)
 		if notif.count() != 0 || notif.boxedCount() != 0 {
 			t.Errorf("alerts=%d boxed=%d, want 0 and 0", notif.count(), notif.boxedCount())
 		}
 	})
 
-	t.Run("below the deep floor nothing fires; in the deep overlap zone deep fires then boxed", func(t *testing.T) {
-		t.Parallel()
-		w, _, rec, notif, _ := snipeHarness()
-		rec.eventSubs["evt"] = []int64{101}
-		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
-
-		w.evaluate("T1", 0.45, 0.50)
-		w.evaluate("T1", 0.10, 0.17)  // in-band alert
-		w.evaluate("T1", 0.01, 0.004) // below SnipeDeepFloor: nothing
-		if notif.boxedCount() != 0 || notif.deepCount() != 0 {
-			t.Fatalf("something fired below the deep floor (deep=%d boxed=%d)", notif.deepCount(), notif.boxedCount())
-		}
-		// Inside [SnipeDeepFloor, SnipeMinAsk) both zones apply; the dispatching
-		// latch makes deep win the first tick and boxed the next — case-3 still
-		// gets its postponed offer on a straight-to-deep crash.
-		w.evaluate("T1", 0.01, 0.02)
-		w.evaluate("T1", 0.01, 0.02)
-		if notif.deepCount() != 1 || notif.boxedCount() != 1 {
-			t.Errorf("deep=%d boxed=%d, want 1 and 1 (deep then boxed in the overlap)", notif.deepCount(), notif.boxedCount())
-		}
-	})
-
-	t.Run("upper bound: 0.10 inclusive, just above stays silent", func(t *testing.T) {
+	t.Run("tranche 1 upper bound: 0.10 inclusive, just above stays silent", func(t *testing.T) {
 		t.Parallel()
 		w, _, rec, notif, _ := snipeHarness()
 		rec.eventSubs["evt"] = []int64{101}
@@ -679,13 +768,31 @@ func TestSnipeWatcher_Boxed(t *testing.T) {
 		if notif.boxedCount() != 0 {
 			t.Fatalf("boxed fired above SnipeBoxedMaxAsk")
 		}
-		w.evaluate("T1", 0.05, SnipeBoxedMaxAsk) // exactly 0.10: fires
-		if notif.boxedCount() != 1 {
-			t.Errorf("boxed at exactly SnipeBoxedMaxAsk = %d fires, want 1", notif.boxedCount())
+		w.evaluate("T1", 0.05, SnipeBoxedMaxAsk) // exactly 0.10: tranche 1 fires
+		if notif.boxedCount() != 1 || notif.boxedAt(0).tranche != 1 {
+			t.Errorf("boxed at exactly SnipeBoxedMaxAsk = %d fires tranche %d, want 1 and tranche 1", notif.boxedCount(), notif.boxedAt(0).tranche)
 		}
 	})
 
-	t.Run("sustained recovery resets the boxed latch (re-fires next episode)", func(t *testing.T) {
+	t.Run("tranche 2 upper bound: 0.05 inclusive, just above fires only tranche 1", func(t *testing.T) {
+		t.Parallel()
+		w, _, rec, notif, _ := snipeHarness()
+		rec.eventSubs["evt"] = []int64{101}
+		w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+
+		w.evaluate("T1", 0.45, 0.50)
+		w.evaluate("T1", 0.10, 0.17)  // in-band alert
+		w.evaluate("T1", 0.02, 0.051) // just above 0.05 → tranche 1 only
+		if notif.boxedCount() != 1 || notif.boxedAt(0).tranche != 1 {
+			t.Fatalf("at 0.051 boxed=%d (tranche %d), want 1 tranche 1", notif.boxedCount(), notif.boxedAt(0).tranche)
+		}
+		w.evaluate("T1", 0.02, SnipeBoxedDeepAsk) // exactly 0.05 → tranche 2 fires
+		if notif.boxedCount() != 2 || notif.boxedAt(1).tranche != 2 {
+			t.Errorf("at exactly SnipeBoxedDeepAsk boxed=%d, want 2 with tranche 2", notif.boxedCount())
+		}
+	})
+
+	t.Run("sustained recovery resets BOTH latches (re-fires both next episode)", func(t *testing.T) {
 		t.Parallel()
 		w, _, rec, notif, clock := snipeHarness()
 		rec.eventSubs["evt"] = []int64{101}
@@ -693,16 +800,43 @@ func TestSnipeWatcher_Boxed(t *testing.T) {
 
 		w.evaluate("T1", 0.45, 0.50)
 		w.evaluate("T1", 0.10, 0.17) // alert #1
-		w.evaluate("T1", 0.02, 0.09) // boxed #1
+		w.evaluate("T1", 0.02, 0.04) // both tranches (gap ≤ 0.05)
+		if notif.boxedCount() != 2 {
+			t.Fatalf("episode 1 boxed=%d, want 2", notif.boxedCount())
+		}
 		w.evaluate("T1", 0.12, 0.34)
 		clock.advance(snipeResetConfirm + time.Second)
 		w.evaluate("T1", 0.12, 0.34) // sustained recovery: episode resets
 		w.evaluate("T1", 0.08, 0.16) // alert #2
-		w.evaluate("T1", 0.02, 0.08) // boxed #2
-		if notif.boxedCount() != 2 {
-			t.Errorf("boxed=%d, want 2 (latch reset with the episode)", notif.boxedCount())
+		w.evaluate("T1", 0.02, 0.04) // both tranches again
+		if notif.boxedCount() != 4 {
+			t.Errorf("boxed=%d, want 4 (both rungs re-fire after reset)", notif.boxedCount())
 		}
 	})
+}
+
+// TestSnipeWatcher_BoxedLogLine pins the production log contract: a boxed fire
+// logs the exact prefix "SnipeWatcher: boxed" (a monitor matches on it) and a
+// tranche= field so the September review can score the two rungs separately.
+// Not parallel: it redirects the global logger for the duration.
+func TestSnipeWatcher_BoxedLogLine(t *testing.T) {
+	buf := &syncBuffer{}
+	log.SetOutput(buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	w, _, rec, _, _ := snipeHarness()
+	rec.eventSubs["evt"] = []int64{101}
+	w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+	w.evaluate("T1", 0.45, 0.50)
+	w.evaluate("T1", 0.10, 0.17) // in-band alert
+	w.evaluate("T1", 0.02, 0.04) // both tranches fire
+
+	out := buf.String()
+	for _, want := range []string{"SnipeWatcher: boxed", "tranche=1", "tranche=2"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("boxed log missing %q in:\n%s", want, out)
+		}
+	}
 }
 
 // TestSnipeWatcher_NoResetWhileDispatching: even a SUSTAINED above-reset

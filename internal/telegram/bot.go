@@ -44,15 +44,19 @@ type Bot struct {
 	// maps short callback IDs to token/market info (token IDs are ~78 digits,
 	// far beyond Telegram's 64-byte callback data); spend ledger caps the v2
 	// auto-buys per UTC day.
-	snipeWatcher snipeWatch
-	snipeFeed    SnipeAskSource
-	snipeAlerts  *snipeAlertRegistry
+	snipeWatcher   snipeWatch
+	snipeFeed      SnipeAskSource
+	snipeAlerts    *snipeAlertRegistry
 	snipeSpend     *snipeSpendLedger
 	snipeDeepSpend *snipeSpendLedger
 	// snipeBought records tokens snipe-bought per recipient (in-band auto-buy
 	// or one-tap) — read by the Deep Crash holdings gate to avoid topping up a
 	// held corpse.
-	snipeBought    *snipeBoughtRecord
+	snipeBought *snipeBoughtRecord
+	// snipeBoxedLatch records who was case-3 (postponed flip) at each in-band
+	// alert; the boxed ladder buys per tranche for latched recipients only
+	// (issue #78), so a mid-episode ceiling harvest cannot cancel the flip buy.
+	snipeBoxedLatch *snipeBoxedLatch
 	// snipeMarkets and snipeBuyExec are test seams for the snipe buy path;
 	// nil selects production (a fresh Gamma client / executeBuyOrderByIndex).
 	snipeMarkets *polymarket.MarketClient
@@ -127,25 +131,26 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 	liveManager := live.NewLiveTradeManager()
 
 	bot := &Bot{
-		api:            api,
-		config:         cfg,
-		db:             db,
-		userRepo:       repositories.NewUserRepository(db),
-		loginTokenRepo: repositories.NewLoginTokenRepository(db),
-		sltpArmRepo:    repositories.NewSLTPArmRepository(db),
-		handlers:       make(map[string]CommandHandler),
-		rateLimiter:    NewRateLimiter(cfg.Security.RateLimitPerUser, time.Duration(cfg.Security.RateLimitWindowMins)*time.Minute),
-		stateManager:   NewStateManager(),
-		walletManager:  walletManager,
-		blockchain:     blockchainClient,
-		proxyResolver:  proxyResolver,
-		tradingClient:  tradingClient,
-		relayerClient:  relayerClient,
-		liveManager:    liveManager,
-		snipeAlerts:    newSnipeAlertRegistry(),
-		snipeSpend:     newSnipeSpendLedger(snipeAutoBuyDailyCapUSD),
-		snipeDeepSpend: newSnipeSpendLedger(snipeDeepDailyCapUSD),
-		snipeBought:    newSnipeBoughtRecord(),
+		api:             api,
+		config:          cfg,
+		db:              db,
+		userRepo:        repositories.NewUserRepository(db),
+		loginTokenRepo:  repositories.NewLoginTokenRepository(db),
+		sltpArmRepo:     repositories.NewSLTPArmRepository(db),
+		handlers:        make(map[string]CommandHandler),
+		rateLimiter:     NewRateLimiter(cfg.Security.RateLimitPerUser, time.Duration(cfg.Security.RateLimitWindowMins)*time.Minute),
+		stateManager:    NewStateManager(),
+		walletManager:   walletManager,
+		blockchain:      blockchainClient,
+		proxyResolver:   proxyResolver,
+		tradingClient:   tradingClient,
+		relayerClient:   relayerClient,
+		liveManager:     liveManager,
+		snipeAlerts:     newSnipeAlertRegistry(),
+		snipeSpend:      newSnipeSpendLedger(snipeAutoBuyDailyCapUSD),
+		snipeDeepSpend:  newSnipeSpendLedger(snipeDeepDailyCapUSD),
+		snipeBought:     newSnipeBoughtRecord(),
+		snipeBoxedLatch: newSnipeBoxedLatch(),
 	}
 
 	// Set bot as telegram sender for live manager

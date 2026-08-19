@@ -40,16 +40,21 @@ func snipeResetAsk() float64 {
 // dust and never fires (observed winners bottomed at 0.0065 and 0.015).
 const SnipeDeepFloor = 0.005
 
-// SnipeBoxedMaxAsk bounds the boxed tier (feat/boxed-snipe-postpone): a
-// recipient who already holds the OTHER side of the market ("case 3") should
-// not take the in-band $10 at ~0.20 — with TP-only auto-arms the held side
-// harvests at the $0.95 ceiling, so the flip ticket is better bought deep. The
-// watcher re-offers the alerted token once its ask reaches
-// [SnipeDeepFloor, SnipeBoxedMaxAsk]; the bot decides who is case-3 and dedups
-// per recipient. Regime bet: the ledger's case-3-at-0.20 taps were historically
-// the best subclass — this deliberately trades them for deeper flip tickets
-// under the auto-arm-ceiling regime.
-const SnipeBoxedMaxAsk = 0.10
+// SnipeBoxedMaxAsk / SnipeBoxedDeepAsk bound the two rungs of the boxed ladder
+// (issue #78): a recipient who already holds the OTHER side of the market
+// ("case 3") should not take the in-band $10 at ~0.20 — with TP-only auto-arms
+// the held side harvests at the $0.95 ceiling, so the flip ticket is better
+// bought deep. The single $10-at-≤0.10 offer becomes two $5 tranches: one at the
+// first touch of [SnipeDeepFloor, SnipeBoxedMaxAsk], one at the first touch of
+// the deeper [SnipeDeepFloor, SnipeBoxedDeepAsk]. $5@0.05 pays about the same as
+// $10@0.10 with half the corpse bleed but misses flips bottoming 0.06–0.09; the
+// ladder dominates both single policies in the win cases at the same $10 max
+// exposure. The bot decides who is case-3 (latched at alert time) and buys per
+// tranche.
+const (
+	SnipeBoxedMaxAsk  = 0.10
+	SnipeBoxedDeepAsk = 0.05
+)
 
 // Shadow underdog-dip instrumentation (log-only, September review). The
 // Enterprise case (2026-08-07): a 0.365-high underdog dipped to 0.095 and won
@@ -105,11 +110,13 @@ type SnipeMarket struct {
 type SnipeNotifier interface {
 	NotifySnipeAlert(chatID int64, market SnipeMarket, sessionHigh, ask float64)
 	NotifySnipeDeepCrash(chatID int64, market SnipeMarket, sessionHigh, ask, alertAsk float64, sinceAlert time.Duration)
-	// NotifySnipeBoxed is the boxed tier (feat/boxed-snipe-postpone): the
-	// alerted token has reached the deep flip zone after an in-band alert. The
-	// bot acts only for case-3 recipients (those holding the other side) and
-	// dedups per recipient.
-	NotifySnipeBoxed(chatID int64, market SnipeMarket, sessionHigh, ask float64)
+	// NotifySnipeBoxed is one rung of the boxed ladder (issue #78): the alerted
+	// token has reached a boxed flip zone after an in-band alert. tranche is 1
+	// ([SnipeDeepFloor, SnipeBoxedMaxAsk]) or 2 (the deeper
+	// [SnipeDeepFloor, SnipeBoxedDeepAsk]); a gap crash fires both on one tick.
+	// The bot acts only for recipients latched case-3 at alert time and buys $5
+	// per tranche.
+	NotifySnipeBoxed(chatID int64, market SnipeMarket, sessionHigh, ask float64, tranche int)
 }
 
 // SnipeHistorySeeder supplies a token's recent trade high so a Session High
@@ -165,11 +172,14 @@ type snipeTokenState struct {
 	// the same sustained recovery that clears alerted (ADR 0007). Deliberately
 	// NOT gated on bought — the in-band auto-buy usually already fired.
 	deepAlerted bool
-	// boxedAlerted latches the boxed tier: once per episode, cleared by the same
-	// sustained recovery that clears alerted. Like deepAlerted it ignores bought
-	// — case-3 recipients hold the OTHER side, so this token's bought latch does
-	// not describe them.
-	boxedAlerted bool
+	// boxed1Alerted / boxed2Alerted latch the two rungs of the boxed ladder
+	// (issue #78): tranche 1 at the [SnipeDeepFloor, SnipeBoxedMaxAsk] cross,
+	// tranche 2 at the deeper [SnipeDeepFloor, SnipeBoxedDeepAsk] cross. Each
+	// fires once per episode and clears with alerted. Like deepAlerted they
+	// ignore bought — case-3 recipients hold the OTHER side, so this token's
+	// bought latch does not describe them.
+	boxed1Alerted bool
+	boxed2Alerted bool
 	// Watch sources. A token stays watched while any source is live.
 	events  map[string]bool     // subscribed event slugs
 	armed   bool                // watched because an SL/TP arm exists
@@ -568,7 +578,8 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		} else if now.Sub(st.resetSince) >= snipeResetConfirm {
 			st.alerted = false
 			st.deepAlerted = false
-			st.boxedAlerted = false
+			st.boxed1Alerted = false
+			st.boxed2Alerted = false
 			st.shadowAlerted = false
 			st.resetSince = time.Time{}
 		}
@@ -587,6 +598,8 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		st.lastAlertAt = now
 		st.alertAsk = ask
 		st.deepAlerted = false
+		st.boxed1Alerted = false
+		st.boxed2Alerted = false
 		pairAgo = "never"
 		if at, ok := w.pairLastAlertLocked(st.market.MarketID, tokenID); ok {
 			pairAgo = now.Sub(at).Round(time.Second).String()
@@ -609,20 +622,30 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		alertAsk = st.alertAsk
 	}
 
-	// Boxed tier (feat/boxed-snipe-postpone): re-offer the alerted token once it
-	// reaches the deep flip zone [SnipeDeepFloor, SnipeBoxedMaxAsk] so a case-3
-	// recipient (holds the OTHER side) can buy the flip ticket deep instead of
-	// at the ~0.20 in-band price. Requires this episode's in-band alert, fires
-	// once, ignores bought — the bot decides case-3 and dedups per recipient.
-	// The zone overlaps Deep Crash's on purpose: a crash that jumps straight
-	// below 0.03 must still offer case-3 its postponed $10. !dispatching keeps it
-	// exclusive with fire/deepFire within a single evaluate; across ticks it
-	// fires on the next one (intended — see the bot's per-recipient dedup).
-	boxedFire := st.alerted && !st.boxedAlerted && !st.dispatching && !fire && !deepFire &&
-		ask >= SnipeDeepFloor && ask <= SnipeBoxedMaxAsk &&
-		w.inPlay(st.market, now)
-	if boxedFire {
-		st.boxedAlerted = true
+	// Boxed ladder (issue #78): re-offer the alerted token deep so a case-3
+	// recipient (holds the OTHER side) buys the flip ticket cheap instead of at
+	// the ~0.20 in-band price. Two independent $5 rungs replace the single $10:
+	// tranche 1 at the first touch of [SnipeDeepFloor, SnipeBoxedMaxAsk], tranche
+	// 2 at the first touch of the deeper [SnipeDeepFloor, SnipeBoxedDeepAsk]. A
+	// gradual fall fires them on separate ticks; a crash that gaps straight to
+	// ≤ SnipeBoxedDeepAsk fires BOTH on one tick. Requires this episode's in-band
+	// alert, each rung fires once, ignores bought — the bot decides case-3 (via
+	// the alert-time latch) and buys per tranche. The zones overlap Deep Crash's
+	// on purpose: a crash that jumps straight below 0.03 must still offer case-3
+	// its postponed flip. !dispatching keeps the ladder exclusive with
+	// fire/deepFire within a single evaluate; across ticks it fires on the next
+	// one (a straight-to-deep crash offers the flip on the tick after deep).
+	boxedZone := st.alerted && !st.dispatching && !fire && !deepFire &&
+		ask >= SnipeDeepFloor && w.inPlay(st.market, now)
+	boxed1Fire := boxedZone && !st.boxed1Alerted && ask <= SnipeBoxedMaxAsk
+	boxed2Fire := boxedZone && !st.boxed2Alerted && ask <= SnipeBoxedDeepAsk
+	if boxed1Fire {
+		st.boxed1Alerted = true
+	}
+	if boxed2Fire {
+		st.boxed2Alerted = true
+	}
+	if boxed1Fire || boxed2Fire {
 		st.dispatching = true
 	}
 
@@ -640,6 +663,7 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 
 	market := st.market
 	high := st.sessionHigh
+	boxedFire := boxed1Fire || boxed2Fire
 	var eventSlugs []string
 	var holders []int64
 	if fire || deepFire || boxedFire {
@@ -671,14 +695,11 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		log.Printf("SnipeWatcher: deep-crash token=%.12s… high=%.3f ask=%.3f bid=%.3f sinceAlert=%s alertAsk=%.3f recipients=%d",
 			tokenID, high, ask, bid, sinceAlert.Round(time.Second), alertAsk, recipients)
 	}
-	if boxedFire {
-		recipients := 0
-		for _, chatID := range w.recipientOrder(market, eventSlugs, holders) {
-			w.notifier.NotifySnipeBoxed(chatID, market, high, ask)
-			recipients++
-		}
-		log.Printf("SnipeWatcher: boxed token=%.12s… high=%.3f ask=%.3f bid=%.3f recipients=%d",
-			tokenID, high, ask, bid, recipients)
+	if boxed1Fire {
+		w.notifyBoxedTranche(market, high, ask, bid, tokenID, eventSlugs, holders, 1)
+	}
+	if boxed2Fire {
+		w.notifyBoxedTranche(market, high, ask, bid, tokenID, eventSlugs, holders, 2)
 	}
 	if shadowFire {
 		log.Printf("SnipeWatcher: shadow-alert class=underdog-dip token=%.12s… high=%.3f ask=%.3f bid=%.3f impliedComplement=%.3f",
@@ -691,6 +712,20 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		}
 		w.mu.Unlock()
 	}
+}
+
+// notifyBoxedTranche delivers one boxed ladder rung to the episode's recipients
+// and logs it. The log prefix "SnipeWatcher: boxed" is matched by a production
+// monitor and must stay exact; tranche=N scores the two rungs separately for
+// the September fills/skips review (issue #78).
+func (w *SnipeWatcher) notifyBoxedTranche(market SnipeMarket, high, ask, bid float64, tokenID string, eventSlugs []string, holders []int64, tranche int) {
+	recipients := 0
+	for _, chatID := range w.recipientOrder(market, eventSlugs, holders) {
+		w.notifier.NotifySnipeBoxed(chatID, market, high, ask, tranche)
+		recipients++
+	}
+	log.Printf("SnipeWatcher: boxed token=%.12s… high=%.3f ask=%.3f bid=%.3f tranche=%d recipients=%d",
+		tokenID, high, ask, bid, tranche, recipients)
 }
 
 // pairLastAlertLocked returns the most recent alert time among OTHER tokens

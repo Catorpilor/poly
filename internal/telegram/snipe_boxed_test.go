@@ -97,14 +97,16 @@ func TestSnipeHoldsSibling(t *testing.T) {
 }
 
 // TestNotifySnipeAlertCase3BoxedWait: a case-3 recipient at ask 0.18 gets no
-// in-band buy — the alert says the auto-buy waits for ≤ $0.10, taps stay live.
+// in-band buy — the alert says the auto-buy ladders the flip ($5 at ≤ $0.10 +
+// $5 at ≤ $0.05), taps stay live, and the recipient is latched boxed-eligible.
 func TestNotifySnipeAlertCase3BoxedWait(t *testing.T) {
 	t.Parallel()
 	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.18, askOK: true, user: snipeWalletUser()})
 	h.watch.siblings = []string{"sibB"}
 	h.bot.snipeBought.mark(7, "sibB") // holds the other side
+	m := testSnipeMarket()
 
-	h.bot.NotifySnipeAlert(7, testSnipeMarket(), 0.45, 0.18)
+	h.bot.NotifySnipeAlert(7, m, 0.45, 0.18)
 
 	if got := h.buys.count(); got != 0 {
 		t.Fatalf("buy calls = %d, want 0 (boxed-wait)", got)
@@ -113,8 +115,12 @@ func TestNotifySnipeAlertCase3BoxedWait(t *testing.T) {
 	if !strings.Contains(sent.text, "Comeback Snipe") || strings.Contains(sent.text, "Auto-sniped") {
 		t.Errorf("boxed-wait alert wrong:\n%s", sent.text)
 	}
-	if !strings.Contains(sent.text, "other side") || !strings.Contains(sent.text, "0.10") {
-		t.Errorf("boxed-wait alert must explain the postponement:\n%s", sent.text)
+	if !strings.Contains(sent.text, "other side") || !strings.Contains(sent.text, "0.10") || !strings.Contains(sent.text, "0.05") {
+		t.Errorf("boxed-wait alert must explain the ladder:\n%s", sent.text)
+	}
+	// The recipient is now latched boxed-eligible for the episode.
+	if !h.bot.snipeBoxedLatch.eligible(7, m.TokenID) {
+		t.Error("case-3 boxed-wait alert did not latch the recipient boxed-eligible")
 	}
 	callbackData(t, sent.markup, "⚡ Snipe $10")
 	callbackData(t, sent.markup, "⚡ Snipe $25")
@@ -142,6 +148,11 @@ func TestNotifySnipeAlertCase3ImmediateWhenDeep(t *testing.T) {
 	if !h.bot.snipeBought.held(7, m.TokenID) {
 		t.Error("immediate case-3 buy did not record the flip token")
 	}
+	// An immediate buy is NOT boxed-wait, so the latch is false — the ladder must
+	// not double-buy on top of the $10 already taken.
+	if h.bot.snipeBoxedLatch.eligible(7, m.TokenID) {
+		t.Error("immediate case-3 buy must leave the recipient NOT boxed-eligible")
+	}
 }
 
 // TestNotifySnipeAlertCase2Unchanged: a non-case-3 recipient at ask 0.18 buys
@@ -158,75 +169,153 @@ func TestNotifySnipeAlertCase2Unchanged(t *testing.T) {
 	}
 }
 
-// TestNotifySnipeBoxedBuysCase3: the boxed dispatch buys $10 for a case-3
-// recipient who hasn't bought the flip token yet, and DMs a boxed confirmation.
-func TestNotifySnipeBoxedBuysCase3(t *testing.T) {
+// TestSnipeBoxedBoughtText: the tranche confirmation states the tranche number,
+// the $5 stake, the fill price, order ID, and cap left. Pure — table-tested.
+func TestSnipeBoxedBoughtText(t *testing.T) {
+	t.Parallel()
+	got := snipeBoxedBoughtText("LoL: T1 vs. Gen.G", "T1", 0.045, snipeBoxedTrancheUSD, 2, "ord-b2", 35)
+	for _, want := range []string{"Boxed flip tranche 2", "$5", "T1", "$0.045", "ord-b2", "$35"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("snipeBoxedBoughtText missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+// TestNotifySnipeBoxedTrancheBuysLatched: a latched recipient's tranche buys $5
+// from the main pool, records the flip token, and DMs a tranche confirmation.
+func TestNotifySnipeBoxedTrancheBuysLatched(t *testing.T) {
 	t.Parallel()
 	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.09, askOK: true, user: snipeWalletUser()})
-	h.watch.siblings = []string{"sibB"}
-	h.bot.snipeBought.mark(7, "sibB") // case-3, but flip token A not yet bought
 	m := testSnipeMarket()
+	h.bot.snipeBoxedLatch.set(7, m.TokenID, true) // latched case-3 at alert time
 
-	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.09)
+	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.09, 1)
 
 	if got := h.buys.count(); got != 1 {
 		t.Fatalf("boxed buy calls = %d, want 1", got)
+	}
+	if c := h.buys.call(t, 0); c.amount != snipeBoxedTrancheUSD {
+		t.Errorf("boxed tranche amount = %v, want %v", c.amount, snipeBoxedTrancheUSD)
 	}
 	if !h.bot.snipeBought.held(7, m.TokenID) {
 		t.Error("boxed buy did not record the flip token")
 	}
 	sent := h.tg.sentAt(t, 0)
-	if !strings.Contains(sent.text, "Boxed") || !strings.Contains(sent.text, "ord-auto") {
+	if !strings.Contains(sent.text, "Boxed flip tranche 1") || !strings.Contains(sent.text, "ord-auto") {
 		t.Errorf("boxed buy confirmation wrong:\n%s", sent.text)
 	}
 }
 
-// TestNotifySnipeBoxedSkipsAlreadyBought: a recipient who already holds the flip
-// token (bought it in-band/tap) gets no second buy and no message.
-func TestNotifySnipeBoxedSkipsAlreadyBought(t *testing.T) {
+// TestNotifySnipeBoxedSkipsUnlatched: a recipient NOT latched at alert time never
+// boxed-buys — even if sibling holdings appear later. The alert-time latch, not a
+// fire-time re-check, is the sole decision (issue #78).
+func TestNotifySnipeBoxedSkipsUnlatched(t *testing.T) {
 	t.Parallel()
 	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.09, askOK: true, user: snipeWalletUser()})
-	h.watch.siblings = []string{"sibB"}
 	m := testSnipeMarket()
+	// Holdings that a fire-time snipeHoldsSibling re-check WOULD have accepted.
+	h.watch.siblings = []string{"sibB"}
 	h.bot.snipeBought.mark(7, "sibB")
-	h.bot.snipeBought.mark(7, m.TokenID) // already bought the flip token
+	// But the recipient was never latched (default false).
 
-	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.09)
+	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.09, 1)
 
 	if got := h.buys.count(); got != 0 {
-		t.Fatalf("boxed buy calls = %d, want 0 (already bought the flip token)", got)
+		t.Fatalf("boxed buy calls = %d, want 0 (not latched)", got)
 	}
 	if got := h.tg.sendCount(); got != 0 {
-		t.Errorf("boxed sent %d messages for an already-bought token, want 0", got)
+		t.Errorf("boxed messaged an unlatched recipient (%d sends)", got)
 	}
 }
 
-// TestNotifySnipeBoxedSkipsNonCase3: a recipient who doesn't hold the other side
-// gets nothing (they had their chance at the in-band alert).
-func TestNotifySnipeBoxedSkipsNonCase3(t *testing.T) {
+// TestNotifySnipeBoxedLadderR72Regression replays the r72 shape: hold A, the
+// flip side B alerts case-3 (ask 0.18 ⇒ boxed-wait, latched). Tranche 1 buys $5,
+// then A is ceiling-harvested mid-episode (the sibling holding disappears), and
+// tranche 2 must STILL buy $5 — the latch, not a live sibling re-check, drives
+// it. Two $5 tranches = the same $10 max exposure as the old single boxed buy.
+func TestNotifySnipeBoxedLadderR72Regression(t *testing.T) {
 	t.Parallel()
-	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.09, askOK: true, user: snipeWalletUser()})
-	// No siblings ⇒ not case-3.
+	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.18, askOK: true, user: snipeWalletUser()})
+	m := testSnipeMarket()
+	// Case-3 at alert: holds the flip side (sibB), ask 0.18 > 0.10 ⇒ boxed-wait.
+	h.watch.siblings = []string{"sibB"}
+	h.bot.snipeBought.mark(7, "sibB")
 
-	h.bot.NotifySnipeBoxed(7, testSnipeMarket(), 0.45, 0.09)
-
+	h.bot.NotifySnipeAlert(7, m, 0.45, 0.18)
 	if got := h.buys.count(); got != 0 {
-		t.Fatalf("boxed buy calls = %d, want 0 (non-case-3)", got)
+		t.Fatalf("in-band buys = %d, want 0 (boxed-wait)", got)
 	}
-	if got := h.tg.sendCount(); got != 0 {
-		t.Errorf("boxed messaged a non-case-3 recipient (%d sends)", got)
+	if !h.bot.snipeBoxedLatch.eligible(7, m.TokenID) {
+		t.Fatal("case-3 alert did not latch boxed-eligibility")
+	}
+
+	// The held side is sold / ceiling-harvested mid-episode: no sibling remains.
+	h.watch.siblings = nil
+	h.bot.snipeBought = newSnipeBoughtRecord() // drop the sibB holding record too
+
+	// Tranche 1 fires at ≤ 0.10.
+	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.09, 1)
+	if got := h.buys.count(); got != 1 {
+		t.Fatalf("after tranche 1 buys = %d, want 1", got)
+	}
+	// Tranche 1 just recorded the flip token as bought; tranche 2 must ignore that
+	// and buy anyway (the ladder is two deliberate $5 rungs).
+	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.045, 2)
+	if got := h.buys.count(); got != 2 {
+		t.Fatalf("after tranche 2 buys = %d, want 2 (tranche 2 must still buy)", got)
+	}
+	for i, wantTranche := range []string{"tranche 1", "tranche 2"} {
+		if c := h.buys.call(t, i); c.amount != snipeBoxedTrancheUSD {
+			t.Errorf("tranche %d amount = %v, want %v", i+1, c.amount, snipeBoxedTrancheUSD)
+		}
+		// send 0 is the boxed-wait in-band alert; tranche confirmations follow.
+		if sent := h.tg.sentAt(t, i+1); !strings.Contains(sent.text, wantTranche) {
+			t.Errorf("send %d = %q, want mention of %q", i+1, sent.text, wantTranche)
+		}
 	}
 }
 
-// TestNotifySnipeBoxedSportGate: the boxed tier is esports-only too.
+// TestNotifySnipeBoxedNewEpisodeOverwritesLatch: the per-alert overwrite is the
+// episode boundary. A recipient latched case-3 in episode 1 who is no longer
+// case-3 at episode 2's in-band alert is un-latched, so episode 2's tranche is
+// skipped.
+func TestNotifySnipeBoxedNewEpisodeOverwritesLatch(t *testing.T) {
+	t.Parallel()
+	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.18, askOK: true, user: snipeWalletUser()})
+	m := testSnipeMarket()
+
+	// Episode 1 alert: case-3 ⇒ latched.
+	h.watch.siblings = []string{"sibB"}
+	h.bot.snipeBought.mark(7, "sibB")
+	h.bot.NotifySnipeAlert(7, m, 0.45, 0.18)
+	if !h.bot.snipeBoxedLatch.eligible(7, m.TokenID) {
+		t.Fatal("episode 1 did not latch boxed-eligibility")
+	}
+
+	// Episode 2 alert: no longer case-3 (sibling gone) ⇒ latch overwritten false.
+	h.watch.siblings = nil
+	h.bot.snipeBought = newSnipeBoughtRecord()
+	h.bot.NotifySnipeAlert(7, m, 0.45, 0.18)
+	if h.bot.snipeBoxedLatch.eligible(7, m.TokenID) {
+		t.Fatal("episode 2's in-band alert must overwrite the latch to false")
+	}
+
+	buysBefore := h.buys.count()
+	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.09, 1)
+	if got := h.buys.count(); got != buysBefore {
+		t.Errorf("boxed buy after latch cleared = %d new, want 0", got-buysBefore)
+	}
+}
+
+// TestNotifySnipeBoxedSportGate: the boxed ladder is esports-only too — a latched
+// recipient on a non-esports market still gets no buy.
 func TestNotifySnipeBoxedSportGate(t *testing.T) {
 	t.Parallel()
 	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.09, askOK: true, user: snipeWalletUser()})
-	h.watch.siblings = []string{"sibB"}
-	h.bot.snipeBought.mark(7, "sibB")
 	m := nonEsportsMarket()
+	h.bot.snipeBoxedLatch.set(7, m.TokenID, true)
 
-	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.09)
+	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.09, 1)
 
 	if got := h.buys.count(); got != 0 {
 		t.Fatalf("boxed buy calls = %d, want 0 (sport gate)", got)
