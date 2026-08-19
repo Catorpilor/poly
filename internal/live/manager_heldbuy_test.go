@@ -52,12 +52,52 @@ func TestRegisterHeldBuy(t *testing.T) {
 		}
 	})
 
+	// Sibling watch (issue #78): buying one side of a market makes the buyer a
+	// holder of BOTH sides. The flip side is where a comeback-snipe crash — and
+	// the boxed case-3 flip buy — actually lands, so it must enter the watcher
+	// too, not just the bought token.
+	t.Run("bought token's sibling in the same market also registers", func(t *testing.T) {
+		t.Parallel()
+		m, w, feed := newSnipeWiredManager(t)
+		clock := newFakeClock()
+		w.now = clock.now
+
+		m.RegisterHeldBuy(7, pinnedFeedEventSlug, "ml-blg", snipeWiringEvent())
+
+		wantExp := clock.now().Add(SnipeHeldTTL)
+		for _, tok := range []string{"ml-blg", "ml-hle"} {
+			st := heldStateOf(t, w, tok)
+			if st == nil {
+				t.Fatalf("%s not registered — sibling watch must register both sides", tok)
+			}
+			exp, ok := st.holders[7]
+			if !ok {
+				t.Fatalf("%s: chatID 7 not among holders", tok)
+			}
+			if !exp.Equal(wantExp) {
+				t.Errorf("%s holder expiry = %v, want now+SnipeHeldTTL %v", tok, exp, wantExp)
+			}
+		}
+		// Both sides subscribed to the feed (they are not otherwise on it).
+		feed.mu.Lock()
+		subs := append([]string(nil), feed.subscribes...)
+		feed.mu.Unlock()
+		if len(subs) != 2 {
+			t.Fatalf("feed subscribes = %v, want both ml-blg and ml-hle", subs)
+		}
+		// The other market's tokens stay untouched.
+		if st := heldStateOf(t, w, "g3-blg"); st != nil {
+			t.Errorf("g3-blg registered from a buy in the ml market: %+v", st)
+		}
+	})
+
 	t.Run("sub-market token registers even though ML resolution excludes it", func(t *testing.T) {
 		t.Parallel()
 		m, w, _ := newSnipeWiredManager(t)
 
 		// g3-blg lives in the Game 3 sub-market, which eventSnipeMarkets/
-		// GetAllMLMarkets never returns — the buy may still target it.
+		// GetAllMLMarkets never returns — the buy may still target it, and its
+		// sibling g3-hle rides along.
 		m.RegisterHeldBuy(7, pinnedFeedEventSlug, "g3-blg", snipeWiringEvent())
 
 		st := heldStateOf(t, w, "g3-blg")
@@ -70,6 +110,13 @@ func TestRegisterHeldBuy(t *testing.T) {
 		if _, ok := st.holders[7]; !ok {
 			t.Error("chatID 7 not among holders")
 		}
+		sib := heldStateOf(t, w, "g3-hle")
+		if sib == nil {
+			t.Fatal("sub-market sibling g3-hle not registered")
+		}
+		if _, ok := sib.holders[7]; !ok {
+			t.Error("sibling g3-hle: chatID 7 not among holders")
+		}
 	})
 
 	t.Run("token not in event does not register", func(t *testing.T) {
@@ -80,6 +127,10 @@ func TestRegisterHeldBuy(t *testing.T) {
 
 		if st := heldStateOf(t, w, "not-a-token"); st != nil {
 			t.Errorf("unknown token registered: %+v", st)
+		}
+		// An unknown token registers nothing at all — not even a stray sibling.
+		if st := heldStateOf(t, w, "ml-blg"); st != nil {
+			t.Errorf("unknown token buy registered an unrelated token: %+v", st)
 		}
 	})
 }
