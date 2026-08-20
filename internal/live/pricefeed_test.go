@@ -3,6 +3,7 @@ package live
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -467,6 +468,39 @@ func TestPriceFeed_BidWithFallback_PrefersTradeOverSeed(t *testing.T) {
 	bid, src, ok := m.BidWithFallback("tokenLT4", 30*time.Second)
 	if !ok || bid != 0.20 || src != "ws" {
 		t.Errorf("got bid=%v src=%s ok=%v, want 0.20 ws true", bid, src, ok)
+	}
+}
+
+// TestPriceFeed_SellVWAP verifies the depth-aware accessor reads the local WS
+// book: a seeded token walks its bids best-first, an unsubscribed token has no
+// book and fails open (ok=false).
+func TestPriceFeed_SellVWAP(t *testing.T) {
+	t.Parallel()
+	f := newStubFetcher()
+	f.set("tokenVW", &polymarket.OrderBook{
+		Bids: []polymarket.OrderBookEntry{{Price: 0.52, Size: 20}, {Price: 0.30, Size: 100}, {Price: 0.20, Size: 500}},
+	})
+	m := newPriceFeedManagerWithURL(f, "ws://unused")
+	defer m.Stop()
+
+	// No subscription yet: no local book → fail-open signal.
+	if _, _, ok := m.SellVWAP("tokenVW", 100); ok {
+		t.Fatalf("SellVWAP before subscribe should be ok=false")
+	}
+
+	m.Subscribe("tokenVW") // HTTP-seeds the book
+
+	// Selling 100 spans the thin 0.52 top (a phantom print) into real depth:
+	// 20@0.52 + 80@0.30 = 34.4 / 100 = 0.344, well under the 0.52 print.
+	vwap, depth, ok := m.SellVWAP("tokenVW", 100)
+	if !ok {
+		t.Fatalf("SellVWAP after seed should be ok=true")
+	}
+	if want := (0.52*20 + 0.30*80) / 100; math.Abs(vwap-want) > 1e-9 {
+		t.Errorf("vwap = %v, want %v", vwap, want)
+	}
+	if math.Abs(depth-620) > 1e-9 {
+		t.Errorf("depth = %v, want 620", depth)
 	}
 }
 
