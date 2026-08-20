@@ -267,3 +267,35 @@ sites of the behavior, not the one function named in the diagnosis —
 round 1 fixed only the web path because the spec said "RegisterHeldBuy"
 while telegram buys registered elsewhere (caught by independent verify,
 would have shipped the bug unfixed for the primary path).
+
+## 2026-08-20 — A data source's API shape is not its production behavior
+The v0.20.1 depth confirm was built (correctly, per spec) against the
+local WS order book — which production logs then proved is a one-shot
+HTTP snapshot frozen at subscribe time: Polymarket's market channel
+sends trade prints, not book updates, so the "live book" was fossilized
+by design in this deployment. Shipped, it would have vetoed genuine
+stop-losses indefinitely against stale-healthy liquidity — the exact
+inverse of the fix's purpose. The repo even documented the staleness in
+a comment; nobody connected it to the new consumer. Rules: (1) before
+wiring a guard to a data source, verify what actually flows into it IN
+PRODUCTION (grep the deploy logs for the update events; zero events in
+34 minutes was the proof), not what its accessors promise; (2) a
+verifier brief must include "trace the data source's refresh mechanics
+end-to-end" whenever a decision consumes cached state; (3) comments
+documenting a limitation are load-bearing evidence — grep for them when
+adding consumers.
+
+## 2026-08-20 — Restart amnesia composes; deploys are trades
+The v0.21.0 deploy landed while a token sat inside the snipe alert
+band. On boot the watcher re-seeded, re-alerted, and re-bought $10 for
+a recipient who already held the episode — because the episode latch,
+the bought record, AND the daily cap are all in-memory (each documented
+individually as a "soft rail"; their composition was not). Issue #84.
+Rules: (1) before `docker compose down`, check the monitor for tokens
+currently in-band — a deploy during a live episode IS a trade decision;
+(2) when N pieces of state share the same loss mode (process restart),
+document and test the composed failure, not just each piece; (3) after
+re-arming a log monitor, verify the follower process attached (ps for
+the `logs -f` pipeline) — the 08-14 syntax-fumble lesson repeated today
+before being caught by exactly that check (build the grep pattern in a
+shell variable; never inline a quote-heavy pattern into a one-liner).
