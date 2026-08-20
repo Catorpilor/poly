@@ -1,9 +1,6 @@
 package live
 
-import (
-	"sort"
-	"sync"
-)
+import "sync"
 
 // BookLevel represents a single (price, size) entry in a book side.
 type BookLevel struct {
@@ -82,51 +79,6 @@ func (b *bookState) BestBid() (float64, bool) {
 		}
 	}
 	return best, found
-}
-
-// SellVWAP returns the volume-weighted average price of selling `shares` into
-// the bid side (a sell lifts the highest bids first) and the total bid depth
-// available. It underpins the depth-aware fire confirm (issue #80): the fire
-// triggers on one best-bid print, but the executable price is the VWAP down the
-// book for the whole size being sold.
-//
-// ok=false ONLY when there is nothing to walk (empty bid side) — the confirm
-// treats that as fail-open. When the book cannot cover `shares` (depth < shares)
-// ok stays true and vwap is the average over the available TOP levels: an UPPER
-// bound on the true full-size VWAP, since the unfilled remainder would only sell
-// into still-lower bids. Callers that need a full fill compare depth to shares.
-func (b *bookState) SellVWAP(shares float64) (vwap, depth float64, ok bool) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	if len(b.bids) == 0 {
-		return 0, 0, false
-	}
-	prices := make([]float64, 0, len(b.bids))
-	for p := range b.bids {
-		prices = append(prices, p)
-		depth += b.bids[p]
-	}
-	// Highest bid first — that is the order a market sell consumes liquidity.
-	sort.Sort(sort.Reverse(sort.Float64Slice(prices)))
-	var cost, filled, remaining float64
-	remaining = shares
-	for _, p := range prices {
-		take := b.bids[p]
-		if take > remaining {
-			take = remaining
-		}
-		cost += take * p
-		filled += take
-		remaining -= take
-		if remaining <= 0 {
-			break
-		}
-	}
-	if filled <= 0 {
-		// shares <= 0, or nothing consumable — no meaningful VWAP.
-		return 0, depth, false
-	}
-	return cost / filled, depth, true
 }
 
 // BestAsk returns the lowest ask price with positive size.

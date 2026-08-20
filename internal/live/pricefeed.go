@@ -244,25 +244,6 @@ func (m *PriceFeedManager) BestAsk(tokenID string) (float64, bool) {
 	return m.httpBestAsk(tokenID)
 }
 
-// SellVWAP computes the executable VWAP of selling `shares` of tokenID into the
-// local WS bid book (best bid first), plus the total bid depth available. It
-// backs the SL/TP/ceiling depth-aware fire confirm (issue #80).
-//
-// LOCAL-ONLY, no HTTP fallback: a firing decision must be cheap and must never
-// block on the network, and the book is exactly the resting liquidity a phantom
-// print lacks. ok=false (no local book for tokenID) is the fail-open signal —
-// the confirm then fires as it did before the check. See bookState.SellVWAP for
-// the partial-depth (depth < shares) semantics.
-func (m *PriceFeedManager) SellVWAP(tokenID string, shares float64) (float64, float64, bool) {
-	m.mu.RLock()
-	book := m.books[tokenID]
-	m.mu.RUnlock()
-	if book == nil {
-		return 0, 0, false
-	}
-	return book.SellVWAP(shares)
-}
-
 // httpBestAsk fetches the orderbook via HTTP and returns the lowest ask price
 // with positive size.
 func (m *PriceFeedManager) httpBestAsk(tokenID string) (float64, bool) {

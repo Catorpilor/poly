@@ -52,10 +52,6 @@ type PriceFeedSubscriber interface {
 	// BestAsk returns the lowest live ask for tokenID. Used by the lottery
 	// flow to gate a BUY of the opposite token.
 	BestAsk(tokenID string) (float64, bool)
-	// SellVWAP returns the executable VWAP of selling `shares` into tokenID's
-	// local bid book (best bid first) and the total bid depth. ok=false (no
-	// local book) is the depth-confirm's fail-open signal (issue #80).
-	SellVWAP(tokenID string, shares float64) (vwap float64, depth float64, ok bool)
 	// BidWithFallback returns the freshest available bid: WS if the per-token
 	// last update is within maxAge, else an HTTP fetch. Used by the periodic
 	// tick to backstop a silent WS subscription.
@@ -92,6 +88,23 @@ type TradeExecutor interface {
 // ErrMultiOutcome signals that lottery-ticket BUY isn't supported for this
 // market because there's no single "other side".
 var ErrMultiOutcome = errors.New("multi-outcome market: no single other side")
+
+// BookReader reports the executable sell-VWAP for a token from a FRESH order
+// book read at call time. The depth-aware fire confirm (issue #80) uses this
+// INSTEAD of the price feed's local book: on this deployment the market WS
+// sends last_trade_price only (no book/price_change frames), so
+// PriceFeedManager's book is a one-shot subscribe-time HTTP seed that
+// fossilizes — confirming against it would veto genuine fires indefinitely
+// against stale liquidity. This reads the same live CLOB book the sell path
+// walks, at fire time.
+//
+// It returns the VWAP of selling `shares` best-bid-first, the total bid depth,
+// and ok. ok=false — empty book, fetch error, or timeout — is the confirm's
+// fail-open signal; the implementation owns a short timeout so a firing
+// decision never blocks on the network.
+type BookReader interface {
+	SellVWAP(ctx context.Context, tokenID string, shares float64) (vwap float64, depth float64, ok bool)
+}
 
 // ClosedMarketChecker resolves a condition ID to its market only when Gamma
 // reports that market closed (resolved-arm sweeper, issue #39). A market that
@@ -156,7 +169,11 @@ const slRetryIntervalDefault = 30 * time.Second
 // confirm attempts after a refusal (issue #80). Short because the trigger stays
 // armed and a genuinely-crossing book must be allowed to fire promptly; long
 // enough that a phantom oscillating around the threshold can't spam the confirm
-// (and its refused log) on every WS tick.
+// (and its refused log) — nor hammer the fresh-book HTTP fetch — on every WS
+// tick. It bounds the confirm/fetch rate for TP and ceiling fires, which
+// otherwise retry on every price update. For SL the pre-existing slGate retry
+// interval (slRetryInterval, 30s) already spaces attempts and dominates this
+// cooldown, so the effective SL re-confirm cadence is that 30s, not 5s.
 const depthConfirmCooldownDefault = 5 * time.Second
 
 // sltpSweepInitialDelay is how long after Start the first closed-market sweep
@@ -252,6 +269,11 @@ type SLTPMonitor struct {
 	// coverage. nil (the default) disables coverage extension — fire/sweep use
 	// SharesAtArm exactly as today. Set before Start, like closedChecker.
 	holdings HoldingReader
+	// book is the fresh-book price source for the depth-aware fire confirm
+	// (issue #80). nil (the default) disables the confirm — every fire is
+	// fail-open, i.e. the pre-issue-#80 one-bid behavior. Set before Start,
+	// like holdings/closedChecker.
+	book BookReader
 
 	// depthConfirmWindow is the per-arm cooldown between depth-confirm attempts
 	// after a refusal. Test-overridable copy of depthConfirmCooldownDefault.
@@ -260,12 +282,21 @@ type SLTPMonitor struct {
 	mu            sync.Mutex
 	pauseNotified map[int64]bool      // telegramID -> notified at window start
 	slState       map[int]*slArmState // arm.ID -> breach/attempt state
-	// depthRefusedAt records the last depth-confirm refusal per arm.ID. It is a
-	// map SEPARATE from slState on purpose: evaluateArm wipes slState before a
-	// TP/ceiling fire (SL-debounce reset), which would otherwise clear the
-	// cooldown on every tick and defeat it. Stale entries are harmless — always
-	// expired-in-the-past or for an arm.ID that never fires again.
-	depthRefusedAt map[int]time.Time
+	// depthConfirm is the per-arm.ID bookkeeping for the depth-aware fire
+	// confirm: single-flight + refusal cooldown in ONE struct so a claim is
+	// atomic. A map SEPARATE from slState on purpose — evaluateArm wipes slState
+	// before a TP/ceiling fire (SL-debounce reset), which would otherwise clear
+	// the cooldown on every tick and defeat it. Entries are pruned on terminal
+	// disarm/sweep.
+	depthConfirm map[int]*depthConfirmState
+}
+
+// depthConfirmState is one arm's depth-confirm slot: an in-flight flag
+// (single-flight across concurrent WS+tick evals) and the last refusal time
+// (cooldown anchor). Both fields are only ever read/written under m.mu.
+type depthConfirmState struct {
+	inFlight  bool      // a confirm attempt (holdings + book fetch) is running
+	refusedAt time.Time // last refusal — the cooldown starts here
 }
 
 // NewSLTPMonitor builds the monitor. paused may be nil (no pause window).
@@ -295,7 +326,7 @@ func NewSLTPMonitor(
 		sweepInterval:      sltpSweepInterval,
 		pauseNotified:      make(map[int64]bool),
 		slState:            make(map[int]*slArmState),
-		depthRefusedAt:     make(map[int]time.Time),
+		depthConfirm:       make(map[int]*depthConfirmState),
 	}
 }
 
@@ -311,6 +342,13 @@ func (m *SLTPMonitor) SetClosedMarketChecker(c ClosedMarketChecker) {
 // Must be called before Start.
 func (m *SLTPMonitor) SetHoldingReader(h HoldingReader) {
 	m.holdings = h
+}
+
+// SetBookReader wires the fresh-book price source used by the depth-aware fire
+// confirm (issue #80). nil keeps the confirm disabled (every fire is fail-open,
+// pre-#80 one-bid behavior). Must be called before Start.
+func (m *SLTPMonitor) SetBookReader(r BookReader) {
+	m.book = r
 }
 
 // tpOnlyCurrentShares returns the recipient's current holding (in shares) for a
@@ -519,6 +557,7 @@ func (m *SLTPMonitor) sweepClosedArms() {
 			continue
 		}
 		m.clearSLState(arm.ID)
+		m.clearDepthConfirm(arm.ID)
 		m.unsubscribeIfLast(arm.TokenID)
 		if _, seen := sweptOutcomes[arm.TelegramID]; !seen {
 			notifyOrder = append(notifyOrder, arm.TelegramID)
@@ -646,39 +685,39 @@ func (m *SLTPMonitor) notifyPauseOnce(tokenID string) {
 	}
 }
 
-// confirmFire is the depth-aware fire gate (issue #80). Every SL/TP/ceiling
-// fire triggers on a single best-bid print; before any order goes out this
-// recomputes the executable VWAP of selling the EXACT size that would sell,
-// from the local WS bid book, and refuses the fire when that VWAP contradicts
-// the trigger:
+// confirmFire is the depth-aware fire decision (issue #80). Every SL/TP/ceiling
+// fire triggers on a single best-bid print; the caller has ALREADY claimed the
+// depth-confirm slot (claimDepthConfirm) and computed the EXACT `shares` that
+// would sell. This reads a fresh executable VWAP from the live book (BookReader,
+// an HTTP fetch — NOT the fossilized WS seed) and returns true to fire / false
+// to refuse, releasing the slot (fire / fail-open) or arming the cooldown
+// (refusal) before it returns:
 //
 //	TP / ceiling: fire iff VWAP >= threshold  (the print had real depth behind it)
 //	SL:           fire iff VWAP <  stop        (the collapse is real, not a phantom low)
 //
-// Strict comparison, no tolerance. Returns true to proceed with the fire.
-//
-// Fail-open by construction: a missing/empty local book (SellVWAP ok=false)
+// Strict comparison, no tolerance. Fail-open by construction: no book reader
+// wired, or a fresh read yielding ok=false (empty book / fetch error / timeout),
 // fires exactly as before the check — the confirm is a guard, never a
 // dependency. A refused fire re-arms (the caller must not have consumed the
-// trigger yet) and is retried after a per-arm cooldown; the depth-refused log
-// is emitted once per allowed attempt, AFTER the cooldown gate, so a phantom
-// oscillating around the threshold can't spam it.
+// trigger yet) and is retried after the per-arm cooldown; the depth-refused log
+// is emitted once per allowed attempt.
 //
-// Partial depth (book can't cover `shares`): SellVWAP's VWAP is then an upper
-// bound on the true full-size VWAP (best bids fill first).
+// Partial depth (book can't cover `shares`): the VWAP is then an upper bound on
+// the true full-size VWAP (best bids fill first).
 //   - TP/ceiling: an upper bound below the threshold still proves the target is
 //     unreachable, so the refusal stands.
 //   - SL: an upper bound at/above the stop does NOT prove the book clears the
 //     stop, so a partial fill fails open and the stop fires — the safe direction.
 func (m *SLTPMonitor) confirmFire(arm *database.SLTPArm, kind string, fireBid, threshold, shares float64) bool {
-	now := m.now()
-	if !m.depthConfirmGate(arm.ID, now) {
-		return false // within the cooldown of a recent refusal: suppress the retry
+	if m.book == nil {
+		m.clearDepthConfirm(arm.ID)
+		return true // confirm disabled — fire as before
 	}
-	vwap, depth, ok := m.feed.SellVWAP(arm.TokenID, shares)
+	vwap, depth, ok := m.book.SellVWAP(m.ctx, arm.TokenID, shares)
 	if !ok {
-		m.clearDepthRefused(arm.ID)
-		return true // no local book to check against — fire as before
+		m.clearDepthConfirm(arm.ID)
+		return true // no usable fresh book — fail-open
 	}
 
 	var refuse bool
@@ -690,41 +729,75 @@ func (m *SLTPMonitor) confirmFire(arm *database.SLTPArm, kind string, fireBid, t
 		refuse = vwap < threshold
 	}
 	if !refuse {
-		m.clearDepthRefused(arm.ID)
+		m.clearDepthConfirm(arm.ID)
 		return true
 	}
 
-	m.markDepthRefused(arm.ID, now)
+	m.refuseDepthConfirm(arm.ID, m.now())
 	log.Printf("SLTPMonitor: depth-refused kind=%s user=%d token=%s fireBid=%.4f execVWAP=%.4f size=%.2f",
 		kind, arm.TelegramID, arm.TokenID, fireBid, vwap, shares)
 	return false
 }
 
-// depthConfirmGate reports whether arm.ID may attempt a depth confirm now: true
-// unless a refusal within the last depthConfirmWindow is still suppressing
-// retries. Per arm, not per token — one token can carry several users' arms.
-func (m *SLTPMonitor) depthConfirmGate(armID int, now time.Time) bool {
+// claimDepthConfirm atomically acquires the single per-arm depth-confirm slot,
+// so the caller may proceed to the (expensive) holdings read and fresh book
+// fetch. It returns false — bail BEFORE any I/O — when a recent refusal's
+// cooldown is still active OR another eval already holds the slot. This makes a
+// standing refusal cheap (no Data-API / CLOB hammering while a phantom
+// oscillates around the threshold) and stops concurrent WS+tick evals from
+// double-fetching or double-logging: check-and-claim in one critical section.
+// Per arm, not per token — one token can carry several users' arms.
+func (m *SLTPMonitor) claimDepthConfirm(armID int, now time.Time) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	last, ok := m.depthRefusedAt[armID]
-	return !ok || now.Sub(last) >= m.depthConfirmWindow
+	st := m.depthConfirm[armID]
+	if st == nil {
+		st = &depthConfirmState{}
+		m.depthConfirm[armID] = st
+	}
+	if st.inFlight {
+		return false
+	}
+	if !st.refusedAt.IsZero() && now.Sub(st.refusedAt) < m.depthConfirmWindow {
+		return false
+	}
+	st.inFlight = true
+	return true
 }
 
-func (m *SLTPMonitor) markDepthRefused(armID int, now time.Time) {
+// refuseDepthConfirm frees the slot AND arms the cooldown (a refusal): the next
+// claim is suppressed for depthConfirmWindow.
+func (m *SLTPMonitor) refuseDepthConfirm(armID int, now time.Time) {
 	m.mu.Lock()
-	m.depthRefusedAt[armID] = now
+	st := m.depthConfirm[armID]
+	if st == nil {
+		st = &depthConfirmState{}
+		m.depthConfirm[armID] = st
+	}
+	st.inFlight = false
+	st.refusedAt = now
 	m.mu.Unlock()
 }
 
-func (m *SLTPMonitor) clearDepthRefused(armID int) {
+// clearDepthConfirm drops an arm's depth-confirm state: the fire proceeded /
+// failed open / had nothing to sell, or the arm was disarmed/swept (F5). A no-op
+// when absent.
+func (m *SLTPMonitor) clearDepthConfirm(armID int) {
 	m.mu.Lock()
-	delete(m.depthRefusedAt, armID)
+	delete(m.depthConfirm, armID)
 	m.mu.Unlock()
 }
 
-// fireTP clears the tp_armed flag (double-fire guard), sells 50% of the
-// snapshot shares, and notifies the user. SL stays armed on the remainder.
+// fireTP clears the tp_armed flag (double-fire guard), sells TPSellFraction of
+// the snapshot shares, and notifies the user. SL stays armed on the remainder.
 func (m *SLTPMonitor) fireTP(arm *database.SLTPArm, bid float64) {
+	// Depth-confirm slot claimed FIRST — cheap, in-memory — so a standing
+	// refusal's cooldown skips the holdings read below entirely (F2) and
+	// concurrent evals can't both reach the book fetch (F3).
+	if !m.claimDepthConfirm(arm.ID, m.now()) {
+		return
+	}
+
 	// Coverage basis: SharesAtArm for a manual TP+SL arm (deliberate freeze);
 	// max(snapshot, current holding) for a TP-only auto-arm so the fraction is
 	// taken off the WHOLE position (manual tranches included), never just the
@@ -738,11 +811,12 @@ func (m *SLTPMonitor) fireTP(arm *database.SLTPArm, bid float64) {
 	shares := basis * database.TPSellFraction
 	sharesRaw := int64(shares * 1e6)
 	if sharesRaw <= 0 {
+		m.clearDepthConfirm(arm.ID) // release the claimed slot; nothing to sell
 		return
 	}
 
 	// Depth-aware confirm (issue #80): refuse the TP if the executable VWAP of
-	// selling `shares` is below the trigger (the print was a phantom).
+	// selling `shares` (fresh book) is below the trigger (the print was a phantom).
 	if !m.confirmFire(arm, "TP", bid, arm.TPTriggerPrice(), shares) {
 		return
 	}
@@ -793,6 +867,7 @@ func (m *SLTPMonitor) retryTPShortfall(kind string, arm *database.SLTPArm, inten
 // ErrSLTPArmNotFound is tolerated — the ceiling path disarms before selling.
 func (m *SLTPMonitor) disarmGonePosition(arm *database.SLTPArm) {
 	m.clearSLState(arm.ID)
+	m.clearDepthConfirm(arm.ID)
 	if err := m.store.Disarm(m.ctx, arm.TelegramID, arm.TokenID); err != nil && !errors.Is(err, repositories.ErrSLTPArmNotFound) {
 		log.Printf("SLTPMonitor: disarm gone position for %d/%s: %v", arm.TelegramID, arm.TokenID, err)
 	}
@@ -871,10 +946,18 @@ func (m *SLTPMonitor) attemptSLExit(arm *database.SLTPArm, bid, trigger float64)
 	}
 
 	// Depth-aware confirm (issue #80): the breach triggered on a single bid
-	// print. Refuse the stop if the executable VWAP of the whole exit is still
-	// at/above the stop (the low print was a phantom; the real book is healthy).
+	// print. Refuse the stop if the executable VWAP of the whole exit (fresh
+	// book) is still at/above the stop (the low print was a phantom; the real
+	// book is healthy). The atomic slot claim also serializes the fetch under
+	// concurrent evals; slGate's 30s retry already single-flights SL, so this
+	// arm's 5s cooldown is effectively inert here — the effective SL re-confirm
+	// cadence is the slGate retry interval, not depthConfirmWindow.
 	// finishSLAttempt releases the single-flight slot slGate claimed so the next
 	// evaluation can retry; the trigger itself stays armed (nothing sold).
+	if !m.claimDepthConfirm(arm.ID, m.now()) {
+		m.finishSLAttempt(arm.ID)
+		return
+	}
 	if !m.confirmFire(arm, "SL", bid, trigger, float64(sharesRaw)/1e6) {
 		m.finishSLAttempt(arm.ID)
 		return
@@ -929,6 +1012,7 @@ func (m *SLTPMonitor) completeSLExit(arm *database.SLTPArm, kind string, bid, fl
 			arm.TelegramID, arm.TokenID, err)
 	} else {
 		m.clearSLState(arm.ID)
+		m.clearDepthConfirm(arm.ID)
 		m.unsubscribeIfLast(arm.TokenID)
 	}
 	m.notifier.NotifySLTPFired(arm.TelegramID, kind, arm, bid, result)
@@ -969,6 +1053,7 @@ func (m *SLTPMonitor) handleSLShortfall(arm *database.SLTPArm, availableRaw int6
 			return
 		}
 		m.clearSLState(arm.ID)
+		m.clearDepthConfirm(arm.ID)
 		m.unsubscribeIfLast(arm.TokenID)
 		return
 	}
@@ -1005,6 +1090,7 @@ func (m *SLTPMonitor) retrySLDisarm(arm *database.SLTPArm) {
 		}
 	}
 	m.clearSLState(arm.ID)
+	m.clearDepthConfirm(arm.ID)
 	m.unsubscribeIfLast(arm.TokenID)
 }
 
@@ -1074,6 +1160,12 @@ func (m *SLTPMonitor) unsubscribeIfLast(tokenID string) {
 // difference is intent: SL is a downside exit, ceiling-TP is an upside exit
 // when there's no meaningful upside left to chase.
 func (m *SLTPMonitor) fireCeilingTP(arm *database.SLTPArm, bid float64) {
+	// Depth-confirm slot claimed FIRST (see fireTP): a standing refusal skips
+	// the holdings read (F2); concurrent evals can't double-fetch (F3).
+	if !m.claimDepthConfirm(arm.ID, m.now()) {
+		return
+	}
+
 	// Frozen-snapshot remainder (manual TP+SL, unchanged): the whole snapshot if
 	// the 2× TP hasn't fired, else the post-TP remainder.
 	remaining := arm.SharesAtArm
@@ -1091,11 +1183,13 @@ func (m *SLTPMonitor) fireCeilingTP(arm *database.SLTPArm, bid float64) {
 	}
 	sharesRaw := int64(remaining * 1e6)
 	if sharesRaw <= 0 {
+		m.clearDepthConfirm(arm.ID) // release the claimed slot; nothing to sell
 		return
 	}
 
 	// Depth-aware confirm (issue #80): refuse the ceiling exit if the executable
-	// VWAP for the whole remainder is below the ceiling (thin top-level print).
+	// VWAP for the whole remainder (fresh book) is below the ceiling (thin
+	// top-level print).
 	if !m.confirmFire(arm, "ceiling", bid, database.CeilingTPPrice, remaining) {
 		return
 	}

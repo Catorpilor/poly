@@ -189,18 +189,6 @@ type fakeFeed struct {
 	subscribes     []string
 	unsubscribes   []string
 	listeners      []PriceUpdateListener
-	// vwaps scripts SellVWAP per token (issue #80 depth confirm). Unset tokens
-	// return ok=false — the fail-open signal — so every pre-existing test keeps
-	// firing on the one-bid path exactly as before. vwapCalls counts every
-	// SellVWAP invocation so cooldown-suppression can be asserted.
-	vwaps     map[string]vwapScript
-	vwapCalls int
-}
-
-type vwapScript struct {
-	vwap  float64
-	depth float64
-	ok    bool
 }
 
 func newFakeFeed() *fakeFeed {
@@ -210,7 +198,6 @@ func newFakeFeed() *fakeFeed {
 		fallbackBids:   make(map[string]float64),
 		fallbackSource: make(map[string]string),
 		fallbackOK:     make(map[string]bool),
-		vwaps:          make(map[string]vwapScript),
 	}
 }
 
@@ -283,32 +270,6 @@ func (f *fakeFeed) BidWithFallback(tokenID string, _ time.Duration) (float64, st
 	return 0, "http", false
 }
 
-func (f *fakeFeed) SellVWAP(tokenID string, _ float64) (float64, float64, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.vwapCalls++
-	if s, ok := f.vwaps[tokenID]; ok {
-		return s.vwap, s.depth, s.ok
-	}
-	return 0, 0, false // no scripted depth → fail-open
-}
-
-// setVWAP scripts SellVWAP's return for tokenID. depth >= the fired size means a
-// full fill; a smaller depth exercises the partial-fill path.
-func (f *fakeFeed) setVWAP(tokenID string, vwap, depth float64, ok bool) {
-	f.mu.Lock()
-	f.vwaps[tokenID] = vwapScript{vwap, depth, ok}
-	f.mu.Unlock()
-}
-
-// vwapCallCount returns how many SellVWAP reads the feed has served — used to
-// prove the per-arm cooldown suppresses back-to-back confirm attempts.
-func (f *fakeFeed) vwapCallCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.vwapCalls
-}
-
 func (f *fakeFeed) OnUpdate(l PriceUpdateListener) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -348,6 +309,51 @@ func (f *fakeFeed) emit(tokenID string) {
 	}
 }
 
+// fakeBookReader is a scripted live.BookReader (issue #80 depth confirm): per
+// token it returns a canned executable sell-VWAP + depth + ok. Unset tokens
+// return ok=false — the fail-open signal — so a monitor with a reader wired but
+// no script fires exactly as the one-bid path did. calls counts every SellVWAP
+// so cooldown suppression and single-flight (no double-fetch) can be asserted.
+type fakeBookReader struct {
+	mu    sync.Mutex
+	vwaps map[string]vwapScript
+	calls int
+}
+
+type vwapScript struct {
+	vwap  float64
+	depth float64
+	ok    bool
+}
+
+func newFakeBookReader() *fakeBookReader {
+	return &fakeBookReader{vwaps: make(map[string]vwapScript)}
+}
+
+func (r *fakeBookReader) SellVWAP(_ context.Context, tokenID string, _ float64) (float64, float64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	if s, ok := r.vwaps[tokenID]; ok {
+		return s.vwap, s.depth, s.ok
+	}
+	return 0, 0, false
+}
+
+// setVWAP scripts SellVWAP for tokenID. depth >= the fired size means a full
+// fill; a smaller depth exercises the partial-fill path.
+func (r *fakeBookReader) setVWAP(tokenID string, vwap, depth float64, ok bool) {
+	r.mu.Lock()
+	r.vwaps[tokenID] = vwapScript{vwap, depth, ok}
+	r.mu.Unlock()
+}
+
+func (r *fakeBookReader) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
 // fakeHoldings is a scripted HoldingReader: per-token current balance in raw
 // 6-decimal units, and a failure flag to exercise the fall-back-to-snapshot path.
 type fakeHoldings struct {
@@ -366,6 +372,12 @@ func (h *fakeHoldings) CurrentSharesRaw(_ context.Context, arm *database.SLTPArm
 	}
 	raw, ok := h.raw[arm.TokenID]
 	return raw, ok
+}
+
+func (h *fakeHoldings) callCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.calls
 }
 
 type fakeExecutor struct {
@@ -423,6 +435,13 @@ func (e *fakeExecutor) ExecuteSell(_ context.Context, arm *database.SLTPArm, sha
 		return ret
 	}
 	return &polymarket.TradeResult{Success: true, OrderID: "ord-stub"}
+}
+
+// callCountTotal returns how many ExecuteSell calls the executor has served.
+func (e *fakeExecutor) callCountTotal() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.calls)
 }
 
 func (e *fakeExecutor) ResolveOtherToken(_ context.Context, arm *database.SLTPArm) (string, string, error) {

@@ -1,9 +1,6 @@
 package live
 
-import (
-	"math"
-	"testing"
-)
+import "testing"
 
 func TestBookState_ApplyBook(t *testing.T) {
 	t.Parallel()
@@ -83,51 +80,5 @@ func TestBookState_ApplyBook_SkipsNegativeSize(t *testing.T) {
 	b.ApplyBook([]BookLevel{{Price: 0.5, Size: -1}, {Price: 0.4, Size: 100}}, nil)
 	if got, _ := b.BestBid(); got != 0.4 {
 		t.Errorf("negative size should be dropped, BestBid = %v want 0.4", got)
-	}
-}
-
-// TestBookState_SellVWAP is the issue #80 book-walking accessor: the executable
-// VWAP of selling N shares into the bid side, best (highest) bid first, plus the
-// total bid depth. ok=false ONLY when the bid side is empty — a partial fill
-// (depth < shares) still returns ok=true with a VWAP over the available top
-// levels, which is an upper bound on the true full-size VWAP.
-func TestBookState_SellVWAP(t *testing.T) {
-	t.Parallel()
-	// Bids 0.50×100, 0.48×200, 0.45×300 (total depth 600). Map-order shuffled to
-	// prove the walk sorts by price, not insertion order.
-	full := []BookLevel{{Price: 0.45, Size: 300}, {Price: 0.50, Size: 100}, {Price: 0.48, Size: 200}}
-	cases := []struct {
-		name      string
-		bids      []BookLevel
-		shares    float64
-		wantVWAP  float64
-		wantDepth float64
-		wantOK    bool
-	}{
-		{"single top level", full, 100, 0.50, 600, true},
-		{"spans two levels", full, 300, (0.50*100 + 0.48*200) / 300, 600, true},
-		{"exact-depth boundary", full, 600, (0.50*100 + 0.48*200 + 0.45*300) / 600, 600, true},
-		// Insufficient depth: consumes the whole book, VWAP over all 600 shares,
-		// ok=true (upper bound), depth reports the 600 actually available.
-		{"insufficient depth", full, 700, (0.50*100 + 0.48*200 + 0.45*300) / 600, 600, true},
-		{"empty book", nil, 100, 0, 0, false},
-	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			b := newBookState()
-			b.ApplyBook(tc.bids, nil)
-			vwap, depth, ok := b.SellVWAP(tc.shares)
-			if ok != tc.wantOK {
-				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
-			}
-			if math.Abs(vwap-tc.wantVWAP) > 1e-9 {
-				t.Errorf("vwap = %v, want %v", vwap, tc.wantVWAP)
-			}
-			if math.Abs(depth-tc.wantDepth) > 1e-9 {
-				t.Errorf("depth = %v, want %v", depth, tc.wantDepth)
-			}
-		})
 	}
 }
