@@ -252,7 +252,7 @@ func TestNotifySnipeDeepCrashHoldingsRecord(t *testing.T) {
 	t.Parallel()
 	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.02, askOK: true, user: snipeWalletUserWithProxy()})
 	m := testSnipeMarket()
-	h.bot.snipeBought.mark(7, m.TokenID) // in-band auto-buy already funded it
+	h.bot.snipeBought.mark(7, m.TokenID, snipeAutoBuyUSD) // in-band auto-buy already funded it
 
 	h.bot.NotifySnipeDeepCrash(7, m, 0.45, 0.02, 0.09, time.Minute)
 
@@ -334,7 +334,7 @@ func TestNotifySnipeDeepCrashPositionsErrorButRecordSkips(t *testing.T) {
 		ask: 0.02, askOK: true, user: snipeWalletUserWithProxy(),
 		posErr: errors.New("data api down"),
 	})
-	h.bot.snipeBought.mark(7, m.TokenID)
+	h.bot.snipeBought.mark(7, m.TokenID, snipeAutoBuyUSD)
 
 	h.bot.NotifySnipeDeepCrash(7, m, 0.45, 0.02, 0.09, time.Minute)
 

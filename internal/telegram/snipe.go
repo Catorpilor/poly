@@ -134,24 +134,84 @@ func snipeCorpseGeometry(bid float64, bidOK bool, ask float64) bool {
 	return bid < ask/snipeCorpseSpreadRatio
 }
 
+// SnipeBuyStore is the durable snipe-buy log (issue #84) — the consumer-side
+// interface, mirroring ADR 0008's LiveWatchStore. The in-memory snipeBoughtRecord
+// and the two spend ledgers are the runtime view; this store is what a restart
+// re-reads (RestoreSnipeBuys) to close the restart-amnesia gap: an already-bought
+// token re-alerting/re-buying after a reboot, and the daily cap resetting to
+// zero. repositories.SnipeBuyRepository satisfies it structurally, so
+// internal/telegram never imports the concrete repo. A nil store keeps the
+// pre-#84 in-memory-only behavior (tests construct bots without it).
+type SnipeBuyStore interface {
+	Save(ctx context.Context, chatID int64, tokenID string, amountUSD float64, pool string) error
+	ListSince(ctx context.Context, since time.Time) ([]*database.SnipeBuy, error)
+}
+
+// snipeBuyPersistTimeout bounds each write-through so a hung DB cannot stall the
+// alert-delivery goroutine that owns the post-fill bookkeeping.
+const snipeBuyPersistTimeout = 5 * time.Second
+
 // snipeBoughtRecord tracks, per recipient, the tokens the bot snipe-bought via
-// the in-band auto-buy or a one-tap buy. In-memory, never cleared during a run
-// — matches end with their markets, so staleness is bounded. Gate 3 (Deep
-// holdings) reads it so a $5 Deep Crash top-up never funds a token the in-band
-// buy already holds (all 11 losing deep fires were top-ups onto held corpses).
-// This is the lag-free half of the holdings check; the Data API positions read
-// is the other half, and it lags fills by seconds — hence both.
+// the in-band auto-buy, a one-tap buy, or a boxed tranche. In-memory, never
+// cleared during a run — matches end with their markets, so staleness is
+// bounded. Gate 3 (Deep holdings) reads it so a $5 Deep Crash top-up never funds
+// a token the in-band buy already holds (all 11 losing deep fires were top-ups
+// onto held corpses). This is the lag-free half of the holdings check; the Data
+// API positions read is the other half, and it lags fills by seconds — hence
+// both.
+//
+// It also OWNS the durable buy-log write-through (issue #84): when a store is
+// wired, mark() and logDeepBuy() persist one row per accepted buy so a restart
+// can rebuild this record, the watcher's bought latch, and the spend ledgers.
+// Keeping the write-through here is the single seam the spec asks for — every
+// main-pool accept already funnels through mark(); the deep tier (which
+// deliberately does NOT mark this record) gets logDeepBuy(), the one exception.
 type snipeBoughtRecord struct {
 	mu     sync.Mutex
 	bought map[int64]map[string]bool // chatID -> tokenID -> true
+	// store, when set, durably logs every accepted buy. Set once at boot
+	// (SetStore) before any mark, so it is read without the mutex.
+	store SnipeBuyStore
 }
 
 func newSnipeBoughtRecord() *snipeBoughtRecord {
 	return &snipeBoughtRecord{bought: make(map[int64]map[string]bool)}
 }
 
-// mark records that chatID holds tokenID from a snipe buy.
-func (r *snipeBoughtRecord) mark(chatID int64, tokenID string) {
+// SetStore wires the durable buy log. Optional: leaving it unset keeps the
+// pre-#84 in-memory-only behavior. Follows the setter-injection pattern of the
+// bot's other durable dependencies.
+func (r *snipeBoughtRecord) SetStore(s SnipeBuyStore) { r.store = s }
+
+// mark records that chatID holds tokenID from a MAIN-pool snipe buy (in-band
+// auto, one-tap, or boxed tranche) and, when a store is wired, writes it through
+// to the durable log as a 'main' row. amountUSD is the reserved stake so the
+// main spend ledger can be reconstructed on restore. With a nil store the
+// behavior is byte-identical to pre-#84.
+func (r *snipeBoughtRecord) mark(chatID int64, tokenID string, amountUSD float64) {
+	r.mu.Lock()
+	if r.bought[chatID] == nil {
+		r.bought[chatID] = make(map[string]bool)
+	}
+	r.bought[chatID][tokenID] = true
+	store := r.store
+	r.mu.Unlock()
+	writeSnipeBuy(store, chatID, tokenID, amountUSD, database.SnipeBuyPoolMain)
+}
+
+// logDeepBuy persists a Deep Crash fire to the durable log as a 'deep' row
+// WITHOUT touching the in-memory record — the deep tier never feeds this record
+// (Gate 3a semantics: it is a catch-up entry, not a holding that gates further
+// deep buys), but its $5 spend must be restorable into the deep ledger after a
+// restart (issue #84). No-op with a nil store.
+func (r *snipeBoughtRecord) logDeepBuy(chatID int64, tokenID string, amountUSD float64) {
+	writeSnipeBuy(r.store, chatID, tokenID, amountUSD, database.SnipeBuyPoolDeep)
+}
+
+// restore sets the in-memory bought flag WITHOUT writing through — used by boot
+// restore to rebuild the record from the durable log; re-persisting would
+// duplicate the very rows being read.
+func (r *snipeBoughtRecord) restore(chatID int64, tokenID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.bought[chatID] == nil {
@@ -160,11 +220,37 @@ func (r *snipeBoughtRecord) mark(chatID int64, tokenID string) {
 	r.bought[chatID][tokenID] = true
 }
 
+// listSince returns the durable buy rows at or after since (the boot-restore
+// scan). Nil store ⇒ no rows, no error.
+func (r *snipeBoughtRecord) listSince(ctx context.Context, since time.Time) ([]*database.SnipeBuy, error) {
+	if r.store == nil {
+		return nil, nil
+	}
+	return r.store.ListSince(ctx, since)
+}
+
 // held reports whether chatID already snipe-bought tokenID.
 func (r *snipeBoughtRecord) held(chatID int64, tokenID string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.bought[chatID][tokenID]
+}
+
+// writeSnipeBuy persists one accepted snipe buy through the durable log. A nil
+// store is a no-op (pre-#84 behavior). A write failure is logged LOUDLY and
+// swallowed — the buy already filled and the in-memory state is authoritative
+// for the session (issue #84); persistence only closes the restart-amnesia gap
+// and must never fail or block the buy. Bounded by snipeBuyPersistTimeout.
+func writeSnipeBuy(store SnipeBuyStore, chatID int64, tokenID string, amountUSD float64, pool string) {
+	if store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), snipeBuyPersistTimeout)
+	defer cancel()
+	if err := store.Save(ctx, chatID, tokenID, amountUSD, pool); err != nil {
+		log.Printf("Snipe buy log: persist FAILED chat=%d token=%.12s… $%.2f pool=%s: %v — in-memory authoritative, buy stands",
+			chatID, tokenID, amountUSD, pool, err)
+	}
 }
 
 // snipeBoxedLatchTTL bounds how long a boxed latch stays live (issue #78 F4).
@@ -416,6 +502,25 @@ func (l *snipeSpendLedger) reserve(chatID int64, amount float64) (left float64, 
 	return l.cap - l.spent[chatID], true
 }
 
+// seed adds amount to chatID's accumulator for the CURRENT UTC day and pins the
+// ledger's day, so boot restore can re-seed the cap from the durable buy log
+// (issue #84). Two rollLocked hazards it must dodge, hence the deliberate order:
+//
+//   - At construction l.day is empty, so the FIRST reserve/release would roll —
+//     wiping a seed that ran before it. seed calls rollLocked FIRST, which sets
+//     l.day to today; the later reserve then sees day == l.day and keeps the seed.
+//   - A seed must never resurrect yesterday's spend after a post-midnight boot.
+//     The caller (RestoreSnipeBuys) only seeds rows dated to the current UTC day,
+//     so a pre-midnight row is never passed here; rollLocked pinning today makes
+//     that boundary authoritative even if the very first reserve arrives seconds
+//     later.
+func (l *snipeSpendLedger) seed(chatID int64, amount float64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.rollLocked()
+	l.spent[chatID] += amount
+}
+
 // release refunds a reservation whose buy failed. A release landing after a
 // UTC rollover is dropped — the fresh day's accumulator never goes negative.
 func (l *snipeSpendLedger) release(chatID int64, amount float64) {
@@ -557,6 +662,91 @@ func (b *Bot) SetSnipe(w *live.SnipeWatcher, feed SnipeAskSource) {
 		b.snipeWatcher = w
 	}
 	b.snipeFeed = feed
+}
+
+// SetSnipeBuyStore wires the durable snipe-buy log (issue #84) into the bought
+// record's write-through seam. Optional — a nil store keeps in-memory-only
+// behavior. Call before RestoreSnipeBuys (restore reads through it) and before
+// the first buy can be accepted.
+func (b *Bot) SetSnipeBuyStore(s SnipeBuyStore) {
+	if b.snipeBought != nil {
+		b.snipeBought.SetStore(s)
+	}
+}
+
+// snipeBuyRestoreWindow is how far back boot restore rebuilds the bought record
+// and the watcher's bought latch (issue #84). No comeback match spans anywhere
+// near this; 24h comfortably covers any in-flight game plus a generous restart
+// gap while bounding the scan (indexed on bought_at). The spend ledgers seed
+// from a NARROWER window — the current UTC day only — so a pre-midnight buy
+// restores the bought latch but not the (already-rolled-over) daily cap.
+const snipeBuyRestoreWindow = 24 * time.Hour
+
+// RestoreSnipeBuys rebuilds the in-memory snipe state a restart would otherwise
+// lose (issue #84), from the durable buy log:
+//
+//	(a) the per-recipient bought record — MAIN-pool rows only, mirroring live
+//	    exactly (the deep tier never marks that record);
+//	(b) the watcher's token-level bought latch, via MarkBought on EVERY row
+//	    (in-band, manual, boxed AND deep all call watcher.MarkBought live) —
+//	    lazy-capable, so a token only watched later this session is still
+//	    silenced; this latch is THE gate that suppresses re-alerts;
+//	(c) both daily spend ledgers, seeded per pool from the CURRENT UTC day's
+//	    rows only (the cap is a soft rail that resets at UTC midnight).
+//
+// Ordering is load-bearing: cmd/bot calls this BEFORE any snipe registration
+// (SeedSnipeArmed, RestoreWatches) so the pending bought marks are in place
+// before a token can be watched and re-evaluated — that is what closes the
+// re-alert/re-buy race. A nil store (or absent record) is a no-op.
+func (b *Bot) RestoreSnipeBuys(ctx context.Context) (restored int, err error) {
+	return b.restoreSnipeBuysAt(ctx, time.Now().UTC())
+}
+
+// restoreSnipeBuysAt is RestoreSnipeBuys with an injected clock for tests — the
+// same "now" pins both the 24h window and the current-UTC-day spend boundary.
+func (b *Bot) restoreSnipeBuysAt(ctx context.Context, now time.Time) (restored int, err error) {
+	if b.snipeBought == nil {
+		return 0, nil
+	}
+	now = now.UTC()
+	rows, err := b.snipeBought.listSince(ctx, now.Add(-snipeBuyRestoreWindow))
+	if err != nil {
+		return 0, fmt.Errorf("restore snipe buys: %w", err)
+	}
+	today := now.Format("2006-01-02")
+	var seededMain, seededDeep int
+	for _, row := range rows {
+		// (b) Re-latch the watcher for EVERY buy tier — all call MarkBought live.
+		// Lazy: a not-yet-watched token latches when it is first registered.
+		if b.snipeWatcher != nil {
+			b.snipeWatcher.MarkBought(row.TokenID)
+		}
+		// (a) Rebuild the bought record — main pool only (deep never marks it).
+		if row.Pool != database.SnipeBuyPoolDeep {
+			b.snipeBought.restore(row.ChatID, row.TokenID)
+		}
+		// (c) Seed the matching spend ledger — current UTC day only, so a
+		// pre-midnight row (still in the 24h window above) does not resurrect
+		// spend into a freshly rolled-over day.
+		if row.BoughtAt.UTC().Format("2006-01-02") == today {
+			switch row.Pool {
+			case database.SnipeBuyPoolDeep:
+				if b.snipeDeepSpend != nil {
+					b.snipeDeepSpend.seed(row.ChatID, row.AmountUSD)
+					seededDeep++
+				}
+			default:
+				if b.snipeSpend != nil {
+					b.snipeSpend.seed(row.ChatID, row.AmountUSD)
+					seededMain++
+				}
+			}
+		}
+		restored++
+	}
+	log.Printf("Snipe buys: restored %d row(s) in %s (bought record + watcher latch); seeded %d main + %d deep spend row(s) for %s",
+		restored, snipeBuyRestoreWindow, seededMain, seededDeep, today)
+	return restored, nil
 }
 
 // NotifySnipeAlert implements live.SnipeNotifier: registers the alert for
@@ -775,6 +965,13 @@ func (b *Bot) snipeDeepAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyR
 		log.Printf("Snipe deep-buy: skipped chat=%d token=%.12s… reason=%d err=%v msg=%s",
 			chatID, market.TokenID, res.outcome, res.err, res.errorMsg)
 		return res, 0, snipeAutoSkipped
+	}
+	// Persist the deep fire to the durable log (pool 'deep') so a restart can
+	// re-seed the deep ledger (issue #84). Deliberately does NOT mark the
+	// in-memory bought record — the deep tier never does (Gate 3a). No-op when no
+	// store is wired.
+	if b.snipeBought != nil {
+		b.snipeBought.logDeepBuy(chatID, market.TokenID, snipeDeepBuyUSD)
 	}
 	// Auto-arm TP + ceiling (no trailing SL) from the fill — async, never blocks
 	// alert delivery.
@@ -1082,9 +1279,10 @@ func (b *Bot) snipeAutoBuyExec(ctx context.Context, chatID int64, user *database
 	}
 	// Record the holding so a later Deep Crash fire on this token is
 	// holdings-gated (Gate 3a). Only the in-band auto-buy, one-tap, and boxed
-	// tranches feed this record — never the deep tier itself.
+	// tranches feed this record — never the deep tier itself. mark also writes
+	// the durable buy row (pool 'main', this stake) when a store is wired (#84).
 	if b.snipeBought != nil {
-		b.snipeBought.mark(chatID, market.TokenID)
+		b.snipeBought.mark(chatID, market.TokenID, amount)
 	}
 	// Auto-arm TP + ceiling (no trailing SL) from the fill — async, never blocks
 	// alert delivery.
@@ -1266,9 +1464,10 @@ func (b *Bot) handleSnipeCallback(ctx context.Context, update *tgbotapi.Update) 
 			question, res.errorMsg))
 	case snipeBuyFilled:
 		// Record the holding so a later Deep Crash fire on this token is
-		// holdings-gated (Gate 3a), same as the in-band auto-buy.
+		// holdings-gated (Gate 3a), same as the in-band auto-buy. mark also writes
+		// the durable buy row (pool 'main', this tap's stake) when wired (#84).
 		if b.snipeBought != nil {
-			b.snipeBought.mark(chatID, entry.tokenID)
+			b.snipeBought.mark(chatID, entry.tokenID, amount)
 		}
 		// A manual tap supersedes the boxed ladder: clear the latch so the
 		// watcher's tranche fires don't stack another $5+$5 on top of the manual

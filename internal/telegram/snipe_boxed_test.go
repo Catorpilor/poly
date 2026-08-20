@@ -41,7 +41,7 @@ func TestSnipeHoldsSibling(t *testing.T) {
 	t.Run("record source", func(t *testing.T) {
 		t.Parallel()
 		b := newBot()
-		b.snipeBought.mark(7, "sibB")
+		b.snipeBought.mark(7, "sibB", snipeAutoBuyUSD)
 		if !b.snipeHoldsSibling(context.Background(), user, 7, market) {
 			t.Error("record-held sibling not detected")
 		}
@@ -90,7 +90,7 @@ func TestSnipeHoldsSibling(t *testing.T) {
 	t.Run("no watched siblings ⇒ false without any lookup", func(t *testing.T) {
 		t.Parallel()
 		b := &Bot{snipeWatcher: &fakeSnipeWatch{}, snipeBought: newSnipeBoughtRecord()}
-		b.snipeBought.mark(7, "sibB")
+		b.snipeBought.mark(7, "sibB", snipeAutoBuyUSD)
 		if b.snipeHoldsSibling(context.Background(), user, 7, market) {
 			t.Error("no watched siblings must short-circuit to false")
 		}
@@ -104,7 +104,7 @@ func TestNotifySnipeAlertCase3BoxedWait(t *testing.T) {
 	t.Parallel()
 	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.18, askOK: true, user: snipeWalletUser()})
 	h.watch.siblings = []string{"sibB"}
-	h.bot.snipeBought.mark(7, "sibB") // holds the other side
+	h.bot.snipeBought.mark(7, "sibB", snipeAutoBuyUSD) // holds the other side
 	m := testSnipeMarket()
 
 	h.bot.NotifySnipeAlert(7, m, 0.45, 0.18)
@@ -139,7 +139,7 @@ func TestNotifySnipeAlertCase3ImmediateLadders(t *testing.T) {
 	t.Parallel()
 	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.09, askOK: true, user: snipeWalletUser()})
 	h.watch.siblings = []string{"sibB"}
-	h.bot.snipeBought.mark(7, "sibB")
+	h.bot.snipeBought.mark(7, "sibB", snipeAutoBuyUSD)
 	m := testSnipeMarket()
 
 	h.bot.NotifySnipeAlert(7, m, 0.45, 0.09)
@@ -236,7 +236,7 @@ func TestNotifySnipeBoxedSkipsUnlatched(t *testing.T) {
 	m := testSnipeMarket()
 	// Holdings that a fire-time snipeHoldsSibling re-check WOULD have accepted.
 	h.watch.siblings = []string{"sibB"}
-	h.bot.snipeBought.mark(7, "sibB")
+	h.bot.snipeBought.mark(7, "sibB", snipeAutoBuyUSD)
 	// But the recipient was never latched (default false).
 
 	h.bot.NotifySnipeBoxed(7, m, 0.45, 0.09, 1)
@@ -260,7 +260,7 @@ func TestNotifySnipeBoxedLadderR72Regression(t *testing.T) {
 	m := testSnipeMarket()
 	// Case-3 at alert: holds the flip side (sibB), ask 0.18 > 0.10 ⇒ boxed-wait.
 	h.watch.siblings = []string{"sibB"}
-	h.bot.snipeBought.mark(7, "sibB")
+	h.bot.snipeBought.mark(7, "sibB", snipeAutoBuyUSD)
 
 	h.bot.NotifySnipeAlert(7, m, 0.45, 0.18)
 	if got := h.buys.count(); got != 0 {
@@ -307,7 +307,7 @@ func TestNotifySnipeBoxedNewEpisodeOverwritesLatch(t *testing.T) {
 
 	// Episode 1 alert: case-3 ⇒ latched.
 	h.watch.siblings = []string{"sibB"}
-	h.bot.snipeBought.mark(7, "sibB")
+	h.bot.snipeBought.mark(7, "sibB", snipeAutoBuyUSD)
 	h.bot.NotifySnipeAlert(7, m, 0.45, 0.18)
 	if !h.bot.snipeBoxedLatch.eligible(7, m.TokenID) {
 		t.Fatal("episode 1 did not latch boxed-eligibility")
@@ -351,7 +351,7 @@ func TestSnipeManualTapClearsBoxedLatch(t *testing.T) {
 	t.Parallel()
 	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.18, askOK: true, user: snipeWalletUser()})
 	h.watch.siblings = []string{"sibB"}
-	h.bot.snipeBought.mark(7, "sibB")
+	h.bot.snipeBought.mark(7, "sibB", snipeAutoBuyUSD)
 	m := testSnipeMarket()
 
 	// Case-3 boxed-wait alert latches both rungs and advertises the manual tap.
@@ -383,7 +383,7 @@ func TestNotifySnipeAlertCase3ImmediateFailureRetries(t *testing.T) {
 		buyResult: &polymarket.TradeResult{Success: false, ErrorMsg: "rejected"},
 	})
 	h.watch.siblings = []string{"sibB"}
-	h.bot.snipeBought.mark(7, "sibB")
+	h.bot.snipeBought.mark(7, "sibB", snipeAutoBuyUSD)
 	m := testSnipeMarket()
 
 	h.bot.NotifySnipeAlert(7, m, 0.45, 0.09)
