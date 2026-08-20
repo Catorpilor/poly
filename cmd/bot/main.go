@@ -69,6 +69,10 @@ func main() {
 	// TP-only auto-arms extend sell coverage to the whole current position
 	// (feat/auto-arm-full-coverage); the bot reads holdings via the Data API.
 	sltpMonitor.SetHoldingReader(bot)
+	// Depth-aware fire confirm (issue #80): the monitor recomputes the executable
+	// VWAP from a FRESH CLOB book at fire time (the bot's SellVWAP) before letting
+	// an SL/TP/ceiling fire on a single bid print. nil would disable it.
+	sltpMonitor.SetBookReader(bot)
 	if err := sltpMonitor.Start(); err != nil {
 		log.Printf("Warning: Failed to start SL/TP monitor: %v", err)
 	}

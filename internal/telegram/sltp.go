@@ -463,6 +463,28 @@ func (b *Bot) CurrentSharesRaw(ctx context.Context, arm *database.SLTPArm) (int6
 	return 0, false
 }
 
+// sltpBookFetchTimeout bounds the depth-confirm's fresh book read. A firing
+// decision must never block on the network; on timeout the confirm fails open.
+const sltpBookFetchTimeout = 3 * time.Second
+
+// SellVWAP implements live.BookReader. It reads a FRESH CLOB order book at fire
+// time and returns the executable sell-VWAP for `shares` — the price source for
+// the depth-aware fire confirm (issue #80). It must not use the price feed's WS
+// book: on this deployment the market channel sends last_trade_price only, so
+// that book is a one-shot subscribe-time HTTP seed that fossilizes and would
+// veto genuine fires against stale liquidity. Fail-open (ok=false) on any
+// error, timeout, or empty book — the confirm then fires as before the check.
+func (b *Bot) SellVWAP(ctx context.Context, tokenID string, shares float64) (float64, float64, bool) {
+	ctx, cancel := context.WithTimeout(ctx, sltpBookFetchTimeout)
+	defer cancel()
+	vwap, depth, ok, err := b.tradingClient.SellVWAP(ctx, tokenID, shares)
+	if err != nil {
+		log.Printf("SLTPMonitor: depth-confirm book fetch for %s: %v (fail-open)", tokenID, err)
+		return 0, 0, false
+	}
+	return vwap, depth, ok
+}
+
 // NotifySLExitPending implements live.Notifier. Sent at most once per breach
 // episode when the floored FOK exit can't fill; the monitor keeps retrying
 // while the price stays below the stop.

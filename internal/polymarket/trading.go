@@ -393,6 +393,50 @@ func (tc *TradingClient) GetOrderBook(ctx context.Context, tokenID string) (*Ord
 	return &orderBook, nil
 }
 
+// SellVWAP fetches a FRESH order book and returns the volume-weighted average
+// price of selling `shares` into the bid side (highest bids first) plus the
+// total bid depth. It is the depth-aware fire confirm's price source (issue
+// #80): the same live CLOB book the sell path walks, read at fire time — never
+// a cached/seeded book.
+//
+// ok=false only when the bid side is empty. Unlike GetBestPrice, a book that
+// can't cover `shares` does NOT error: it returns ok=true with the VWAP over
+// the available top levels (an upper bound on the true full-size VWAP) and a
+// depth below `shares`, so the confirm can apply its direction-aware
+// partial-depth rule. A non-nil error is a fetch/transport failure only.
+func (tc *TradingClient) SellVWAP(ctx context.Context, tokenID string, shares float64) (vwap, depth float64, ok bool, err error) {
+	ob, err := tc.GetOrderBook(ctx, tokenID)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	bids := make([]OrderBookEntry, len(ob.Bids))
+	copy(bids, ob.Bids)
+	// Highest bid first — the order a market sell consumes liquidity.
+	sort.Slice(bids, func(i, j int) bool { return bids[i].Price > bids[j].Price })
+
+	var cost, filled, remaining float64
+	remaining = shares
+	for _, e := range bids {
+		if e.Size <= 0 {
+			continue
+		}
+		depth += e.Size
+		if remaining > 0 {
+			take := e.Size
+			if take > remaining {
+				take = remaining
+			}
+			cost += take * e.Price
+			filled += take
+			remaining -= take
+		}
+	}
+	if filled <= 0 {
+		return 0, depth, false, nil // empty book (or shares <= 0)
+	}
+	return cost / filled, depth, true, nil
+}
+
 // CLOBMarketInfo contains market information from the CLOB API
 type CLOBMarketInfo struct {
 	ConditionID      string  `json:"condition_id"`

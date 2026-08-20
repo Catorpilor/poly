@@ -309,6 +309,51 @@ func (f *fakeFeed) emit(tokenID string) {
 	}
 }
 
+// fakeBookReader is a scripted live.BookReader (issue #80 depth confirm): per
+// token it returns a canned executable sell-VWAP + depth + ok. Unset tokens
+// return ok=false — the fail-open signal — so a monitor with a reader wired but
+// no script fires exactly as the one-bid path did. calls counts every SellVWAP
+// so cooldown suppression and single-flight (no double-fetch) can be asserted.
+type fakeBookReader struct {
+	mu    sync.Mutex
+	vwaps map[string]vwapScript
+	calls int
+}
+
+type vwapScript struct {
+	vwap  float64
+	depth float64
+	ok    bool
+}
+
+func newFakeBookReader() *fakeBookReader {
+	return &fakeBookReader{vwaps: make(map[string]vwapScript)}
+}
+
+func (r *fakeBookReader) SellVWAP(_ context.Context, tokenID string, _ float64) (float64, float64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	if s, ok := r.vwaps[tokenID]; ok {
+		return s.vwap, s.depth, s.ok
+	}
+	return 0, 0, false
+}
+
+// setVWAP scripts SellVWAP for tokenID. depth >= the fired size means a full
+// fill; a smaller depth exercises the partial-fill path.
+func (r *fakeBookReader) setVWAP(tokenID string, vwap, depth float64, ok bool) {
+	r.mu.Lock()
+	r.vwaps[tokenID] = vwapScript{vwap, depth, ok}
+	r.mu.Unlock()
+}
+
+func (r *fakeBookReader) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
 // fakeHoldings is a scripted HoldingReader: per-token current balance in raw
 // 6-decimal units, and a failure flag to exercise the fall-back-to-snapshot path.
 type fakeHoldings struct {
@@ -327,6 +372,12 @@ func (h *fakeHoldings) CurrentSharesRaw(_ context.Context, arm *database.SLTPArm
 	}
 	raw, ok := h.raw[arm.TokenID]
 	return raw, ok
+}
+
+func (h *fakeHoldings) callCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.calls
 }
 
 type fakeExecutor struct {
@@ -384,6 +435,13 @@ func (e *fakeExecutor) ExecuteSell(_ context.Context, arm *database.SLTPArm, sha
 		return ret
 	}
 	return &polymarket.TradeResult{Success: true, OrderID: "ord-stub"}
+}
+
+// callCountTotal returns how many ExecuteSell calls the executor has served.
+func (e *fakeExecutor) callCountTotal() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.calls)
 }
 
 func (e *fakeExecutor) ResolveOtherToken(_ context.Context, arm *database.SLTPArm) (string, string, error) {

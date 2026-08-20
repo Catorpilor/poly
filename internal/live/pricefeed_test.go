@@ -18,10 +18,10 @@ import (
 
 // stubFetcher implements orderBookFetcher for tests.
 type stubFetcher struct {
-	mu       sync.Mutex
-	byToken  map[string]*polymarket.OrderBook
+	mu        sync.Mutex
+	byToken   map[string]*polymarket.OrderBook
 	callCount int32
-	err      error
+	err       error
 }
 
 func (s *stubFetcher) GetOrderBook(_ context.Context, tokenID string) (*polymarket.OrderBook, error) {
