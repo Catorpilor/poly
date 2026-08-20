@@ -93,6 +93,23 @@ func main() {
 	defer snipeWatcher.Stop()
 	bot.GetLiveManager().SetSnipeWatcher(snipeWatcher)
 	bot.SetSnipe(snipeWatcher, priceFeed)
+
+	// Durable snipe buys (issue #84): wire the Postgres log, then rebuild the
+	// bought record, the watcher's per-token bought latch, and both daily spend
+	// ledgers from the accepted buys of the last 24h / current UTC day. Ordering
+	// is load-bearing — this MUST run before any snipe registration
+	// (SeedSnipeArmed and RestoreWatches below), so the lazy bought marks are in
+	// place before a token can be watched and re-evaluated. That is what closes
+	// the restart race: a token that already auto-bought must not re-alert or
+	// re-buy when it re-enters its crash band after a reboot. A write/restore
+	// failure never blocks startup (in-memory stays authoritative).
+	bot.SetSnipeBuyStore(repositories.NewSnipeBuyRepository(db))
+	if restored, err := bot.RestoreSnipeBuys(context.Background()); err != nil {
+		log.Printf("Warning: Failed to restore snipe buys: %v", err)
+	} else if restored > 0 {
+		log.Printf("Restored %d snipe buy(s) from the durable log", restored)
+	}
+
 	bot.SeedSnipeArmed()
 
 	// Durable Live Watches (ADR 0008, issue #57 phase 1): wire the Postgres

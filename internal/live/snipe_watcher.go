@@ -80,6 +80,16 @@ const snipeResetConfirm = 10 * time.Second
 // the user fetches positions.
 const SnipeHeldTTL = 6 * time.Hour
 
+// snipePendingBoughtTTL bounds how long a MarkBought for an as-yet-unwatched
+// token is held pending LAZY application (issue #84). Boot restore re-latches
+// bought tokens from the durable buy log, but some of those tokens only become
+// watched later this session (a held-position or event registration arrives
+// after boot). The mark must survive until that registration and be applied
+// then — otherwise the token re-enters its crash band unsilenced and re-alerts
+// (the exact restart-amnesia failure). Bounded so a token that never gets
+// watched cannot leak the pending entry forever; matches the buy-restore window.
+const snipePendingBoughtTTL = 24 * time.Hour
+
 // snipeJanitorInterval is how often the watcher sweeps expired held
 // registrations for tokens whose feed has gone quiet (no update ever reaches
 // evaluate, so lazy pruning alone would leak the feed subscription).
@@ -233,21 +243,28 @@ type SnipeWatcher struct {
 	// eventTokens indexes event slug -> token IDs so UnwatchEventMarkets can
 	// find its tokens without scanning.
 	eventTokens map[string]map[string]bool
+	// pendingBought holds MarkBought calls for tokens not yet watched (issue
+	// #84): tokenID -> the time the mark was recorded. ensureStateLocked applies
+	// (and clears) a pending mark when the token is first registered; entries
+	// older than snipePendingBoughtTTL are ignored on apply and swept by the
+	// janitor, so an unwatched token cannot leak forever.
+	pendingBought map[string]time.Time
 }
 
 // NewSnipeWatcher builds the watcher. Call Start to hook it into the feed.
 func NewSnipeWatcher(feed PriceFeedSubscriber, recipients SnipeRecipientResolver, notifier SnipeNotifier) *SnipeWatcher {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &SnipeWatcher{
-		ctx:          ctx,
-		cancel:       cancel,
-		feed:         feed,
-		recipients:   recipients,
-		notifier:     notifier,
-		now:          time.Now,
-		tickInterval: snipeTickInterval,
-		tokens:       make(map[string]*snipeTokenState),
-		eventTokens:  make(map[string]map[string]bool),
+		ctx:           ctx,
+		cancel:        cancel,
+		feed:          feed,
+		recipients:    recipients,
+		notifier:      notifier,
+		now:           time.Now,
+		tickInterval:  snipeTickInterval,
+		tokens:        make(map[string]*snipeTokenState),
+		eventTokens:   make(map[string]map[string]bool),
+		pendingBought: make(map[string]time.Time),
 	}
 }
 
@@ -416,14 +433,40 @@ func (w *SnipeWatcher) RenewHeldMarket(chatID int64, tokenID string, ttl time.Du
 }
 
 // MarkBought latches the bought flag: a snipe buy silences the token's alerts
-// for the rest of the match (state is per-session; matches end with the
-// market, so no un-latch is needed).
+// for the rest of the match (state is per-session; matches end with the market,
+// so no un-latch is needed).
+//
+// LAZY when the token is not yet watched (issue #84): boot restore re-applies
+// marks from the durable buy log before the tokens they name have been
+// registered (held/event/armed registration happens later in the session), and
+// the mark that only latched an in-memory token would be silently lost — the
+// pre-#84 no-op. Instead the mark is parked in pendingBought and applied by
+// ensureStateLocked when the token is first registered. Bounded by
+// snipePendingBoughtTTL.
 func (w *SnipeWatcher) MarkBought(tokenID string) {
+	if tokenID == "" {
+		return
+	}
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	if st := w.tokens[tokenID]; st != nil {
 		st.bought = true
+		return
 	}
-	w.mu.Unlock()
+	w.pendingBought[tokenID] = w.now()
+	w.prunePendingBoughtLocked()
+}
+
+// prunePendingBoughtLocked drops pending marks older than snipePendingBoughtTTL.
+// Callers hold w.mu. Called opportunistically on each MarkBought (bounds growth
+// on the write path) and on the janitor sweep (bounds a quiet watcher).
+func (w *SnipeWatcher) prunePendingBoughtLocked() {
+	cutoff := w.now().Add(-snipePendingBoughtTTL)
+	for tok, at := range w.pendingBought {
+		if at.Before(cutoff) {
+			delete(w.pendingBought, tok)
+		}
+	}
 }
 
 // ensureStateLocked returns the token's state, creating it from m when absent.
@@ -437,6 +480,16 @@ func (w *SnipeWatcher) ensureStateLocked(m SnipeMarket) *snipeTokenState {
 	if !ok {
 		st = newSnipeTokenState(m)
 		w.tokens[m.TokenID] = st
+		// Apply a pending bought mark (issue #84): a restored buy latched this
+		// token before it was watched. Latch it now so the first in-band re-alert
+		// is suppressed. An expired pending mark is dropped without latching —
+		// the buy is old enough that a fresh episode may legitimately re-alert.
+		if at, pending := w.pendingBought[m.TokenID]; pending {
+			if w.now().Sub(at) <= snipePendingBoughtTTL {
+				st.bought = true
+			}
+			delete(w.pendingBought, m.TokenID)
+		}
 		if w.seeder != nil {
 			go w.seedFromHistory(m)
 		}
@@ -884,6 +937,7 @@ func (w *SnipeWatcher) sweepExpired() {
 		}
 		delete(w.tokens, tokenID)
 	}
+	w.prunePendingBoughtLocked()
 	w.mu.Unlock()
 	w.unsubscribeReleased(unsub)
 }

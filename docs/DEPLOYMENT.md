@@ -157,7 +157,16 @@ pending file(s) against the live DB first, then swap the image:
 # v0.21.x — deep-entry exit ladder (issue #81): adds sltp_arms.ladder_rungs_fired
 # and ladder_base_shares. Apply this BEFORE `docker compose up -d` with the new tag.
 psql -h localhost -U polybot -d polybot -f migrations/011_deep_entry_ladder.sql
+
+# v0.21.1 — snipe-buy persistence (issue #84): creates snipe_buys. Missing table
+# degrades loudly to pre-#84 amnesia (the fix silently isn't there) — apply first.
+psql -h localhost -U polybot -d polybot -f migrations/012_snipe_buys.sql
 ```
+
+Before `docker compose down`, check the session monitor for tokens currently
+inside the snipe alert band: a restart during a live episode re-alerts and,
+without #84's table populated, re-buys (ledger r81). Prefer deploying between
+episodes.
 
 ## 4. Build and Run with Docker
 
