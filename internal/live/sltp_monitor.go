@@ -52,6 +52,10 @@ type PriceFeedSubscriber interface {
 	// BestAsk returns the lowest live ask for tokenID. Used by the lottery
 	// flow to gate a BUY of the opposite token.
 	BestAsk(tokenID string) (float64, bool)
+	// SellVWAP returns the executable VWAP of selling `shares` into tokenID's
+	// local bid book (best bid first) and the total bid depth. ok=false (no
+	// local book) is the depth-confirm's fail-open signal (issue #80).
+	SellVWAP(tokenID string, shares float64) (vwap float64, depth float64, ok bool)
 	// BidWithFallback returns the freshest available bid: WS if the per-token
 	// last update is within maxAge, else an HTTP fetch. Used by the periodic
 	// tick to backstop a silent WS subscription.
@@ -148,6 +152,13 @@ const slConfirmWindowDefault = 30 * time.Second
 // while a confirmed breach persists.
 const slRetryIntervalDefault = 30 * time.Second
 
+// depthConfirmCooldownDefault is the per-arm spacing between depth-aware fire
+// confirm attempts after a refusal (issue #80). Short because the trigger stays
+// armed and a genuinely-crossing book must be allowed to fire promptly; long
+// enough that a phantom oscillating around the threshold can't spam the confirm
+// (and its refused log) on every WS tick.
+const depthConfirmCooldownDefault = 5 * time.Second
+
 // sltpSweepInitialDelay is how long after Start the first closed-market sweep
 // runs: soon enough that a deploy purges zombie arms immediately, late enough
 // to stay off the startup path.
@@ -242,9 +253,19 @@ type SLTPMonitor struct {
 	// SharesAtArm exactly as today. Set before Start, like closedChecker.
 	holdings HoldingReader
 
+	// depthConfirmWindow is the per-arm cooldown between depth-confirm attempts
+	// after a refusal. Test-overridable copy of depthConfirmCooldownDefault.
+	depthConfirmWindow time.Duration
+
 	mu            sync.Mutex
 	pauseNotified map[int64]bool      // telegramID -> notified at window start
 	slState       map[int]*slArmState // arm.ID -> breach/attempt state
+	// depthRefusedAt records the last depth-confirm refusal per arm.ID. It is a
+	// map SEPARATE from slState on purpose: evaluateArm wipes slState before a
+	// TP/ceiling fire (SL-debounce reset), which would otherwise clear the
+	// cooldown on every tick and defeat it. Stale entries are harmless — always
+	// expired-in-the-past or for an arm.ID that never fires again.
+	depthRefusedAt map[int]time.Time
 }
 
 // NewSLTPMonitor builds the monitor. paused may be nil (no pause window).
@@ -257,22 +278,24 @@ func NewSLTPMonitor(
 ) *SLTPMonitor {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &SLTPMonitor{
-		ctx:               ctx,
-		cancel:            cancel,
-		store:             store,
-		feed:              feed,
-		executor:          executor,
-		notifier:          notifier,
-		paused:            paused,
-		now:               time.Now,
-		tickInterval:      sltpTickInterval,
-		freshnessMaxAge:   sltpFreshnessMaxAge,
-		slConfirmWindow:   slConfirmWindowDefault,
-		slRetryInterval:   slRetryIntervalDefault,
-		sweepInitialDelay: sltpSweepInitialDelay,
-		sweepInterval:     sltpSweepInterval,
-		pauseNotified:     make(map[int64]bool),
-		slState:           make(map[int]*slArmState),
+		ctx:                ctx,
+		cancel:             cancel,
+		store:              store,
+		feed:               feed,
+		executor:           executor,
+		notifier:           notifier,
+		paused:             paused,
+		now:                time.Now,
+		tickInterval:       sltpTickInterval,
+		freshnessMaxAge:    sltpFreshnessMaxAge,
+		slConfirmWindow:    slConfirmWindowDefault,
+		slRetryInterval:    slRetryIntervalDefault,
+		depthConfirmWindow: depthConfirmCooldownDefault,
+		sweepInitialDelay:  sltpSweepInitialDelay,
+		sweepInterval:      sltpSweepInterval,
+		pauseNotified:      make(map[int64]bool),
+		slState:            make(map[int]*slArmState),
+		depthRefusedAt:     make(map[int]time.Time),
 	}
 }
 
@@ -623,26 +646,111 @@ func (m *SLTPMonitor) notifyPauseOnce(tokenID string) {
 	}
 }
 
+// confirmFire is the depth-aware fire gate (issue #80). Every SL/TP/ceiling
+// fire triggers on a single best-bid print; before any order goes out this
+// recomputes the executable VWAP of selling the EXACT size that would sell,
+// from the local WS bid book, and refuses the fire when that VWAP contradicts
+// the trigger:
+//
+//	TP / ceiling: fire iff VWAP >= threshold  (the print had real depth behind it)
+//	SL:           fire iff VWAP <  stop        (the collapse is real, not a phantom low)
+//
+// Strict comparison, no tolerance. Returns true to proceed with the fire.
+//
+// Fail-open by construction: a missing/empty local book (SellVWAP ok=false)
+// fires exactly as before the check — the confirm is a guard, never a
+// dependency. A refused fire re-arms (the caller must not have consumed the
+// trigger yet) and is retried after a per-arm cooldown; the depth-refused log
+// is emitted once per allowed attempt, AFTER the cooldown gate, so a phantom
+// oscillating around the threshold can't spam it.
+//
+// Partial depth (book can't cover `shares`): SellVWAP's VWAP is then an upper
+// bound on the true full-size VWAP (best bids fill first).
+//   - TP/ceiling: an upper bound below the threshold still proves the target is
+//     unreachable, so the refusal stands.
+//   - SL: an upper bound at/above the stop does NOT prove the book clears the
+//     stop, so a partial fill fails open and the stop fires — the safe direction.
+func (m *SLTPMonitor) confirmFire(arm *database.SLTPArm, kind string, fireBid, threshold, shares float64) bool {
+	now := m.now()
+	if !m.depthConfirmGate(arm.ID, now) {
+		return false // within the cooldown of a recent refusal: suppress the retry
+	}
+	vwap, depth, ok := m.feed.SellVWAP(arm.TokenID, shares)
+	if !ok {
+		m.clearDepthRefused(arm.ID)
+		return true // no local book to check against — fire as before
+	}
+
+	var refuse bool
+	if kind == "SL" {
+		// Block the stop only with positive evidence the book is healthy: a
+		// full-size fill whose VWAP still clears the stop.
+		refuse = depth >= shares && vwap >= threshold
+	} else {
+		refuse = vwap < threshold
+	}
+	if !refuse {
+		m.clearDepthRefused(arm.ID)
+		return true
+	}
+
+	m.markDepthRefused(arm.ID, now)
+	log.Printf("SLTPMonitor: depth-refused kind=%s user=%d token=%s fireBid=%.4f execVWAP=%.4f size=%.2f",
+		kind, arm.TelegramID, arm.TokenID, fireBid, vwap, shares)
+	return false
+}
+
+// depthConfirmGate reports whether arm.ID may attempt a depth confirm now: true
+// unless a refusal within the last depthConfirmWindow is still suppressing
+// retries. Per arm, not per token — one token can carry several users' arms.
+func (m *SLTPMonitor) depthConfirmGate(armID int, now time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	last, ok := m.depthRefusedAt[armID]
+	return !ok || now.Sub(last) >= m.depthConfirmWindow
+}
+
+func (m *SLTPMonitor) markDepthRefused(armID int, now time.Time) {
+	m.mu.Lock()
+	m.depthRefusedAt[armID] = now
+	m.mu.Unlock()
+}
+
+func (m *SLTPMonitor) clearDepthRefused(armID int) {
+	m.mu.Lock()
+	delete(m.depthRefusedAt, armID)
+	m.mu.Unlock()
+}
+
 // fireTP clears the tp_armed flag (double-fire guard), sells 50% of the
 // snapshot shares, and notifies the user. SL stays armed on the remainder.
 func (m *SLTPMonitor) fireTP(arm *database.SLTPArm, bid float64) {
-	if err := m.store.ClearTP(m.ctx, arm.TelegramID, arm.TokenID); err != nil {
-		if !errors.Is(err, repositories.ErrSLTPArmNotFound) {
-			log.Printf("SLTPMonitor: clear tp for %d/%s: %v", arm.TelegramID, arm.TokenID, err)
-		}
-		return
-	}
-
 	// Coverage basis: SharesAtArm for a manual TP+SL arm (deliberate freeze);
 	// max(snapshot, current holding) for a TP-only auto-arm so the fraction is
 	// taken off the WHOLE position (manual tranches included), never just the
 	// fill snapshot. The reactive shortfall clamp still caps a shrunken wallet.
+	// Computed BEFORE ClearTP so the depth confirm sizes off the exact shares
+	// that would sell, and a refusal leaves tp_armed intact to retry.
 	basis := arm.SharesAtArm
 	if cur, ok := m.tpOnlyCurrentShares(arm); ok && cur > basis {
 		basis = cur
 	}
-	sharesRaw := int64(basis * database.TPSellFraction * 1e6)
+	shares := basis * database.TPSellFraction
+	sharesRaw := int64(shares * 1e6)
 	if sharesRaw <= 0 {
+		return
+	}
+
+	// Depth-aware confirm (issue #80): refuse the TP if the executable VWAP of
+	// selling `shares` is below the trigger (the print was a phantom).
+	if !m.confirmFire(arm, "TP", bid, arm.TPTriggerPrice(), shares) {
+		return
+	}
+
+	if err := m.store.ClearTP(m.ctx, arm.TelegramID, arm.TokenID); err != nil {
+		if !errors.Is(err, repositories.ErrSLTPArmNotFound) {
+			log.Printf("SLTPMonitor: clear tp for %d/%s: %v", arm.TelegramID, arm.TokenID, err)
+		}
 		return
 	}
 
@@ -758,6 +866,16 @@ func (m *SLTPMonitor) attemptSLExit(arm *database.SLTPArm, bid, trigger float64)
 		sharesRaw = clamped
 	}
 	if sharesRaw <= 0 {
+		m.finishSLAttempt(arm.ID)
+		return
+	}
+
+	// Depth-aware confirm (issue #80): the breach triggered on a single bid
+	// print. Refuse the stop if the executable VWAP of the whole exit is still
+	// at/above the stop (the low print was a phantom; the real book is healthy).
+	// finishSLAttempt releases the single-flight slot slGate claimed so the next
+	// evaluation can retry; the trigger itself stays armed (nothing sold).
+	if !m.confirmFire(arm, "SL", bid, trigger, float64(sharesRaw)/1e6) {
 		m.finishSLAttempt(arm.ID)
 		return
 	}
@@ -956,13 +1074,6 @@ func (m *SLTPMonitor) unsubscribeIfLast(tokenID string) {
 // difference is intent: SL is a downside exit, ceiling-TP is an upside exit
 // when there's no meaningful upside left to chase.
 func (m *SLTPMonitor) fireCeilingTP(arm *database.SLTPArm, bid float64) {
-	if err := m.store.Disarm(m.ctx, arm.TelegramID, arm.TokenID); err != nil {
-		if !errors.Is(err, repositories.ErrSLTPArmNotFound) {
-			log.Printf("SLTPMonitor: ceiling disarm for %d/%s: %v", arm.TelegramID, arm.TokenID, err)
-		}
-		return
-	}
-
 	// Frozen-snapshot remainder (manual TP+SL, unchanged): the whole snapshot if
 	// the 2× TP hasn't fired, else the post-TP remainder.
 	remaining := arm.SharesAtArm
@@ -972,12 +1083,27 @@ func (m *SLTPMonitor) fireCeilingTP(arm *database.SLTPArm, bid float64) {
 	// TP-only auto-arms sell the whole CURRENT holding. The live balance already
 	// nets any earlier TP sale, so it replaces the snapshot remainder when
 	// larger (manual tranches); the reactive clamp caps a Data-API-lag
-	// over-request. Manual arms keep the frozen remainder above.
+	// over-request. Manual arms keep the frozen remainder above. Computed BEFORE
+	// Disarm so the depth confirm sizes off the exact shares, and a refusal
+	// leaves the arm armed to retry.
 	if cur, ok := m.tpOnlyCurrentShares(arm); ok && cur > remaining {
 		remaining = cur
 	}
 	sharesRaw := int64(remaining * 1e6)
 	if sharesRaw <= 0 {
+		return
+	}
+
+	// Depth-aware confirm (issue #80): refuse the ceiling exit if the executable
+	// VWAP for the whole remainder is below the ceiling (thin top-level print).
+	if !m.confirmFire(arm, "ceiling", bid, database.CeilingTPPrice, remaining) {
+		return
+	}
+
+	if err := m.store.Disarm(m.ctx, arm.TelegramID, arm.TokenID); err != nil {
+		if !errors.Is(err, repositories.ErrSLTPArmNotFound) {
+			log.Printf("SLTPMonitor: ceiling disarm for %d/%s: %v", arm.TelegramID, arm.TokenID, err)
+		}
 		return
 	}
 
