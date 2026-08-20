@@ -70,6 +70,32 @@ type LiveSubscription struct {
 	CreatedAt time.Time `json:"created_at" db:"created_at"`
 }
 
+// Snipe buy pools — the two isolated daily budgets a snipe buy draws from
+// (issue #84). 'main' is the $50/day in-band + manual + boxed budget; 'deep' is
+// the $20/day Deep Crash pool (ADR 0007). Stored in snipe_buys.pool so a restart
+// can re-seed each ledger independently.
+const (
+	SnipeBuyPoolMain = "main"
+	SnipeBuyPoolDeep = "deep"
+)
+
+// SnipeBuy is one ACCEPTED comeback-snipe buy, persisted (issue #84) so a
+// restart can rebuild the in-memory snipe state it would otherwise lose: the
+// per-recipient bought record, the watcher's token-level bought latch (the gate
+// that suppresses re-alerts), and the daily spend ledgers. One row per buy at
+// every tier — in-band auto $10, manual tap $10/$25, boxed rung $5 (Pool=main),
+// Deep Crash fire $5 (Pool=deep). Rows are audit-kept (no pruning); restore
+// scans a 24h window on bought_at. AmountUSD is the reserved stake, so summing a
+// pool's current-UTC-day rows reconstructs that ledger's spend.
+type SnipeBuy struct {
+	ID        int64     `json:"id" db:"id"`
+	ChatID    int64     `json:"chat_id" db:"chat_id"`
+	TokenID   string    `json:"token_id" db:"token_id"`
+	AmountUSD float64   `json:"amount_usd" db:"amount_usd"`
+	Pool      string    `json:"pool" db:"pool"`
+	BoughtAt  time.Time `json:"bought_at" db:"bought_at"`
+}
+
 // SLTPArm represents an armed take-profit / stop-loss for a user's position on a token.
 // v1 uses fixed presets: TP fires at avg_price*2.0 selling 50% of remaining;
 // SL fires at avg_price*0.70 selling 100% of remaining.
