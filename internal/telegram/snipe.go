@@ -601,6 +601,12 @@ func snipeSkipNote(res snipeBuyResult) string {
 		reason = "you already hold this token — not topping up a held position"
 	case snipeBuyBoxedWait:
 		reason = "you hold the other side — laddering the flip deep ($5 at ≤ $0.10 + $5 at ≤ $0.05)"
+	case snipeBuyManualArmed:
+		// Issue #86: an active manual stop already governs this token. The auto-buy
+		// would be stop-sold moments later or ride unprotected; the manual tap stays
+		// live for the user who wants it anyway. (The template appends "— tap below
+		// if you still want it.", completing the ratified copy.)
+		reason = "your stop is already managing this token"
 	default:
 		reason = "auto-buy unavailable"
 	}
@@ -1248,6 +1254,43 @@ func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResul
 		return res, capLeft, status
 	}
 
+	// Manual-arm gate (issue #86): skip the normal in-band $10 auto-buy when this
+	// recipient already carries an ACTIVE manual stop (sl_armed = TRUE) on the
+	// CRASHED/alerted token. Rationale is coherence, not just orphan-avoidance: a
+	// trailing stop armed above the snipe band means the buy is either stop-sold
+	// moments later or rides unprotected — the snipe thesis can't play out under a
+	// live manual stop (DK G2 exhibit: the machine bought 0.26 while its own stop
+	// stood at 0.464 and fired minutes later).
+	//
+	// Precedence is load-bearing and deliberate:
+	//   - It runs AFTER case-3 classification. A recipient holding the OTHER side
+	//     already latched boxed-wait / bought a tranche and returned above, so
+	//     case-3 WINS — this gate reads the arm on the ALERTED token only, never a
+	//     sibling, and a holder of both sides never reaches here.
+	//   - It runs BEFORE snipeAutoBuyExec's cap reserve, so a gated alert never
+	//     touches the daily cap (no reserve, no refund, no MarkBought).
+	//
+	// Scope (binding, from the ratified spec):
+	//   - TP-only auto-arms (sl_armed = FALSE) never gate — they already carry
+	//     fire-time whole-position TP coverage, so a top-up stays orphan-safe.
+	//   - Disarmed/swept arms never gate: GetByUserAndToken returns nil for a
+	//     deleted row, or a row with sl_armed = FALSE for a swept one — both fall
+	//     through to the buy.
+	//   - The gate is a GUARD, not a dependency: a DB-read failure fails OPEN (the
+	//     buy proceeds exactly as today) and logs loudly. A nil repo (test bots,
+	//     legacy wiring) is likewise a no-op.
+	if b.sltpArmRepo != nil {
+		arm, err := b.sltpArmRepo.GetByUserAndToken(ctx, chatID, market.TokenID)
+		switch {
+		case err != nil:
+			log.Printf("Snipe auto-buy: manual-arm gate read FAILED chat=%d token=%.12s…: %v — failing open, buy proceeds",
+				chatID, market.TokenID, err)
+		case arm != nil && arm.SLArmed:
+			log.Printf("Snipe auto-buy: manual-armed chat=%d token=%.12s…", chatID, market.TokenID)
+			return snipeBuyResult{outcome: snipeBuyManualArmed}, 0, snipeAutoSkipped
+		}
+	}
+
 	return b.snipeAutoBuyExec(ctx, chatID, user, market, snipeAutoBuyUSD)
 }
 
@@ -1306,6 +1349,7 @@ const (
 	snipeBuyCorpseSpread                 // corpse-spread gate: fresh bid far below ask (decided-game signature)
 	snipeBuyDeepHeld                     // deep holdings gate: recipient already holds the crashed token
 	snipeBuyBoxedWait                    // boxed tier: recipient holds the other side — postpone until ask ≤ $0.10
+	snipeBuyManualArmed                  // manual-arm gate (issue #86): recipient has an ACTIVE sl_armed stop on the crashed token
 )
 
 // snipeBuyResult carries what each caller needs to message the user.
