@@ -73,18 +73,7 @@ func (b *Bot) handleSLTPList(ctx context.Context, update *tgbotapi.Update) {
 		}
 	}
 
-	header := fmt.Sprintf(
-		"🎯 *SL/TP Auto-Sell* (%d positions)\n\n"+
-			"• *TP:* bid ≥ entry × %.1f → sell %.0f%%\n"+
-			"• *SL:* trailing — activates once bid ≥ entry × %.2f, then\n"+
-			"  stop = max(entry, peak × %.2f) → sell 100%%\n\n"+
-			"Tap a position to arm or disarm.\n\n",
-		len(positions),
-		database.TPMultiplier,
-		database.TPSellFraction*100,
-		database.SLActivationMult,
-		database.SLTrailMult,
-	)
+	header := sltpListHeader(len(positions), armed)
 
 	var rows [][]tgbotapi.InlineKeyboardButton
 	for i, pos := range positions {
@@ -108,6 +97,37 @@ func (b *Bot) handleSLTPList(ctx context.Context, update *tgbotapi.Update) {
 	b.stateManager.SetState(userID, StateSelectingPosition, map[string]interface{}{
 		"positions": positions,
 	}, 10*time.Minute)
+}
+
+// sltpListHeader builds the /sltp list legend. Deep-aware (issue #81): when any
+// currently-armed position is a deep-entry arm, it appends the exit-ladder
+// summary so the surface states what those arms actually do rather than the
+// single 25% @ 2× partial (v0.18.1 lesson: no message may promise a mechanism
+// that will not fire). A list with no deep-entry arm is byte-identical to the
+// pre-#81 header. Pure — table-tested.
+func sltpListHeader(positionCount int, armed map[string]*database.SLTPArm) string {
+	header := fmt.Sprintf(
+		"🎯 *SL/TP Auto-Sell* (%d positions)\n\n"+
+			"• *TP:* bid ≥ entry × %.1f → sell %.0f%%\n"+
+			"• *SL:* trailing — activates once bid ≥ entry × %.2f, then\n"+
+			"  stop = max(entry, peak × %.2f) → sell 100%%\n\n"+
+			"Tap a position to arm or disarm.\n\n",
+		positionCount,
+		database.TPMultiplier,
+		database.TPSellFraction*100,
+		database.SLActivationMult,
+		database.SLTrailMult,
+	)
+	for _, arm := range armed {
+		if arm != nil && arm.IsDeepEntry() {
+			header += fmt.Sprintf(
+				"⚡ Deep entries (≤ $%.2f) use the exit ladder instead: "+
+					"25%%@2× · 20%%@3× · 15%%@4× · 15%%@5×, rest → $%.2f ceiling.\n\n",
+				database.LadderMaxEntry, database.CeilingTPPrice)
+			break
+		}
+	}
+	return header
 }
 
 // sltpCoverageTolerance is the dust threshold (shares) below which a TP-only
@@ -599,6 +619,30 @@ func sltpFiredText(kind string, arm *database.SLTPArm, bid float64, result *poly
 				"No stop-loss — the remainder rides to the $%.2f ceiling; max loss is the remaining stake.",
 			bid, database.TPSellFraction*100, arm.Outcome, database.CeilingTPPrice,
 		)
+	case "TP-ladder":
+		// Deep-entry ladder fire (issue #81). arm.LadderRungsFired is the NEW
+		// cumulative count (the monitor updates the local copy before notifying);
+		// state the top rung multiple reached and the cumulative fraction banked.
+		idx := arm.LadderRungsFired
+		if idx < 1 {
+			idx = 1
+		}
+		reached := database.DeepEntryLadder[idx-1].Multiple
+		banked := database.DeepEntryLadderSoldFraction(idx) * 100
+		// Remainder disposition, per source, mirrors the standard TP branch so we
+		// never promise a stop that will not fire (v0.18.1 lesson).
+		tail := fmt.Sprintf(
+			"No stop-loss — the rest rides to the $%.2f ceiling; max loss is the remaining stake.",
+			database.CeilingTPPrice)
+		if arm.SLArmed {
+			tail = fmt.Sprintf("Trailing stop ($%.4f, follows the peak) watching the remainder.",
+				arm.SLTriggerPrice())
+		}
+		return fmt.Sprintf(
+			"🎯 *TP ladder* hit at $%.4f (bid ≥ %.0f× entry)\n\n"+
+				"Banked %.0f%% of %s position across the deep-entry rungs (25%%@2× · 20%%@3× · 15%%@4× · 15%%@5×).\n%s",
+			bid, reached, banked, arm.Outcome, tail,
+		)
 	case "TP-ceiling":
 		return fmt.Sprintf(
 			"🏁 *TP ceiling hit* at $%.4f (≥ $%.2f)\n\n"+
@@ -658,11 +702,32 @@ func sltpArmedText(title, outcome string, arm *database.SLTPArm) string {
 // 2× trigger at/above the ceiling can never fire — for those arms the real
 // behavior is the ceiling's sell-everything, and that is what gets promised.
 func sltpTPLine(arm *database.SLTPArm) string {
+	if arm.IsDeepEntry() {
+		return sltpTPLadderLine(arm)
+	}
 	if arm.TPTriggerPrice() >= database.CeilingTPPrice {
 		return sltpCeilingTPLine()
 	}
 	return fmt.Sprintf("• TP: bid ≥ $%.4f → sell %.0f%%",
 		arm.TPTriggerPrice(), database.TPSellFraction*100)
+}
+
+// sltpTPLadderLine renders the deep-entry (entry ≤ $0.05) exit-ladder promise
+// (issue #81) — every rung's fraction and its actual tick-floored trigger price,
+// then the remainder's fate. Truthful by construction: the copy lists exactly
+// the rungs the monitor fires (v0.18.1 lesson: a message must not promise a
+// mechanism that will not fire).
+func sltpTPLadderLine(arm *database.SLTPArm) string {
+	var b strings.Builder
+	b.WriteString("• TP ladder (deep entry ≤ $0.05):\n")
+	for i, r := range database.DeepEntryLadder {
+		b.WriteString(fmt.Sprintf("   %.0f%% @ %.0f× → bid ≥ $%.4f\n",
+			r.Fraction*100, r.Multiple, arm.DeepEntryRungPrice(i)))
+	}
+	rest := (1 - database.DeepEntryLadderSoldFraction(len(database.DeepEntryLadder))) * 100
+	b.WriteString(fmt.Sprintf("   remainder (~%.0f%%) rides to the $%.2f ceiling",
+		rest, database.CeilingTPPrice))
+	return b.String()
 }
 
 // sltpCeilingTPLine is the shared unreachable-TP wording: the arm's only

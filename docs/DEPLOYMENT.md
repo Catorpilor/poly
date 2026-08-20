@@ -145,6 +145,20 @@ psql -h localhost -U polybot -d polybot -f migrations/001_initial_schema.sql
 sudo -u postgres psql -d polybot -f migrations/001_initial_schema.sql
 ```
 
+### Per-release migrations (apply BEFORE swapping the image)
+
+Migrations ship as numbered `migrations/NNN_*.sql` files applied by hand — there
+is no in-app runner (`cmd/bot/main.go`). The bot's arm reader (`scanArm`)
+`SELECT`s every column unconditionally, so a new arm-table column must exist
+before the new image starts or **every armed-position read crashes**. Apply the
+pending file(s) against the live DB first, then swap the image:
+
+```bash
+# v0.21.x — deep-entry exit ladder (issue #81): adds sltp_arms.ladder_rungs_fired
+# and ladder_base_shares. Apply this BEFORE `docker compose up -d` with the new tag.
+psql -h localhost -U polybot -d polybot -f migrations/011_deep_entry_ladder.sql
+```
+
 ## 4. Build and Run with Docker
 
 ### Option A: Using Docker Compose (Recommended)

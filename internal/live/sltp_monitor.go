@@ -30,6 +30,14 @@ type SLTPArmStore interface {
 	// Used by the sweep to reconcile TP-only auto-arm coverage to the whole
 	// position.
 	UpdateSharesAtArm(ctx context.Context, telegramID int64, tokenID string, shares float64) error
+
+	// AdvanceLadder advances a deep-entry arm's fired-rung count from expectedFired
+	// to rungsFired and freezes ladder_base_shares (issue #81). Compare-and-set on
+	// the fired count (SQL WHERE ladder_rungs_fired = expectedFired): only the eval
+	// whose loaded count still matches wins, so two overlapping evals with stale
+	// row copies can never double-sell an overlapping slice. ErrSLTPArmNotFound ⇒
+	// another eval already advanced the row (or it is gone) ⇒ the caller aborts.
+	AdvanceLadder(ctx context.Context, telegramID int64, tokenID string, expectedFired, rungsFired int, baseShares float64) error
 }
 
 // HoldingReader reports a recipient's CURRENT share balance for an arm's token,
@@ -635,7 +643,17 @@ func (m *SLTPMonitor) evaluateArm(arm *database.SLTPArm, bid float64) {
 		m.fireCeilingTP(arm, bid)
 		return
 	}
-	if arm.TPArmed && bid >= arm.TPTriggerPrice() {
+	// Deep-entry arms (entry ≤ $0.05, issue #81) run the multi-rung ladder in
+	// place of the single 2× partial. fireLadder consumes the tick (returns true,
+	// resetting the SL debounce like a 2× TP fire) whenever the bid has reached an
+	// as-yet-unfired rung; when no new rung is crossed it returns false so the
+	// trailing SL still evaluates the remainder — deep manual arms keep their stop.
+	if arm.TPArmed && arm.IsDeepEntry() {
+		if m.fireLadder(arm, bid) {
+			m.clearSLState(arm.ID)
+			return
+		}
+	} else if arm.TPArmed && bid >= arm.TPTriggerPrice() {
 		m.clearSLState(arm.ID)
 		m.fireTP(arm, bid)
 		return
@@ -838,6 +856,112 @@ func (m *SLTPMonitor) fireTP(arm *database.SLTPArm, bid float64) {
 	m.notifier.NotifySLTPFired(arm.TelegramID, "TP", arm, bid, result)
 }
 
+// fireLadder is the deep-entry (entry ≤ $0.05) take-profit path (issue #81): it
+// sells the ladder rungs ACTUALLY crossed in ONE combined market sell, sized as
+// the sum of their fractions of a COMMON BASE frozen at the FIRST rung fire. It
+// returns true when the bid reached an as-yet-unfired rung — this tick belongs
+// to the ladder, so evaluateArm consumes it and resets the SL debounce exactly
+// as a 2× TP fire does — and false when no new rung is crossed, letting the
+// caller fall through to the trailing SL.
+//
+// Rung derivation (F1): the bid print only NOMINATES the candidate slice; a
+// mid-crash overprint (2.4×+ is the #80 norm) would front-load the ladder far
+// past the study's model if we sized/marked off the raw print. So one fresh
+// executable-VWAP fetch is sized to the candidate slice, then the rungs actually
+// crossed are read from that VWAP — a rung counts iff its price ≤ the executable
+// VWAP. The combined sell therefore never sells a rung's fraction below its own
+// rung price (the actual, smaller slice fills at a VWAP ≥ the candidate VWAP,
+// which already clears every counted rung). Fail-open (no reader / unreadable
+// book) fires the nominated slice — pre-#80 behavior.
+//
+// Gap-tick semantics: a single eval crossing several genuine rungs fires all of
+// them in one sell at the current book (sum of fractions), NOT one sell per rung
+// at each rung's price. Base accounting is cumulative and never compounds: rung
+// k always sells base × fraction[k], and a shortfall on one rung (clamped by
+// retryTPShortfall) leaves the frozen base and fired count intact.
+func (m *SLTPMonitor) fireLadder(arm *database.SLTPArm, bid float64) bool {
+	fired := arm.LadderRungsFired
+	candidate := arm.DeepEntryRungsCrossed(bid)
+	if candidate <= fired {
+		return false // the bid reached no new rung — let the SL evaluate
+	}
+
+	// Depth-confirm slot claimed FIRST (cheap, in-memory) so a standing refusal's
+	// cooldown skips the holdings read and concurrent evals can't double-fetch —
+	// see fireTP. Claim failure means a rung fire is already in flight or cooling
+	// down; this tick still belongs to the ladder, so consume it.
+	if !m.claimDepthConfirm(arm.ID, m.now()) {
+		return true
+	}
+
+	// Common base: frozen at the FIRST rung fire. On the first fire compute it off
+	// the fire-time WHOLE position (SharesAtArm for a manual arm; max(snapshot,
+	// current holding) for a TP-only auto-arm so blended tranches are covered —
+	// same basis rule as fireTP). Thereafter reuse the persisted frozen base so
+	// later tranches never re-inflate earlier rung fractions.
+	base := arm.LadderBaseShares
+	if fired == 0 || base <= 0 {
+		base = arm.SharesAtArm
+		if cur, ok := m.tpOnlyCurrentShares(arm); ok && cur > base {
+			base = cur
+		}
+	}
+
+	// Nominated (candidate) slice sizes the ONE fresh-book fetch; the executable
+	// VWAP then trims it to the rungs genuinely crossed (see the method doc).
+	candidateShares := base * database.DeepEntryLadderFractionBetween(fired, candidate)
+	target := candidate
+	if m.book != nil {
+		vwap, _, okBook := m.book.SellVWAP(m.ctx, arm.TokenID, candidateShares)
+		if okBook {
+			if crossed := arm.DeepEntryRungsCrossed(vwap); crossed < target {
+				target = crossed
+			}
+			if target <= fired {
+				// Phantom: no unfired rung's price is at/below the executable VWAP.
+				m.refuseDepthConfirm(arm.ID, m.now())
+				log.Printf("SLTPMonitor: depth-refused kind=TP-ladder user=%d token=%s fireBid=%.4f execVWAP=%.4f size=%.2f",
+					arm.TelegramID, arm.TokenID, bid, vwap, candidateShares)
+				return true
+			}
+		}
+	}
+	m.clearDepthConfirm(arm.ID) // genuine (possibly partial) crossing, or fail-open
+
+	// Sell exactly the fractions for the rungs actually crossed (fired, target].
+	shares := base * database.DeepEntryLadderFractionBetween(fired, target)
+	sharesRaw := int64(shares * 1e6)
+	if sharesRaw <= 0 {
+		return true // nothing to sell (dust base); rungs stay live
+	}
+
+	// Atomically advance the fired count BEFORE selling, base frozen. CAS on the
+	// exact fired count this eval loaded (F2): a concurrent eval that already
+	// advanced the row makes this WHERE miss ⇒ ErrSLTPArmNotFound ⇒ abort the
+	// fire (no double-sell of an overlapping slice). Advance-before-sell is
+	// preserved — the CAS gates the sell.
+	if err := m.store.AdvanceLadder(m.ctx, arm.TelegramID, arm.TokenID, fired, target, base); err != nil {
+		if !errors.Is(err, repositories.ErrSLTPArmNotFound) {
+			log.Printf("SLTPMonitor: advance ladder for %d/%s: %v", arm.TelegramID, arm.TokenID, err)
+		}
+		return true
+	}
+	// Reflect the advance on the local copy so the fire notification renders the
+	// new cumulative state (the store row is already updated).
+	arm.LadderRungsFired = target
+	arm.LadderBaseShares = base
+
+	log.Printf("SLTPMonitor: TP-ladder fire user=%d token=%s bid=%.4f rungs=%d→%d sharesRaw=%d",
+		arm.TelegramID, arm.TokenID, bid, fired, target, sharesRaw)
+	result := m.executor.ExecuteSell(m.ctx, arm, sharesRaw, 0, polymarket.OrderTypeGTC)
+	result, handled := m.retryTPShortfall("TP-ladder", arm, sharesRaw, bid, result)
+	if handled {
+		return true
+	}
+	m.notifier.NotifySLTPFired(arm.TelegramID, "TP-ladder", arm, bid, result)
+	return true
+}
+
 // retryTPShortfall handles a balance-shortfall rejection on a TP or
 // ceiling-TP sell (issue #24). An unsellable balance at bid (dust or below
 // the CLOB's $1 minimum — shortfallGone) means the position was closed
@@ -931,11 +1055,10 @@ func (m *SLTPMonitor) slGate(armID int, now time.Time) bool {
 // the gate retries after slRetryInterval; the arm row is deleted only after a
 // successful sell.
 func (m *SLTPMonitor) attemptSLExit(arm *database.SLTPArm, bid, trigger float64) {
-	// If TP already fired, only half the snapshot remains; otherwise the full amount.
-	remaining := arm.SharesAtArm
-	if !arm.TPArmed {
-		remaining = arm.SharesAtArm * (1 - database.TPSellFraction)
-	}
+	// The frozen-basis remainder still under the stop: the post-2×-TP remainder
+	// for a standard arm, or the common base minus the fired ladder rungs for a
+	// deep-entry arm (issue #81). RemainderShares keeps non-deep arms identical.
+	remaining := arm.RemainderShares()
 	sharesRaw := int64(remaining * 1e6)
 	if clamped := m.slClampedShares(arm.ID); clamped > 0 && clamped < sharesRaw {
 		sharesRaw = clamped
@@ -1167,11 +1290,9 @@ func (m *SLTPMonitor) fireCeilingTP(arm *database.SLTPArm, bid float64) {
 	}
 
 	// Frozen-snapshot remainder (manual TP+SL, unchanged): the whole snapshot if
-	// the 2× TP hasn't fired, else the post-TP remainder.
-	remaining := arm.SharesAtArm
-	if !arm.TPArmed {
-		remaining = arm.SharesAtArm * (1 - database.TPSellFraction)
-	}
+	// the 2× TP hasn't fired, else the post-TP remainder — and for a deep-entry
+	// arm the common base minus its fired ladder rungs (issue #81).
+	remaining := arm.RemainderShares()
 	// TP-only auto-arms sell the whole CURRENT holding. The live balance already
 	// nets any earlier TP sale, so it replaces the snapshot remainder when
 	// larger (manual tranches); the reactive clamp caps a Data-API-lag

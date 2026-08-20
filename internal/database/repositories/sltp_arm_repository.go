@@ -68,6 +68,19 @@ type SLTPArmRepository interface {
 	// shrinks (the reactive shortfall clamp handles a smaller wallet). Used by
 	// the sweep reconciliation; AvgPrice/HWM/flags are never touched.
 	UpdateSharesAtArm(ctx context.Context, telegramID int64, tokenID string, shares float64) error
+
+	// AdvanceLadder advances a deep-entry arm's fired-rung count from expectedFired
+	// to rungsFired and freezes ladder_base_shares (issue #81). Compare-and-set:
+	// the WHERE ladder_rungs_fired = $expectedFired guard makes it the atomic
+	// double-fire guard — two overlapping evals with stale row copies can never
+	// double-sell an overlapping slice, because only the eval whose loaded count
+	// still matches the row advances (a monotonic `< $n` guard would let a stale
+	// wider slice re-cover an already-sold rung). Returns ErrSLTPArmNotFound when
+	// no row matched (another eval already advanced it, or the row is gone).
+	// baseShares is written unconditionally; callers pass the FROZEN base (the
+	// fire-time whole position on the first fire, the stored value thereafter),
+	// so it is stable across advances.
+	AdvanceLadder(ctx context.Context, telegramID int64, tokenID string, expectedFired, rungsFired int, baseShares float64) error
 }
 
 type sltpArmRepo struct {
@@ -81,6 +94,7 @@ func NewSLTPArmRepository(db *database.DB) SLTPArmRepository {
 
 const sltpArmColumns = `id, telegram_id, token_id, condition_id, market_id, outcome,
 		avg_price, shares_at_arm, high_water_mark, tick_size, tp_armed, sl_armed, neg_risk, lottery_ticket_armed,
+		ladder_rungs_fired, ladder_base_shares,
 		created_at, updated_at`
 
 func scanArm(row pgx.Row) (*database.SLTPArm, error) {
@@ -88,6 +102,7 @@ func scanArm(row pgx.Row) (*database.SLTPArm, error) {
 	if err := row.Scan(
 		&a.ID, &a.TelegramID, &a.TokenID, &a.ConditionID, &a.MarketID, &a.Outcome,
 		&a.AvgPrice, &a.SharesAtArm, &a.HighWaterMark, &a.TickSize, &a.TPArmed, &a.SLArmed, &a.NegRisk, &a.LotteryTicketArmed,
+		&a.LadderRungsFired, &a.LadderBaseShares,
 		&a.CreatedAt, &a.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -95,19 +110,12 @@ func scanArm(row pgx.Row) (*database.SLTPArm, error) {
 	return a, nil
 }
 
-func (r *sltpArmRepo) Arm(ctx context.Context, arm *database.SLTPArm) (*database.SLTPArm, error) {
-	if err := arm.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid arm: %w", err)
-	}
-
-	// Legacy callers may leave TickSize unset; the column's CHECK requires a
-	// positive tick, so normalize to the CLOB-wide default here.
-	tickSize := arm.TickSize
-	if tickSize <= 0 {
-		tickSize = 0.01
-	}
-
-	query := `
+// armUpsertQuery inserts or re-arms a full TP+SL arm. The ON CONFLICT reset
+// includes ladder_rungs_fired = 0, ladder_base_shares = 0 (issue #81): a re-arm
+// over a mid-ladder deep arm must start the ladder fresh, otherwise it would
+// inherit a stale fired count/base and skip rungs. Mirrors high_water_mark's
+// re-seed to avg_price.
+const armUpsertQuery = `
 		INSERT INTO sltp_arms (
 			telegram_id, token_id, condition_id, market_id, outcome,
 			avg_price, shares_at_arm, high_water_mark, tick_size, tp_armed, sl_armed, neg_risk
@@ -122,10 +130,24 @@ func (r *sltpArmRepo) Arm(ctx context.Context, arm *database.SLTPArm) (*database
 			tick_size = EXCLUDED.tick_size,
 			tp_armed = TRUE,
 			sl_armed = TRUE,
-			neg_risk = EXCLUDED.neg_risk
+			neg_risk = EXCLUDED.neg_risk,
+			ladder_rungs_fired = 0,
+			ladder_base_shares = 0
 		RETURNING ` + sltpArmColumns
 
-	row := r.db.Pool.QueryRow(ctx, query,
+func (r *sltpArmRepo) Arm(ctx context.Context, arm *database.SLTPArm) (*database.SLTPArm, error) {
+	if err := arm.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid arm: %w", err)
+	}
+
+	// Legacy callers may leave TickSize unset; the column's CHECK requires a
+	// positive tick, so normalize to the CLOB-wide default here.
+	tickSize := arm.TickSize
+	if tickSize <= 0 {
+		tickSize = 0.01
+	}
+
+	row := r.db.Pool.QueryRow(ctx, armUpsertQuery,
 		arm.TelegramID, arm.TokenID, arm.ConditionID, arm.MarketID, arm.Outcome,
 		arm.AvgPrice, arm.SharesAtArm, tickSize, arm.NegRisk,
 	)
@@ -136,20 +158,10 @@ func (r *sltpArmRepo) Arm(ctx context.Context, arm *database.SLTPArm) (*database
 	return result, nil
 }
 
-// ArmTPOnly mirrors Arm but sets sl_armed = FALSE (tp_armed = TRUE). See the
-// interface doc for the rationale. high_water_mark is seeded to avg_price like
-// Arm, so a later manual re-arm behaves identically.
-func (r *sltpArmRepo) ArmTPOnly(ctx context.Context, arm *database.SLTPArm) (*database.SLTPArm, error) {
-	if err := arm.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid arm: %w", err)
-	}
-
-	tickSize := arm.TickSize
-	if tickSize <= 0 {
-		tickSize = 0.01
-	}
-
-	query := `
+// armTPOnlyUpsertQuery mirrors armUpsertQuery with sl_armed = FALSE, including
+// the same ladder_rungs_fired = 0 / ladder_base_shares = 0 reset on re-arm
+// (issue #81) so a snipe re-auto-arm over a mid-ladder deep arm restarts clean.
+const armTPOnlyUpsertQuery = `
 		INSERT INTO sltp_arms (
 			telegram_id, token_id, condition_id, market_id, outcome,
 			avg_price, shares_at_arm, high_water_mark, tick_size, tp_armed, sl_armed, neg_risk
@@ -164,10 +176,25 @@ func (r *sltpArmRepo) ArmTPOnly(ctx context.Context, arm *database.SLTPArm) (*da
 			tick_size = EXCLUDED.tick_size,
 			tp_armed = TRUE,
 			sl_armed = FALSE,
-			neg_risk = EXCLUDED.neg_risk
+			neg_risk = EXCLUDED.neg_risk,
+			ladder_rungs_fired = 0,
+			ladder_base_shares = 0
 		RETURNING ` + sltpArmColumns
 
-	row := r.db.Pool.QueryRow(ctx, query,
+// ArmTPOnly mirrors Arm but sets sl_armed = FALSE (tp_armed = TRUE). See the
+// interface doc for the rationale. high_water_mark is seeded to avg_price like
+// Arm, so a later manual re-arm behaves identically.
+func (r *sltpArmRepo) ArmTPOnly(ctx context.Context, arm *database.SLTPArm) (*database.SLTPArm, error) {
+	if err := arm.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid arm: %w", err)
+	}
+
+	tickSize := arm.TickSize
+	if tickSize <= 0 {
+		tickSize = 0.01
+	}
+
+	row := r.db.Pool.QueryRow(ctx, armTPOnlyUpsertQuery,
 		arm.TelegramID, arm.TokenID, arm.ConditionID, arm.MarketID, arm.Outcome,
 		arm.AvgPrice, arm.SharesAtArm, tickSize, arm.NegRisk,
 	)
@@ -271,6 +298,22 @@ func (r *sltpArmRepo) UpdateSharesAtArm(ctx context.Context, telegramID int64, t
 		WHERE telegram_id = $1 AND token_id = $2 AND shares_at_arm < $3`
 	if _, err := r.db.Pool.Exec(ctx, query, telegramID, tokenID, shares); err != nil {
 		return fmt.Errorf("failed to update shares_at_arm: %w", err)
+	}
+	return nil
+}
+
+// AdvanceLadder compare-and-sets ladder_rungs_fired (from expectedFired to
+// rungsFired) and freezes ladder_base_shares. See the interface doc for the
+// double-fire guard rationale.
+func (r *sltpArmRepo) AdvanceLadder(ctx context.Context, telegramID int64, tokenID string, expectedFired, rungsFired int, baseShares float64) error {
+	query := `UPDATE sltp_arms SET ladder_rungs_fired = $4, ladder_base_shares = $5
+		WHERE telegram_id = $1 AND token_id = $2 AND ladder_rungs_fired = $3`
+	tag, err := r.db.Pool.Exec(ctx, query, telegramID, tokenID, expectedFired, rungsFired, baseShares)
+	if err != nil {
+		return fmt.Errorf("failed to advance ladder: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrSLTPArmNotFound
 	}
 	return nil
 }

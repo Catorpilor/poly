@@ -946,10 +946,15 @@ func (b *Bot) snipeAutoArmTPOnly(chatID int64, tokenID, question, outcome string
 // line, and it states plainly that the stake is the max loss (there is no
 // stop). Pure — table-tested.
 func snipeAutoArmedText(title, outcome string, arm *database.SLTPArm) string {
-	// Same honesty rule as sltpTPLine (issue #74): a trigger at/above the
-	// ceiling never fires, so promise the ceiling's sell-everything instead.
+	// Deep entries (≤ $0.05) fire the multi-rung exit ladder (issue #81); list
+	// every rung so the confirmation is ladder-truthful. Otherwise the same
+	// honesty rule as sltpTPLine (issue #74): a trigger at/above the ceiling never
+	// fires, so promise the ceiling's sell-everything instead.
 	tpLine := sltpCeilingTPLine()
-	if arm.TPTriggerPrice() < database.CeilingTPPrice {
+	switch {
+	case arm.IsDeepEntry():
+		tpLine = sltpTPLadderLine(arm)
+	case arm.TPTriggerPrice() < database.CeilingTPPrice:
 		tpLine = fmt.Sprintf("• TP: bid ≥ $%.4f → sell %.0f%%, then ride to the $%.2f ceiling",
 			arm.TPTriggerPrice(), database.TPSellFraction*100, database.CeilingTPPrice)
 	}

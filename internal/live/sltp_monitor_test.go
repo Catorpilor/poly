@@ -26,9 +26,17 @@ type fakeStore struct {
 	updateHWMCalls []float64
 	// updateSharesCalls records every UpdateSharesAtArm invocation's argument.
 	updateSharesCalls []float64
+	// advanceLadderCalls records every AdvanceLadder invocation (issue #81).
+	advanceLadderCalls []ladderAdvance
 	// disarmFailN makes the next N Disarm calls fail with a generic error
 	// (simulates a transient DB outage; not ErrSLTPArmNotFound).
 	disarmFailN int
+}
+
+type ladderAdvance struct {
+	expectedFired int
+	rungsFired    int
+	baseShares    float64
 }
 
 func newFakeStore() *fakeStore {
@@ -125,6 +133,33 @@ func (s *fakeStore) UpdateSharesAtArm(_ context.Context, telegramID int64, token
 		}
 	}
 	return nil
+}
+
+// AdvanceLadder mirrors the SQL compare-and-set double-fire guard: only the eval
+// whose loaded fired count still matches the row advances; a stale copy loses.
+func (s *fakeStore) AdvanceLadder(_ context.Context, telegramID int64, tokenID string, expectedFired, rungsFired int, baseShares float64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.advanceLadderCalls = append(s.advanceLadderCalls, ladderAdvance{expectedFired, rungsFired, baseShares})
+	for _, a := range s.byToken[tokenID] {
+		if a.TelegramID == telegramID && a.LadderRungsFired == expectedFired {
+			a.LadderRungsFired = rungsFired
+			a.LadderBaseShares = baseShares
+			return nil
+		}
+	}
+	return repositories.ErrSLTPArmNotFound
+}
+
+// storedLadder returns the fake's (rungs_fired, base_shares) for the first arm
+// on tokenID.
+func (s *fakeStore) storedLadder(tokenID string) (int, float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if arms := s.byToken[tokenID]; len(arms) > 0 {
+		return arms[0].LadderRungsFired, arms[0].LadderBaseShares
+	}
+	return -1, -1
 }
 
 // storedSharesAtArm returns the fake's shares_at_arm for the first arm on tokenID.

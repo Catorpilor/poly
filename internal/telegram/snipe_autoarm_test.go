@@ -124,6 +124,28 @@ func TestSnipeAutoArmedTextUnreachableTP(t *testing.T) {
 	}
 }
 
+// TestSnipeAutoArmedTextDeepEntry: a deep-entry (≤ $0.05) TP-only auto-arm lists
+// the full exit ladder (issue #81) — every rung and the ceiling remainder — and
+// still omits any trailing-stop wording.
+func TestSnipeAutoArmedTextDeepEntry(t *testing.T) {
+	t.Parallel()
+	arm := &database.SLTPArm{AvgPrice: 0.02, HighWaterMark: 0.02, TickSize: 0.01, SharesAtArm: 250, Outcome: "T1"}
+	got := snipeAutoArmedText("LoL: T1 vs GEN", "T1", arm)
+	for _, w := range []string{
+		"Auto-armed (TP only)", "$0.0200", "TP ladder", "deep entry",
+		"25% @ 2×", "20% @ 3×", "15% @ 4×", "15% @ 5×", "ceiling", "max loss",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("deep auto-armed text missing %q:\n%s", w, got)
+		}
+	}
+	for _, notWant := range []string{"trailing", "Trailing", "wakes"} {
+		if strings.Contains(got, notWant) {
+			t.Errorf("deep TP-only text must not mention a stop (%q):\n%s", notWant, got)
+		}
+	}
+}
+
 // TestSnipeAutoArmInBand: a successful in-band auto-buy TP-only-arms from the
 // fill — TPArmed true, SLArmed false, price = guard ask, shares = stake/price,
 // HWM = AvgPrice — informs the snipe watcher, and DMs the confirmation.
