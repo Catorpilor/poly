@@ -194,10 +194,16 @@ func (a *SLTPArm) DeepEntryRungPrice(idx int) float64 {
 }
 
 // DeepEntryRungsCrossed returns how many ladder rungs the bid has reached — the
-// count of rungs whose tick-floored trigger price ≤ bid. Rung prices strictly
-// increase with the multiple, so this is always a contiguous prefix count
+// count of rungs whose tick-floored trigger price ≤ bid. Rung prices are
+// non-decreasing with the multiple, so this is always a contiguous prefix count
 // (0..len), which is why the fired state is a count and a gap that jumps two
 // rungs fires both in one combined sell.
+//
+// Sub-cent entries can collide two rungs onto the same tick (e.g. entry 0.003:
+// 2× and 3× both floor to a 0.01 grid), so a single crossing may cover both —
+// a pre-existing issue-#25-class tick-granularity limitation, not introduced
+// here. The prefix-count contract still holds; the two colliding rungs simply
+// fire together.
 func (a *SLTPArm) DeepEntryRungsCrossed(bid float64) int {
 	n := 0
 	for i := range DeepEntryLadder {

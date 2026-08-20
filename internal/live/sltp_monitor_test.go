@@ -34,8 +34,9 @@ type fakeStore struct {
 }
 
 type ladderAdvance struct {
-	rungsFired int
-	baseShares float64
+	expectedFired int
+	rungsFired    int
+	baseShares    float64
 }
 
 func newFakeStore() *fakeStore {
@@ -134,15 +135,14 @@ func (s *fakeStore) UpdateSharesAtArm(_ context.Context, telegramID int64, token
 	return nil
 }
 
-// advanceLadderCalls records every AdvanceLadder invocation for assertions.
-func (s *fakeStore) AdvanceLadder(_ context.Context, telegramID int64, tokenID string, rungsFired int, baseShares float64) error {
+// AdvanceLadder mirrors the SQL compare-and-set double-fire guard: only the eval
+// whose loaded fired count still matches the row advances; a stale copy loses.
+func (s *fakeStore) AdvanceLadder(_ context.Context, telegramID int64, tokenID string, expectedFired, rungsFired int, baseShares float64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.advanceLadderCalls = append(s.advanceLadderCalls, ladderAdvance{rungsFired, baseShares})
+	s.advanceLadderCalls = append(s.advanceLadderCalls, ladderAdvance{expectedFired, rungsFired, baseShares})
 	for _, a := range s.byToken[tokenID] {
-		// Mirror the SQL monotonic double-fire guard: only the first eval to
-		// cross a new rung set advances; a stale/duplicate count no-ops.
-		if a.TelegramID == telegramID && a.LadderRungsFired < rungsFired {
+		if a.TelegramID == telegramID && a.LadderRungsFired == expectedFired {
 			a.LadderRungsFired = rungsFired
 			a.LadderBaseShares = baseShares
 			return nil

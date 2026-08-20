@@ -14,6 +14,8 @@
 -- arms adopt the ladder with no backfill, and every non-qualifying arm keeps
 -- ladder_rungs_fired = 0 forever (never enters the ladder path) — byte-identical
 -- to pre-#81 behavior. See internal/database/models.go (DeepEntryLadder).
+-- The upper bound (4) is len(DeepEntryLadder); if the schedule ever grows,
+-- this CHECK must grow with it (a follow-up ALTER … DROP/ADD CONSTRAINT).
 ALTER TABLE sltp_arms
     ADD COLUMN IF NOT EXISTS ladder_rungs_fired INTEGER NOT NULL DEFAULT 0
     CHECK (ladder_rungs_fired >= 0 AND ladder_rungs_fired <= 4);

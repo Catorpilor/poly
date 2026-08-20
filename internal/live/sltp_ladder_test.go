@@ -1,6 +1,7 @@
 package live
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -383,6 +384,145 @@ func TestSLTPMonitor_Ladder_DepthConfirmWrapsRungs(t *testing.T) {
 	}
 	if rungs, _ := store.storedLadder("D"); rungs != 1 {
 		t.Errorf("genuine rung must advance the count to 1, got %d", rungs)
+	}
+}
+
+// TestSLTPMonitor_Ladder_CrossedRungsFromExecutableVWAP is the F1 guard: the bid
+// print only NOMINATES the candidate slice; the rungs ACTUALLY sold are derived
+// from the executable VWAP the depth confirm computes, so a mid-crash overprint
+// can never front-load the ladder past the study's model. entry 0.04 ⇒ rungs
+// 0.08/0.12/0.16/0.20.
+func TestSLTPMonitor_Ladder_CrossedRungsFromExecutableVWAP(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		bid       float64 // the (possibly phantom) print
+		vwap      float64 // executable sell VWAP for the candidate slice
+		wantSell  int64   // raw shares sold (fraction of base 100)
+		wantRungs int     // fired count after the eval
+	}{
+		// Verifier's exhibit: print 0.16 nominates rungs 1-3, but the book only
+		// clears rung 1 (VWAP 0.085 between rung 1 @0.08 and rung 2 @0.12) — sell
+		// only rung 1's 25%.
+		{"phantom gap sells only the genuinely-crossed rung", 0.16, 0.085, 25_000_000, 1},
+		// Real gap: VWAP 0.17 clears rungs 1-3 → all three fire combined (60%).
+		{"real gap fires all crossed rungs combined", 0.16, 0.17, 60_000_000, 3},
+		// VWAP clears rungs 1-2 but not 3 → sell 45% (25+20).
+		{"partial gap fires the cleared rungs only", 0.16, 0.13, 45_000_000, 2},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			store := newFakeStore()
+			store.seed(&database.SLTPArm{ID: 1, TelegramID: 7, TokenID: "D", AvgPrice: 0.04,
+				SharesAtArm: 100, HighWaterMark: 0.04, TickSize: 0.01, TPArmed: true, SLArmed: false})
+			feed := newFakeFeed()
+			exec := &fakeExecutor{}
+			notif := &fakeNotifier{}
+			reader := newFakeBookReader()
+			reader.setVWAP("D", tc.vwap, 1_000_000, true)
+			m := NewSLTPMonitor(store, feed, exec, notif, nil)
+			m.SetBookReader(reader)
+			_ = m.Start()
+
+			feed.setBid("D", tc.bid)
+			feed.emit("D")
+			waitFor(t, func() bool { exec.mu.Lock(); defer exec.mu.Unlock(); return len(exec.calls) == 1 })
+			exec.mu.Lock()
+			got := exec.calls[0].sharesRaw
+			exec.mu.Unlock()
+			if got != tc.wantSell {
+				t.Errorf("sold %d, want %d (rungs from executable VWAP, not the print)", got, tc.wantSell)
+			}
+			if rungs, _ := store.storedLadder("D"); rungs != tc.wantRungs {
+				t.Errorf("advanced to %d rungs, want %d", rungs, tc.wantRungs)
+			}
+			// Exactly ONE fresh-book fetch, sized to the nominated slice.
+			if reader.callCount() != 1 {
+				t.Errorf("book fetches = %d, want 1", reader.callCount())
+			}
+		})
+	}
+}
+
+// TestSLTPMonitor_Ladder_StaleCopyCASNoDoubleSell is the F2 guard: two evals with
+// stale (pre-advance) row copies must not double-sell an overlapping slice. The
+// compare-and-set advance lets the first eval win; the second aborts its fire,
+// and the overlapping rung is sold exactly once.
+func TestSLTPMonitor_Ladder_StaleCopyCASNoDoubleSell(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 1, TelegramID: 7, TokenID: "D", AvgPrice: 0.04,
+		SharesAtArm: 100, HighWaterMark: 0.04, TickSize: 0.01, TPArmed: true, SLArmed: false})
+	feed := newFakeFeed()
+	exec := &fakeExecutor{}
+	notif := &fakeNotifier{}
+	m := NewSLTPMonitor(store, feed, exec, notif, nil)
+	// No Start: drive fireLadder directly with two independently-loaded (stale)
+	// copies, both showing fired=0 as they would if dispatched before either wrote.
+	copyA := &database.SLTPArm{ID: 1, TelegramID: 7, TokenID: "D", AvgPrice: 0.04,
+		SharesAtArm: 100, HighWaterMark: 0.04, TickSize: 0.01, TPArmed: true, SLArmed: false}
+	copyB := *copyA
+
+	// Eval A crosses rung 1 (bid 0.08) and wins: advances 0→1, sells 25%.
+	if !m.fireLadder(copyA, 0.08) {
+		t.Fatal("eval A should consume the tick")
+	}
+	// Eval B still holds fired=0 and crosses rungs 1-2 (bid 0.12); its CAS on
+	// fired=0 now misses (row is at 1), so it must sell NOTHING — not the wider
+	// 45% slice that would re-cover rung 1.
+	if !m.fireLadder(&copyB, 0.12) {
+		t.Fatal("eval B should still consume the tick")
+	}
+	if n := exec.callCountTotal(); n != 1 {
+		t.Fatalf("stale-copy CAS must sell rung 1 exactly once, got %d sells", n)
+	}
+	exec.mu.Lock()
+	first := exec.calls[0].sharesRaw
+	exec.mu.Unlock()
+	if first != 25_000_000 {
+		t.Errorf("only sell = %d, want 25000000 (rung 1 once)", first)
+	}
+	if rungs, _ := store.storedLadder("D"); rungs != 1 {
+		t.Errorf("fired count = %d, want 1 (B's stale advance rejected)", rungs)
+	}
+
+	// A fresh eval (fired=1) fires rung 2 for the remaining 20% — total 45%, never 70%.
+	fresh, _ := store.ListArmedByToken(context.Background(), "D")
+	if !m.fireLadder(fresh[0], 0.12) {
+		t.Fatal("fresh eval should consume the tick")
+	}
+	waitFor(t, func() bool { exec.mu.Lock(); defer exec.mu.Unlock(); return len(exec.calls) == 2 })
+	exec.mu.Lock()
+	second := exec.calls[1].sharesRaw
+	exec.mu.Unlock()
+	if second != 20_000_000 {
+		t.Errorf("fresh rung 2 sell = %d, want 20000000", second)
+	}
+}
+
+// TestFakeStore_AdvanceLadderCAS pins the compare-and-set semantics the SQL
+// mirrors: an advance whose expected count no longer matches the row is rejected.
+func TestFakeStore_AdvanceLadderCAS(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	store.seed(&database.SLTPArm{ID: 1, TelegramID: 7, TokenID: "D", AvgPrice: 0.04,
+		SharesAtArm: 100, TPArmed: true})
+	ctx := context.Background()
+	if err := store.AdvanceLadder(ctx, 7, "D", 0, 1, 100); err != nil {
+		t.Fatalf("first advance 0→1: %v", err)
+	}
+	// Stale expected=0 now misses (row is at 1).
+	if err := store.AdvanceLadder(ctx, 7, "D", 0, 2, 100); err == nil {
+		t.Error("stale-copy advance (expected 0, row at 1) must be rejected")
+	}
+	// Correct expected=1 succeeds.
+	if err := store.AdvanceLadder(ctx, 7, "D", 1, 2, 100); err != nil {
+		t.Fatalf("advance 1→2: %v", err)
+	}
+	if rungs, _ := store.storedLadder("D"); rungs != 2 {
+		t.Errorf("final fired count = %d, want 2", rungs)
 	}
 }
 
