@@ -73,18 +73,7 @@ func (b *Bot) handleSLTPList(ctx context.Context, update *tgbotapi.Update) {
 		}
 	}
 
-	header := fmt.Sprintf(
-		"🎯 *SL/TP Auto-Sell* (%d positions)\n\n"+
-			"• *TP:* bid ≥ entry × %.1f → sell %.0f%%\n"+
-			"• *SL:* trailing — activates once bid ≥ entry × %.2f, then\n"+
-			"  stop = max(entry, peak × %.2f) → sell 100%%\n\n"+
-			"Tap a position to arm or disarm.\n\n",
-		len(positions),
-		database.TPMultiplier,
-		database.TPSellFraction*100,
-		database.SLActivationMult,
-		database.SLTrailMult,
-	)
+	header := sltpListHeader(len(positions), armed)
 
 	var rows [][]tgbotapi.InlineKeyboardButton
 	for i, pos := range positions {
@@ -108,6 +97,37 @@ func (b *Bot) handleSLTPList(ctx context.Context, update *tgbotapi.Update) {
 	b.stateManager.SetState(userID, StateSelectingPosition, map[string]interface{}{
 		"positions": positions,
 	}, 10*time.Minute)
+}
+
+// sltpListHeader builds the /sltp list legend. Deep-aware (issue #81): when any
+// currently-armed position is a deep-entry arm, it appends the exit-ladder
+// summary so the surface states what those arms actually do rather than the
+// single 25% @ 2× partial (v0.18.1 lesson: no message may promise a mechanism
+// that will not fire). A list with no deep-entry arm is byte-identical to the
+// pre-#81 header. Pure — table-tested.
+func sltpListHeader(positionCount int, armed map[string]*database.SLTPArm) string {
+	header := fmt.Sprintf(
+		"🎯 *SL/TP Auto-Sell* (%d positions)\n\n"+
+			"• *TP:* bid ≥ entry × %.1f → sell %.0f%%\n"+
+			"• *SL:* trailing — activates once bid ≥ entry × %.2f, then\n"+
+			"  stop = max(entry, peak × %.2f) → sell 100%%\n\n"+
+			"Tap a position to arm or disarm.\n\n",
+		positionCount,
+		database.TPMultiplier,
+		database.TPSellFraction*100,
+		database.SLActivationMult,
+		database.SLTrailMult,
+	)
+	for _, arm := range armed {
+		if arm != nil && arm.IsDeepEntry() {
+			header += fmt.Sprintf(
+				"⚡ Deep entries (≤ $%.2f) use the exit ladder instead: "+
+					"25%%@2× · 20%%@3× · 15%%@4× · 15%%@5×, rest → $%.2f ceiling.\n\n",
+				database.LadderMaxEntry, database.CeilingTPPrice)
+			break
+		}
+	}
+	return header
 }
 
 // sltpCoverageTolerance is the dust threshold (shares) below which a TP-only

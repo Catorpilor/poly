@@ -425,6 +425,43 @@ func TestSLTPFiredText_Ladder(t *testing.T) {
 	})
 }
 
+// TestSLTPListHeader covers the /sltp list legend (issue #81 F4): it stays
+// byte-identical when no listed arm is deep, and appends the ladder summary when
+// any armed position is a deep entry.
+func TestSLTPListHeader(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no deep arm: standard legend, no ladder line", func(t *testing.T) {
+		t.Parallel()
+		armed := map[string]*database.SLTPArm{
+			"A": {AvgPrice: 0.20, TPArmed: true, SLArmed: true},
+		}
+		got := sltpListHeader(3, armed)
+		for _, w := range []string{"SL/TP Auto-Sell", "entry × 2.0 → sell 25%", "trailing"} {
+			if !strings.Contains(got, w) {
+				t.Errorf("standard header missing %q:\n%s", w, got)
+			}
+		}
+		if strings.Contains(got, "exit ladder") {
+			t.Errorf("non-deep list must not mention the ladder:\n%s", got)
+		}
+	})
+
+	t.Run("a deep arm present: appends the ladder summary", func(t *testing.T) {
+		t.Parallel()
+		armed := map[string]*database.SLTPArm{
+			"A": {AvgPrice: 0.20, TPArmed: true, SLArmed: true},
+			"B": {AvgPrice: 0.03, TPArmed: true, SLArmed: false}, // deep
+		}
+		got := sltpListHeader(2, armed)
+		for _, w := range []string{"exit ladder", "25%@2×", "20%@3×", "15%@4×", "15%@5×", "ceiling"} {
+			if !strings.Contains(got, w) {
+				t.Errorf("deep-aware header missing %q:\n%s", w, got)
+			}
+		}
+	})
+}
+
 // TestSLTPArmedText_Ladder covers the manual arm-confirmation copy for a
 // deep-entry position (issue #81): it lists every rung (fraction, multiple, and
 // tick-floored price) and the ceiling remainder, and never the single-partial
