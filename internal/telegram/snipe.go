@@ -1273,9 +1273,10 @@ func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResul
 	// Scope (binding, from the ratified spec):
 	//   - TP-only auto-arms (sl_armed = FALSE) never gate — they already carry
 	//     fire-time whole-position TP coverage, so a top-up stays orphan-safe.
-	//   - Disarmed/swept arms never gate: GetByUserAndToken returns nil for a
-	//     deleted row, or a row with sl_armed = FALSE for a swept one — both fall
-	//     through to the buy.
+	//   - Disarmed/swept arms never gate: every disarm path (user disarm, SL-fire
+	//     completion, sweep) DELETEs the row, so GetByUserAndToken returns nil;
+	//     the sl_armed=FALSE rows that do exist (TP-only arms, incl. post-ClearTP)
+	//     fall through to the buy on the flag check.
 	//   - The gate is a GUARD, not a dependency: a DB-read failure fails OPEN (the
 	//     buy proceeds exactly as today) and logs loudly. A nil repo (test bots,
 	//     legacy wiring) is likewise a no-op.
