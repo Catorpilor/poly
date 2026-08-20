@@ -68,6 +68,17 @@ type SLTPArmRepository interface {
 	// shrinks (the reactive shortfall clamp handles a smaller wallet). Used by
 	// the sweep reconciliation; AvgPrice/HWM/flags are never touched.
 	UpdateSharesAtArm(ctx context.Context, telegramID int64, tokenID string, shares float64) error
+
+	// AdvanceLadder advances a deep-entry arm's fired-rung count to rungsFired
+	// and freezes ladder_base_shares (issue #81). Monotonic: the
+	// WHERE ladder_rungs_fired < $rungsFired guard is the atomic double-fire
+	// guard — under concurrent WS+tick evals only the first to cross a new rung
+	// set wins, exactly as ClearTP guards the single 2× partial. Returns
+	// ErrSLTPArmNotFound when no row advanced (already at/past that count, or the
+	// row is gone). baseShares is written unconditionally; callers pass the FROZEN
+	// base (the fire-time whole position on the first fire, the stored value
+	// thereafter), so it is stable across advances.
+	AdvanceLadder(ctx context.Context, telegramID int64, tokenID string, rungsFired int, baseShares float64) error
 }
 
 type sltpArmRepo struct {
@@ -81,6 +92,7 @@ func NewSLTPArmRepository(db *database.DB) SLTPArmRepository {
 
 const sltpArmColumns = `id, telegram_id, token_id, condition_id, market_id, outcome,
 		avg_price, shares_at_arm, high_water_mark, tick_size, tp_armed, sl_armed, neg_risk, lottery_ticket_armed,
+		ladder_rungs_fired, ladder_base_shares,
 		created_at, updated_at`
 
 func scanArm(row pgx.Row) (*database.SLTPArm, error) {
@@ -88,6 +100,7 @@ func scanArm(row pgx.Row) (*database.SLTPArm, error) {
 	if err := row.Scan(
 		&a.ID, &a.TelegramID, &a.TokenID, &a.ConditionID, &a.MarketID, &a.Outcome,
 		&a.AvgPrice, &a.SharesAtArm, &a.HighWaterMark, &a.TickSize, &a.TPArmed, &a.SLArmed, &a.NegRisk, &a.LotteryTicketArmed,
+		&a.LadderRungsFired, &a.LadderBaseShares,
 		&a.CreatedAt, &a.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -271,6 +284,21 @@ func (r *sltpArmRepo) UpdateSharesAtArm(ctx context.Context, telegramID int64, t
 		WHERE telegram_id = $1 AND token_id = $2 AND shares_at_arm < $3`
 	if _, err := r.db.Pool.Exec(ctx, query, telegramID, tokenID, shares); err != nil {
 		return fmt.Errorf("failed to update shares_at_arm: %w", err)
+	}
+	return nil
+}
+
+// AdvanceLadder atomically advances ladder_rungs_fired and freezes
+// ladder_base_shares. See the interface doc for the double-fire guard rationale.
+func (r *sltpArmRepo) AdvanceLadder(ctx context.Context, telegramID int64, tokenID string, rungsFired int, baseShares float64) error {
+	query := `UPDATE sltp_arms SET ladder_rungs_fired = $3, ladder_base_shares = $4
+		WHERE telegram_id = $1 AND token_id = $2 AND ladder_rungs_fired < $3`
+	tag, err := r.db.Pool.Exec(ctx, query, telegramID, tokenID, rungsFired, baseShares)
+	if err != nil {
+		return fmt.Errorf("failed to advance ladder: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrSLTPArmNotFound
 	}
 	return nil
 }

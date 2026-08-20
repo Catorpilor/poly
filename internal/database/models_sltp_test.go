@@ -43,6 +43,131 @@ func TestSLTPArm_TPTriggerPrice(t *testing.T) {
 	}
 }
 
+// TestSLTPArm_IsDeepEntry pins the ladder-membership boundary (issue #81):
+// entry ≤ 0.05 qualifies (strict ≤ — 0.05 itself is in), 0.0501 doesn't, and a
+// zero-value arm is never deep.
+func TestSLTPArm_IsDeepEntry(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		avgPrice float64
+		want     bool
+	}{
+		{"entry exactly 0.05 qualifies", 0.05, true},
+		{"entry just above 0.05 does not", 0.0501, false},
+		{"deep entry 0.02 qualifies", 0.02, true},
+		{"one-cent entry qualifies", 0.01, true},
+		{"typical entry 0.20 does not", 0.20, false},
+		{"zero-value arm is not deep", 0, false},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			a := &SLTPArm{AvgPrice: tt.avgPrice}
+			if got := a.IsDeepEntry(); got != tt.want {
+				t.Errorf("IsDeepEntry(avg=%v) = %v, want %v", tt.avgPrice, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSLTPArm_DeepEntryRungPrice pins the four rung triggers off a 0.05 entry,
+// each entry × multiple floored to the tick grid.
+func TestSLTPArm_DeepEntryRungPrice(t *testing.T) {
+	t.Parallel()
+	a := &SLTPArm{AvgPrice: 0.05, TickSize: 0.01}
+	wants := []float64{0.10, 0.15, 0.20, 0.25} // 2×,3×,4×,5×
+	for i, want := range wants {
+		if got := a.DeepEntryRungPrice(i); diffTooBig(got, want) {
+			t.Errorf("DeepEntryRungPrice(%d) = %v, want %v", i, got, want)
+		}
+	}
+}
+
+// TestSLTPArm_DeepEntryRungsCrossed covers the prefix-count semantics including
+// a gap tick that crosses several rungs at once.
+func TestSLTPArm_DeepEntryRungsCrossed(t *testing.T) {
+	t.Parallel()
+	a := &SLTPArm{AvgPrice: 0.05, TickSize: 0.01} // rungs at 0.10/0.15/0.20/0.25
+	tests := []struct {
+		name string
+		bid  float64
+		want int
+	}{
+		{"below first rung", 0.09, 0},
+		{"exactly first rung", 0.10, 1},
+		{"between rung 1 and 2", 0.14, 1},
+		{"gap straight to rung 3 crosses 1-3", 0.20, 3},
+		{"at/above top rung crosses all four", 0.25, 4},
+		{"far above top rung still four", 0.80, 4},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := a.DeepEntryRungsCrossed(tt.bid); got != tt.want {
+				t.Errorf("DeepEntryRungsCrossed(%v) = %d, want %d", tt.bid, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDeepEntryLadderFractions pins the cumulative fraction math: the full
+// ladder banks 75% and leaves ~25% to ride, and a between-rungs slice sums only
+// the rungs it spans.
+func TestDeepEntryLadderFractions(t *testing.T) {
+	t.Parallel()
+	if got := DeepEntryLadderSoldFraction(0); diffTooBig(got, 0) {
+		t.Errorf("sold(0) = %v, want 0", got)
+	}
+	if got := DeepEntryLadderSoldFraction(1); diffTooBig(got, 0.25) {
+		t.Errorf("sold(1) = %v, want 0.25", got)
+	}
+	if got := DeepEntryLadderSoldFraction(4); diffTooBig(got, 0.75) {
+		t.Errorf("sold(4) = %v, want 0.75 (25%% rides to the ceiling)", got)
+	}
+	// A gap that fires rungs 2 and 3 (indices 1,2) sells 20%+15% = 35%.
+	if got := DeepEntryLadderFractionBetween(1, 3); diffTooBig(got, 0.35) {
+		t.Errorf("between(1,3) = %v, want 0.35", got)
+	}
+	// Out-of-range `to` is clamped to the ladder length.
+	if got := DeepEntryLadderFractionBetween(0, 99); diffTooBig(got, 0.75) {
+		t.Errorf("between(0,99) = %v, want 0.75", got)
+	}
+}
+
+// TestSLTPArm_RemainderShares proves the frozen-basis remainder is byte-identical
+// for non-deep arms and follows the ladder base for deep ones.
+func TestSLTPArm_RemainderShares(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		arm  SLTPArm
+		want float64
+	}{
+		{"non-deep TP not fired: full snapshot", SLTPArm{AvgPrice: 0.20, SharesAtArm: 100, TPArmed: true}, 100},
+		{"non-deep TP fired: snapshot minus 25%", SLTPArm{AvgPrice: 0.20, SharesAtArm: 100, TPArmed: false}, 75},
+		{"deep no rung fired: full snapshot", SLTPArm{AvgPrice: 0.05, SharesAtArm: 100, TPArmed: true}, 100},
+		{"deep after 1 rung: base minus 25%", SLTPArm{AvgPrice: 0.05, SharesAtArm: 100, TPArmed: true, LadderRungsFired: 1, LadderBaseShares: 100}, 75},
+		{"deep after 4 rungs: base minus 75%", SLTPArm{AvgPrice: 0.05, SharesAtArm: 100, TPArmed: true, LadderRungsFired: 4, LadderBaseShares: 100}, 25},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.arm.RemainderShares(); diffTooBig(got, tt.want) {
+				t.Errorf("RemainderShares() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func diffTooBig(got, want float64) bool {
+	d := got - want
+	return d > 1e-9 || d < -1e-9
+}
+
 func TestSLTPArm_SLActive(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
