@@ -382,6 +382,74 @@ func TestSLTPFiredText(t *testing.T) {
 	}
 }
 
+// TestSLTPFiredText_Ladder covers the deep-entry ladder fire notice (issue
+// #81): it states the rung multiple reached and the cumulative fraction banked,
+// and its remainder line matches the arm source (ceiling for TP-only, trailing
+// stop for a manual TP+SL arm).
+func TestSLTPFiredText_Ladder(t *testing.T) {
+	t.Parallel()
+	ok := &polymarket.TradeResult{Success: true}
+
+	t.Run("TP-only ladder rung states multiple and cumulative bank", func(t *testing.T) {
+		t.Parallel()
+		// After the 3× rung (2 rungs fired): 25%+20% = 45% banked.
+		arm := &database.SLTPArm{AvgPrice: 0.05, TickSize: 0.01, Outcome: "T1",
+			TPArmed: true, SLArmed: false, LadderRungsFired: 2, LadderBaseShares: 100}
+		got := sltpFiredText("TP-ladder", arm, 0.15, ok)
+		for _, w := range []string{"TP ladder", "3× entry", "45%", "T1", "$0.95", "ceiling"} {
+			if !strings.Contains(got, w) {
+				t.Errorf("ladder fire text missing %q:\n%s", w, got)
+			}
+		}
+		for _, nw := range []string{"Trailing stop"} {
+			if strings.Contains(got, nw) {
+				t.Errorf("TP-only ladder must not promise a stop (%q):\n%s", nw, got)
+			}
+		}
+	})
+
+	t.Run("manual ladder rung promises the trailing stop on the remainder", func(t *testing.T) {
+		t.Parallel()
+		// All four rungs fired: 75% banked; SLArmed ⇒ the remainder is under the stop.
+		arm := &database.SLTPArm{AvgPrice: 0.05, TickSize: 0.01, HighWaterMark: 0.30, Outcome: "T1",
+			TPArmed: true, SLArmed: true, LadderRungsFired: 4, LadderBaseShares: 100}
+		got := sltpFiredText("TP-ladder", arm, 0.25, ok)
+		for _, w := range []string{"TP ladder", "5× entry", "75%", "Trailing stop"} {
+			if !strings.Contains(got, w) {
+				t.Errorf("manual ladder fire text missing %q:\n%s", w, got)
+			}
+		}
+		if strings.Contains(got, "ceiling") {
+			t.Errorf("manual ladder remainder is under the stop, not the ceiling:\n%s", got)
+		}
+	})
+}
+
+// TestSLTPArmedText_Ladder covers the manual arm-confirmation copy for a
+// deep-entry position (issue #81): it lists every rung (fraction, multiple, and
+// tick-floored price) and the ceiling remainder, and never the single-partial
+// wording.
+func TestSLTPArmedText_Ladder(t *testing.T) {
+	t.Parallel()
+	arm := &database.SLTPArm{AvgPrice: 0.05, HighWaterMark: 0.05, TickSize: 0.01, Outcome: "T1"}
+	got := sltpArmedText("LoL: T1 vs GEN", "T1", arm)
+	for _, w := range []string{
+		"TP ladder", "deep entry",
+		"25% @ 2× → bid ≥ $0.1000",
+		"20% @ 3× → bid ≥ $0.1500",
+		"15% @ 4× → bid ≥ $0.2000",
+		"15% @ 5× → bid ≥ $0.2500",
+		"remainder", "$0.95 ceiling",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("deep armed text missing %q:\n%s", w, got)
+		}
+	}
+	if strings.Contains(got, "→ sell 25%") {
+		t.Errorf("deep armed text must not show the single-partial line:\n%s", got)
+	}
+}
+
 // TestSLTPStaleSizeText covers the issue #24 notices: a balance-shortfall
 // rejection means the arm's snapshot is stale — either the position is gone
 // entirely (auto-disarm) or the stop now covers fewer shares.
