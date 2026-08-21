@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -51,6 +52,12 @@ type TelegramConfig struct {
 	// to 90; proxies that kill idle connections make long holds die with
 	// "context deadline exceeded", so proxied deployments set this short.
 	PollTimeoutSeconds int
+	// LinkedChatIDs is the "household" of Telegram chat IDs that share live
+	// subscriptions (LINKED_CHAT_IDS, comma-separated). A /live or /stoplive by
+	// ANY member fans out to every member (issue #90). Empty/unset = feature
+	// off, bit-identical single-account behavior. Membership changes = edit the
+	// .env and restart.
+	LinkedChatIDs []int64
 }
 
 // DatabaseConfig holds database configuration
@@ -149,6 +156,15 @@ func Load() (*Config, error) {
 	cfg.Telegram.PollTimeoutSeconds = getEnvInt("TELEGRAM_POLL_TIMEOUT_SECONDS", 60)
 	if cfg.Telegram.PollTimeoutSeconds < 1 || cfg.Telegram.PollTimeoutSeconds > 90 {
 		cfg.Telegram.PollTimeoutSeconds = 60
+	}
+	// Linked-account fan-out household (issue #90). Fail-safe: a malformed list
+	// logs loudly and leaves the household empty (feature off). A typo must
+	// never silently change recipiency — an unintended member would receive a
+	// live auto-buy per qualifying alert.
+	if ids, err := parseLinkedChatIDs(os.Getenv("LINKED_CHAT_IDS")); err != nil {
+		log.Printf("LINKED_CHAT_IDS invalid (%v) — linked-account fan-out DISABLED; fix the .env and restart", err)
+	} else {
+		cfg.Telegram.LinkedChatIDs = ids
 	}
 
 	// Load Database configuration
@@ -250,6 +266,38 @@ func getEnvFloat(key string, defaultValue float64) float64 {
 		}
 	}
 	return defaultValue
+}
+
+// parseLinkedChatIDs parses a comma-separated list of Telegram chat IDs
+// (LINKED_CHAT_IDS). Empty/blank ⇒ nil (feature off). Whitespace around each
+// entry is tolerated and duplicates collapse. A single malformed entry fails
+// the WHOLE parse: recipiency is safety-critical, so the caller treats any typo
+// as "feature off" rather than silently dropping a member or fanning auto-buys
+// to an unintended chat.
+func parseLinkedChatIDs(raw string) ([]int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	ids := make([]int64, 0, len(parts))
+	seen := make(map[int64]bool, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return nil, fmt.Errorf("empty chat id in %q", raw)
+		}
+		id, err := strconv.ParseInt(p, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid chat id %q: %w", p, err)
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 func getEnvBool(key string, defaultValue bool) bool {

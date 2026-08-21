@@ -39,7 +39,11 @@ type Bot struct {
 	tradingClient  *polymarket.TradingClient
 	relayerClient  *polymarket.RelayerClient
 	liveManager    *live.LiveTradeManager
-	sltpMonitor    *live.SLTPMonitor
+	// liveSubs is a test seam for the /live and /stoplive subscription path; nil
+	// selects production (b.liveManager). Fan-out tests inject a fake so no
+	// Polymarket resolve or WebSocket is needed (issue #90).
+	liveSubs    liveSubscriptions
+	sltpMonitor *live.SLTPMonitor
 	// Comeback Snipe: watcher + ask source wired via SetSnipe; alert registry
 	// maps short callback IDs to token/market info (token IDs are ~78 digits,
 	// far beyond Telegram's 64-byte callback data); spend ledger caps the v2
