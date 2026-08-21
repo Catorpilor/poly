@@ -1,8 +1,10 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +22,7 @@ type recordingArmRepo struct {
 	repositories.SLTPArmRepository
 	mu       sync.Mutex
 	existing *database.SLTPArm // returned by GetByUserAndToken (nil = none)
+	getErr   error             // forced GetByUserAndToken error (fail-closed path, issue #87)
 	armErr   error             // forced ArmTPOnly error
 	armed    []*database.SLTPArm
 }
@@ -27,6 +30,9 @@ type recordingArmRepo struct {
 func (r *recordingArmRepo) GetByUserAndToken(_ context.Context, _ int64, _ string) (*database.SLTPArm, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.getErr != nil {
+		return nil, r.getErr
+	}
 	return r.existing, nil
 }
 
@@ -214,6 +220,69 @@ func TestSnipeAutoArmNoClobber(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	if got := len(repo.armedCalls()); got != 0 {
 		t.Errorf("ArmTPOnly calls = %d, want 0 (existing arm must not be clobbered)", got)
+	}
+	// A found arm is a silent skip — no auto-arm DM (neither the confirmation nor
+	// the issue #87 fail-closed warning); only the alert itself went out.
+	h.tg.mu.Lock()
+	for _, m := range h.tg.sends {
+		if strings.Contains(m.text, "Auto-armed") || strings.Contains(m.text, "Couldn't verify") {
+			t.Errorf("existing arm must not trigger an auto-arm DM; got:\n%s", m.text)
+		}
+	}
+	h.tg.mu.Unlock()
+}
+
+// syncBuffer is a mutex-guarded log sink so the async auto-arm goroutine's
+// output can be captured and read from the test goroutine under -race.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestSnipeAutoArmReadErrorFailsClosed: issue #87 — a non-nil error from the
+// existing-arm read must FAIL CLOSED: no ArmTPOnly call, a fail-closed log, and
+// a DM telling the recipient to arm manually. The buy itself is unaffected.
+// Not parallel: it swaps the process-wide log output to capture the log line.
+func TestSnipeAutoArmReadErrorFailsClosed(t *testing.T) {
+	var logs syncBuffer
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
+
+	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.20, askOK: true, user: snipeWalletUser()})
+	repo := &recordingArmRepo{getErr: errors.New("db read timeout")}
+	h.bot.sltpArmRepo = repo
+
+	h.bot.NotifySnipeAlert(7, testSnipeMarket(), 0.45, 0.20)
+
+	if got := h.buys.count(); got != 1 {
+		t.Fatalf("buy calls = %d, want 1 (read error must not block the buy)", got)
+	}
+	// The fail-closed warning DM is the branch's terminal effect; awaiting it
+	// proves the read-error path ran to completion (log + DM + return).
+	waitForSend(t, h.tg, "Couldn't verify this token's existing protection — auto-arm skipped. Tap 🎯 SL/TP to arm manually.")
+
+	if got := len(repo.armedCalls()); got != 0 {
+		t.Errorf("ArmTPOnly calls = %d, want 0 (must fail closed on read error)", got)
+	}
+	if out := logs.String(); !strings.Contains(out, "existing-arm read FAILED") || !strings.Contains(out, "failing closed, no auto-arm") {
+		t.Errorf("missing fail-closed log line; got:\n%s", out)
 	}
 }
 
