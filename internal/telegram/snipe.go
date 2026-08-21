@@ -1094,7 +1094,16 @@ func (b *Bot) snipeAutoArmTPOnly(chatID int64, tokenID, question, outcome string
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if existing, _ := b.sltpArmRepo.GetByUserAndToken(ctx, chatID, tokenID); existing != nil {
+	existing, err := b.sltpArmRepo.GetByUserAndToken(ctx, chatID, tokenID)
+	if err != nil {
+		// Fail closed (issue #87): a read failure can't distinguish "no arm" from
+		// "arm exists", so never auto-arm on an unverifiable token — that risks
+		// clobbering an existing arm. Warn the recipient to arm manually. No retry.
+		log.Printf("Snipe auto-arm: existing-arm read FAILED chat=%d token=%.12s…: %v — failing closed, no auto-arm", chatID, tokenID, err)
+		b.sendMessage(chatID, "⚠️ Couldn't verify this token's existing protection — auto-arm skipped. Tap 🎯 SL/TP to arm manually.")
+		return
+	}
+	if existing != nil {
 		log.Printf("Snipe auto-arm: arm already exists chat=%d token=%.12s… — skipping", chatID, tokenID)
 		return
 	}
