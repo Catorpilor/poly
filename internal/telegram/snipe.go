@@ -781,10 +781,10 @@ func (b *Bot) snipeAlertMessage(chatID int64, alertID string, market live.SnipeM
 			if price <= 0 {
 				price = ask
 			}
-			return snipeBoxedBoughtText(market.Question, market.Outcome, price, snipeBoxedTrancheUSD, 1, res.orderID, capLeft),
+			return snipeBoxedBoughtText(market.Question, market.Outcome, price, snipeBoxedTrancheUSD, 1, res.orderID, capLeft) + snipeFillNote(res),
 				snipeAutoBoughtKeyboard(alertID)
 		}
-		return snipeAutoBoughtText(market.Question, market.Outcome, sessionHigh, ask, snipeAutoBuyUSD, res.orderID, capLeft),
+		return snipeAutoBoughtText(market.Question, market.Outcome, sessionHigh, ask, snipeAutoBuyUSD, res.orderID, capLeft) + snipeFillNote(res),
 			snipeAutoBoughtKeyboard(alertID)
 	case snipeAutoCapReached:
 		return snipeAlertText(market.Question, market.Outcome, sessionHigh, ask) + snipeCapNote,
@@ -836,7 +836,7 @@ func (b *Bot) NotifySnipeBoxed(chatID int64, market live.SnipeMarket, sessionHig
 	}
 	alertID := b.snipeAlerts.add(market)
 	b.sendMessageWithKeyboard(chatID,
-		snipeBoxedBoughtText(market.Question, market.Outcome, ask, snipeBoxedTrancheUSD, tranche, res.orderID, capLeft),
+		snipeBoxedBoughtText(market.Question, market.Outcome, ask, snipeBoxedTrancheUSD, tranche, res.orderID, capLeft)+snipeFillNote(res),
 		snipeAutoBoughtKeyboard(alertID))
 }
 
@@ -912,7 +912,7 @@ func (b *Bot) snipeDeepMessage(chatID int64, alertID string, market live.SnipeMa
 	base := snipeDeepText(market.Question, market.Outcome, alertAsk, ask)
 	switch status {
 	case snipeAutoBought:
-		return snipeDeepBoughtText(market.Question, market.Outcome, alertAsk, ask, snipeDeepBuyUSD, res.orderID, poolLeft),
+		return snipeDeepBoughtText(market.Question, market.Outcome, alertAsk, ask, snipeDeepBuyUSD, res.orderID, poolLeft) + snipeFillNote(res),
 			snipeAutoBoughtKeyboard(alertID)
 	case snipeAutoCapReached:
 		return base + snipeDeepCapNote, snipeKeyboard(alertID)
@@ -979,9 +979,11 @@ func (b *Bot) snipeDeepAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyR
 	if b.snipeBought != nil {
 		b.snipeBought.logDeepBuy(chatID, market.TokenID, snipeDeepBuyUSD)
 	}
-	// Auto-arm TP + ceiling (no trailing SL) from the fill — async, never blocks
-	// alert delivery.
-	go b.snipeAutoArmTPOnly(chatID, market.TokenID, market.Question, market.Outcome, res, snipeDeepBuyUSD)
+	// Confirm the fill, then arm TP + ceiling (no trailing SL) — async. An
+	// unfilled order is cancelled and the $5 released back to the deep pool
+	// (issue #92).
+	go b.snipeConfirmFillThenArm(chatID, user, market.TokenID, market.Question, market.Outcome, res, snipeDeepBuyUSD,
+		func(a float64) { b.snipeDeepSpend.release(chatID, a) })
 	log.Printf("Snipe deep-buy: accepted chat=%d token=%.12s… $%.0f order=%s pool-left=$%.2f",
 		chatID, market.TokenID, snipeDeepBuyUSD, res.orderID, poolLeft)
 	return res, poolLeft, snipeAutoBought
@@ -1072,6 +1074,220 @@ func (b *Bot) snipeHoldsSiblingPosition(ctx context.Context, user *database.User
 		}
 	}
 	return false
+}
+
+// Fill confirmation (issue #92): an executor Success on a GTC snipe buy only
+// means the CLOB accepted the order — on a fast-moving book it can REST
+// unfilled while the quoted level vanishes. Arming (and keeping the stake)
+// off an unfilled order produced the VISION-series chain: instant TP against
+// zero balance, a false "closed outside the bot" disarm, and an orphaned
+// resting bid that later filled unarmed. The confirm path polls the order
+// until it matches, cancels it when the window expires, and refunds the
+// unfilled slice of the stake.
+const (
+	snipeFillPollInterval  = 3 * time.Second
+	snipeFillConfirmWindow = 60 * time.Second
+	// snipeFillGoneGrace mirrors the FOK path's fokGoneGraceWindow (issue #27):
+	// an accepted in-play order is NOT queryable on GET /data/order during the
+	// bet delay — production delayed orders polled "gone" ~1s after submission
+	// and then FILLED seconds later. A found=false reading inside this window
+	// is inconclusive, never terminal.
+	snipeFillGoneGrace = 15 * time.Second
+)
+
+// snipeFillPendingNote is appended to a bought confirmation whose fill the
+// executor did not confirm (the order may be resting) — the DM must not claim
+// a fill that hasn't happened (the v0.18.1 message-truth rule).
+const snipeFillPendingNote = "\n\n⏳ Fill not confirmed yet — protection arms when it lands, or you'll get a refund note if it doesn't."
+
+// snipeFillNote returns the pending-fill disclaimer for an unconfirmed buy,
+// empty for an executor-confirmed fill. Pure.
+func snipeFillNote(res snipeBuyResult) string {
+	if res.filledSize > 0 {
+		return ""
+	}
+	return snipeFillPendingNote
+}
+
+// snipeUnfilledText is the note for a snipe order that never filled and was
+// cancelled. The refund line only appears when a cap was actually drawn — the
+// one-tap path draws none (issue #92 review F5). Pure.
+func snipeUnfilledText(question, outcome string, stake float64, capRefunded bool) string {
+	tail := "cancelled — nothing was bought."
+	if capRefunded {
+		tail = fmt.Sprintf("cancelled, $%.2f returned to today's cap.", stake)
+	}
+	return fmt.Sprintf("⏳ *Snipe order didn't fill*\n\n%s\nSide: Buy %s\n\nThe book moved before the order could match — %s",
+		question, outcome, tail)
+}
+
+// snipeConfirmFillThenArm gates the TP-only auto-arm behind an actual fill
+// (issue #92). An executor-confirmed fill arms immediately (the pre-#92
+// path). Otherwise it polls the order until matched; an order still open at
+// the window edge is cancelled (a cancel that races a fill still arms the
+// matched shares) and the unfilled slice of the stake is released via the
+// caller's ledger closure. When the order status can never be read, it fails
+// closed both ways: no arm, no refund, one loud warning.
+func (b *Bot) snipeConfirmFillThenArm(chatID int64, user *database.User, tokenID, question, outcome string, res snipeBuyResult, stake float64, release func(float64)) {
+	if res.filledSize > 0 {
+		b.snipeAutoArmTPOnly(chatID, tokenID, question, outcome, res, stake)
+		return
+	}
+	poll, window := b.snipeFillPoll, b.snipeFillWindow
+	if poll <= 0 {
+		poll = snipeFillPollInterval
+	}
+	if window <= 0 {
+		window = snipeFillConfirmWindow
+	}
+	check, kill := b.snipeOrderFill, b.snipeOrderKill
+	if check == nil {
+		check = b.snipeOrderFillLive
+	}
+	if kill == nil {
+		kill = b.snipeOrderKillLive
+	}
+	goneGrace := b.snipeFillGoneGrace
+	if goneGrace <= 0 {
+		goneGrace = snipeFillGoneGrace
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), window+30*time.Second)
+	defer cancel()
+
+	// matched/price only ever update from found=true readings — a bet-delay
+	// 404 blip must not wipe an observed partial fill (review F3). terminal
+	// means the order's final state is CONFIRMED: only a confirmed-terminal
+	// order may trigger a refund (review F2).
+	start := time.Now()
+	deadline := start.Add(window)
+	var matched, price float64
+	var terminal bool
+	for {
+		m, p, o, found, err := check(ctx, user, res.orderID)
+		switch {
+		case err != nil:
+			log.Printf("Snipe fill-confirm: status read chat=%d order=%s: %v", chatID, res.orderID, err)
+		case found:
+			matched = m
+			if p > 0 {
+				price = p
+			}
+			if !o {
+				terminal = true // fully matched or killed
+			}
+		case time.Since(start) > goneGrace:
+			terminal = true // not queryable well past the bet delay: reaped
+		default:
+			// found=false right after submit is the bet-delay blip (issue #27) —
+			// inconclusive, keep polling.
+		}
+		if terminal || !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(poll)
+	}
+
+	if !terminal {
+		// Window expired with the order possibly still on the book: cancel so
+		// nothing can fill unarmed later, then confirm the final state — a
+		// cancel that raced a fill reports the matched shares here. A cancel
+		// AND final read that both fail leave the stake reserved and the user
+		// warned instead of a false "cancelled" note (review F2).
+		killErr := kill(ctx, user, res.orderID)
+		if killErr != nil {
+			log.Printf("Snipe fill-confirm: cancel chat=%d order=%s: %v", chatID, res.orderID, killErr)
+		}
+		for i := 0; i < 3 && !terminal; i++ {
+			m, p, o, found, err := check(ctx, user, res.orderID)
+			if err != nil {
+				log.Printf("Snipe fill-confirm: post-cancel read chat=%d order=%s: %v", chatID, res.orderID, err)
+				time.Sleep(poll)
+				continue
+			}
+			if found {
+				matched = m
+				if p > 0 {
+					price = p
+				}
+				if !o {
+					terminal = true
+				}
+			} else if killErr == nil || time.Since(start) > goneGrace {
+				terminal = true // reaped (or cancelled and reaped)
+			}
+			break
+		}
+	}
+
+	fillPrice := price
+	if fillPrice <= 0 {
+		fillPrice = res.ask
+	}
+	switch {
+	case matched > 0:
+		res.filledSize = matched
+		if price > 0 {
+			res.filledPrice = price
+		}
+		if terminal {
+			if refund := stake - matched*fillPrice; refund > 0.01 && release != nil {
+				log.Printf("Snipe fill-confirm: partial fill chat=%d order=%s matched=%.2f — releasing $%.2f", chatID, res.orderID, matched, refund)
+				release(refund)
+			}
+		} else {
+			log.Printf("Snipe fill-confirm: arming %.2f matched shares with UNCONFIRMED remainder chat=%d order=%s — stake kept reserved", matched, chatID, res.orderID)
+		}
+		b.snipeAutoArmTPOnly(chatID, tokenID, question, outcome, res, stake)
+	case terminal:
+		log.Printf("Snipe fill-confirm: unfilled chat=%d order=%s — cancelled, $%.2f released", chatID, res.orderID, stake)
+		if release != nil {
+			release(stake)
+		}
+		b.sendMessage(chatID, snipeUnfilledText(question, outcome, stake, release != nil))
+	default:
+		log.Printf("Snipe fill-confirm: UNRESOLVED order state chat=%d order=%s — no arm, no refund, stake kept reserved", chatID, res.orderID)
+		warn := "⚠️ Couldn't settle your snipe order's state (status/cancel checks failing) — check the order and position manually and arm by hand if it filled."
+		if release != nil {
+			warn += " The stake stays counted against today's cap."
+		}
+		b.sendMessage(chatID, warn)
+	}
+}
+
+// snipeOrderFillLive is the production fill probe: an L2-authed CLOB order
+// read with the user's derived credentials.
+func (b *Bot) snipeOrderFillLive(ctx context.Context, user *database.User, orderID string) (float64, float64, bool, bool, error) {
+	creds, addr, err := b.snipeOrderCreds(ctx, user)
+	if err != nil {
+		return 0, 0, false, false, err
+	}
+	return b.tradingClient.OrderFill(ctx, addr, creds, orderID)
+}
+
+// snipeOrderKillLive is the production cancel for an unfilled snipe order.
+func (b *Bot) snipeOrderKillLive(ctx context.Context, user *database.User, orderID string) error {
+	creds, addr, err := b.snipeOrderCreds(ctx, user)
+	if err != nil {
+		return err
+	}
+	return b.tradingClient.CancelOrder(ctx, addr, creds, orderID)
+}
+
+// snipeOrderCreds derives the user's CLOB API credentials for the fill
+// probe / cancel, mirroring the manual cancel-all flow.
+func (b *Bot) snipeOrderCreds(ctx context.Context, user *database.User) (*polymarket.APICredentials, common.Address, error) {
+	if b.walletManager == nil || b.tradingClient == nil || user == nil {
+		return nil, common.Address{}, fmt.Errorf("order probe unavailable: trading wiring missing")
+	}
+	uw, err := b.walletManager.DecryptPrivateKey(user.EncryptedKey)
+	if err != nil {
+		return nil, common.Address{}, fmt.Errorf("decrypt wallet: %w", err)
+	}
+	creds, err := b.tradingClient.GetOrCreateAPICredentials(ctx, uw.PrivateKey)
+	if err != nil {
+		return nil, common.Address{}, fmt.Errorf("api credentials: %w", err)
+	}
+	return creds, common.HexToAddress(user.EOAAddress), nil
 }
 
 // snipeAutoArmTPOnly arms TP + ceiling only (no trailing SL) on a freshly
@@ -1337,9 +1553,11 @@ func (b *Bot) snipeAutoBuyExec(ctx context.Context, chatID int64, user *database
 	if b.snipeBought != nil {
 		b.snipeBought.mark(chatID, market.TokenID, amount)
 	}
-	// Auto-arm TP + ceiling (no trailing SL) from the fill — async, never blocks
-	// alert delivery.
-	go b.snipeAutoArmTPOnly(chatID, market.TokenID, market.Question, market.Outcome, res, amount)
+	// Confirm the fill, then arm TP + ceiling (no trailing SL) — async, never
+	// blocks alert delivery. An unfilled order is cancelled and the stake
+	// released back to the main cap (issue #92).
+	go b.snipeConfirmFillThenArm(chatID, user, market.TokenID, market.Question, market.Outcome, res, amount,
+		func(a float64) { b.snipeSpend.release(chatID, a) })
 	log.Printf("Snipe auto-buy: accepted chat=%d token=%.12s… $%.0f order=%s cap-left=$%.2f",
 		chatID, market.TokenID, amount, res.orderID, capLeft)
 	return res, capLeft, snipeAutoBought
@@ -1529,15 +1747,16 @@ func (b *Bot) handleSnipeCallback(ctx context.Context, update *tgbotapi.Update) 
 		if b.snipeBoxedLatch != nil {
 			b.snipeBoxedLatch.clear(chatID, entry.tokenID)
 		}
-		// Auto-arm TP + ceiling (no trailing SL) from the fill — async.
-		go b.snipeAutoArmTPOnly(chatID, entry.tokenID, entry.question, entry.outcome, res, amount)
+		// Confirm the fill, then arm TP + ceiling (no trailing SL) — async. The
+		// tap draws no auto-cap, so there is no ledger to release (issue #92).
+		go b.snipeConfirmFillThenArm(chatID, user, entry.tokenID, entry.question, entry.outcome, res, amount, nil)
 		keyboard := tgbotapi.NewInlineKeyboardMarkup(
 			tgbotapi.NewInlineKeyboardRow(
 				tgbotapi.NewInlineKeyboardButtonData("🎯 Arm SL/TP", "sltp_list"),
 			),
 		)
 		b.editMessageWithKeyboard(chatID, messageID,
-			snipeFilledText(entry.question, entry.outcome, amount, res.orderID), keyboard)
+			snipeFilledText(entry.question, entry.outcome, amount, res.orderID)+snipeFillNote(res), keyboard)
 	}
 }
 
