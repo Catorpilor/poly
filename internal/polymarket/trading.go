@@ -1386,6 +1386,21 @@ func (tc *TradingClient) GetOpenOrders(ctx context.Context, address common.Addre
 	return allOrders, nil
 }
 
+// OrderFill probes a placed order's fill state (issue #92): matched shares,
+// the order's limit price, whether it is still open on the book, and whether
+// the CLOB still knows it (killed-and-reaped orders vanish — found=false).
+// Callers use it to confirm a GTC snipe buy actually filled before arming.
+func (tc *TradingClient) OrderFill(ctx context.Context, address common.Address, creds *APICredentials, orderID string) (matched, price float64, open, found bool, err error) {
+	order, found, err := tc.getOrder(ctx, address, creds, orderID)
+	if err != nil || !found {
+		return 0, 0, false, found, err
+	}
+	matched, _ = strconv.ParseFloat(order.SizeMatched, 64)
+	price, _ = strconv.ParseFloat(order.Price, 64)
+	open = classifyFOKStatus(order.Status) == fokPending
+	return matched, price, open, true, nil
+}
+
 // CancelOrder cancels a single order by ID using L2 authentication
 func (tc *TradingClient) CancelOrder(ctx context.Context, address common.Address, creds *APICredentials, orderID string) error {
 	url := fmt.Sprintf("%s/order/%s", tc.clobURL, orderID)

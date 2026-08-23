@@ -68,6 +68,16 @@ type Bot struct {
 	// snipePositions is a test seam for the held-registration position fetch;
 	// nil selects production (a fresh UnifiedPositionScanner).
 	snipePositions snipePositionSource
+	// snipeOrderFill / snipeOrderKill are test seams for the fill-confirmation
+	// probe and cancel (issue #92); nil selects production (an L2-authed CLOB
+	// order read / cancel with the user's derived credentials).
+	snipeOrderFill func(ctx context.Context, user *database.User, orderID string) (matched, price float64, open, found bool, err error)
+	snipeOrderKill func(ctx context.Context, user *database.User, orderID string) error
+	// snipeFillPoll / snipeFillWindow / snipeFillGoneGrace override the
+	// fill-confirmation cadence; zero selects the production defaults.
+	snipeFillPoll      time.Duration
+	snipeFillWindow    time.Duration
+	snipeFillGoneGrace time.Duration
 }
 
 // snipePositionSource is the slice of the position scanner the held-registration

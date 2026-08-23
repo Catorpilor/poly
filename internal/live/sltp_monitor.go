@@ -974,6 +974,15 @@ func (m *SLTPMonitor) retryTPShortfall(kind string, arm *database.SLTPArm, inten
 		return result, false
 	}
 	if shortfallGone(result.AvailableSharesRaw, bid) {
+		// NO settle grace on the TP paths (issue #92 review F4): the destructive
+		// step (ClearTP / ceiling Disarm / AdvanceLadder) already committed
+		// before the sell, so "skip and retry later" is impossible — a skip
+		// here would strand the arm silently unprotected. Disarm-and-notify
+		// stays; the distinct log line keeps settling-aged cases countable.
+		if m.armSettling(arm) {
+			log.Printf("SLTPMonitor: %s shortfall within fill-settle window user=%d token=%s (age %s) — disarming anyway (TP path cannot retry, #92)",
+				kind, arm.TelegramID, arm.TokenID, m.now().Sub(arm.CreatedAt).Round(time.Second))
+		}
 		m.disarmGonePosition(arm)
 		return result, true
 	}
@@ -984,6 +993,19 @@ func (m *SLTPMonitor) retryTPShortfall(kind string, arm *database.SLTPArm, inten
 	log.Printf("SLTPMonitor: %s clamped retry user=%d token=%s sharesRaw=%d (was %d)",
 		kind, arm.TelegramID, arm.TokenID, sharesRaw, intendedRaw)
 	return m.executor.ExecuteSell(m.ctx, arm, sharesRaw, 0, polymarket.OrderTypeGTC), false
+}
+
+// fillSettleGrace (issue #92): a zero-balance sell rejection within this
+// window of arm creation is treated as a buy still settling on the CLOB, not
+// a position closed outside the bot — the fire is skipped and retried instead
+// of disarming (the VISION-series false-disarm class).
+const fillSettleGrace = 2 * time.Minute
+
+// armSettling reports whether arm is young enough that a zero-balance
+// rejection should get the fill-settle grace. Zero CreatedAt (legacy rows)
+// never qualifies — the grace must not block a real disarm forever.
+func (m *SLTPMonitor) armSettling(arm *database.SLTPArm) bool {
+	return !arm.CreatedAt.IsZero() && m.now().Sub(arm.CreatedAt) < fillSettleGrace
 }
 
 // disarmGonePosition removes an arm whose position no longer exists on-chain
@@ -1167,6 +1189,11 @@ func (m *SLTPMonitor) setSLEscalated(armID int) {
 // thin-book notice.
 func (m *SLTPMonitor) handleSLShortfall(arm *database.SLTPArm, availableRaw int64, floor float64) {
 	if shortfallGone(availableRaw, floor) {
+		if m.armSettling(arm) {
+			log.Printf("SLTPMonitor: SL shortfall on settling arm user=%d token=%s (age %s) — fill-settle grace, retrying later",
+				arm.TelegramID, arm.TokenID, m.now().Sub(arm.CreatedAt).Round(time.Second))
+			return
+		}
 		m.markSLSold(arm.ID)
 		m.notifier.NotifySLTPStaleSize(arm.TelegramID, arm, 0)
 		if err := m.store.Disarm(m.ctx, arm.TelegramID, arm.TokenID); err != nil && !errors.Is(err, repositories.ErrSLTPArmNotFound) {

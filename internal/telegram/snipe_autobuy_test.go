@@ -362,8 +362,21 @@ func newSnipeAutoBuyHarness(t *testing.T, cfg snipeHarnessConfig) *snipeAutoBuyH
 		snipeWatcher:    watch,
 		snipeMarkets:    polymarket.NewMarketClientWithURL(gamma.URL),
 	}
+	// The default fixture reports an executor-confirmed fill at the guard ask
+	// (size = amount/ask matches the stake-derivation the arm tests assert), so
+	// arm-behavior tests exercise the immediate post-fill ceremony. Tests that
+	// target the #92 confirm path pass an explicit buyResult, which is served
+	// verbatim.
+	defaultFixture := cfg.buyResult == nil
 	b.snipeBuyExec = func(_ context.Context, user *database.User, _ *polymarket.GammaMarket, idx int, amount float64) *polymarket.TradeResult {
-		return buys.record(user, idx, amount)
+		r := buys.record(user, idx, amount)
+		if defaultFixture && r != nil && r.Success && r.FilledSize == 0 && cfg.ask > 0 {
+			c := *r
+			c.FilledSize = amount / cfg.ask
+			c.AveragePrice = cfg.ask
+			return &c
+		}
+		return r
 	}
 	return &snipeAutoBuyHarness{bot: b, tg: tg, watch: watch, buys: buys}
 }
