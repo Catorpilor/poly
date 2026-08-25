@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -78,6 +79,10 @@ type Bot struct {
 	snipeFillPoll      time.Duration
 	snipeFillWindow    time.Duration
 	snipeFillGoneGrace time.Duration
+	// snipeSeriesWalked rate-limits the issue #94 series walk per (chat, event);
+	// see snipeSeriesWalkDue. Lazily initialized under snipeSeriesWalkMu.
+	snipeSeriesWalkMu sync.Mutex
+	snipeSeriesWalked map[string]time.Time
 }
 
 // snipePositionSource is the slice of the position scanner the held-registration

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -217,6 +218,48 @@ func (mc *MarketClient) GetTrendingMarkets(ctx context.Context, limit int) ([]*G
 }
 
 // GetMarketBySlug fetches a specific market by its slug
+// GetEventMarkets fetches the markets of the event with the given slug via
+// Gamma's /events?slug= (the embedded markets carry question, clobTokenIds,
+// outcomes, gameStartTime, active, closed). Embedded markets lack the parent
+// events field, so the requested slug is stamped onto each — callers group
+// series-mates by it (issue #94).
+func (mc *MarketClient) GetEventMarkets(ctx context.Context, eventSlug string) ([]*GammaMarket, error) {
+	reqURL := fmt.Sprintf("%s/events?slug=%s", mc.gammaAPIURL, url.QueryEscape(eventSlug))
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := mc.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch event: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Gamma API returned status %d", resp.StatusCode)
+	}
+
+	var events []struct {
+		Slug    string         `json:"slug"`
+		Markets []*GammaMarket `json:"markets"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&events); err != nil {
+		return nil, fmt.Errorf("failed to decode event: %w", err)
+	}
+	if len(events) == 0 {
+		return nil, fmt.Errorf("event not found: %s", eventSlug)
+	}
+	markets := events[0].Markets
+	for _, m := range markets {
+		// Stamp unconditionally: callers group series-mates by the slug they
+		// asked for; an embedded aggregate event must not fragment the group.
+		m.Events = []*GammaEvent{{Slug: eventSlug}}
+	}
+	return markets, nil
+}
+
 func (mc *MarketClient) GetMarketBySlug(ctx context.Context, slug string) (*GammaMarket, error) {
 	url := fmt.Sprintf("%s/markets/slug/%s", mc.gammaAPIURL, slug)
 

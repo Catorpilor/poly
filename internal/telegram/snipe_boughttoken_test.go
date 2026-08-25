@@ -29,6 +29,7 @@ func (c *capturingHeldWatch) UnwatchArmed(string)         {}
 func (c *capturingHeldWatch) RenewHeldMarket(int64, string, time.Duration) bool {
 	return false
 }
+func (x *capturingHeldWatch) EventSlugOf(string) string { return "" }
 func (c *capturingHeldWatch) WatchHeld(chatID int64, m live.SnipeMarket, ttl time.Duration) {
 	c.mu.Lock()
 	c.calls = append(c.calls, heldWatchCall{chatID: chatID, market: m, ttl: ttl})

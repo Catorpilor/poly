@@ -582,8 +582,21 @@ func (m *LiveTradeManager) RegisterHeldBuy(telegramID int64, eventSlug, tokenID 
 		log.Printf("LiveTradeManager: RegisterHeldBuy unknown token=%.12s… event=%s", tokenID, eventSlug)
 		return
 	}
+	// Series watch (issue #94): the bought market's tokens register as before,
+	// and so do the event's other WINNER-class markets (series moneyline +
+	// game/map winners, active and unresolved) — a series' next game must not
+	// crash to recipients=0 while the holder's exposure carries over. Props
+	// stay out. openWinner indexes the qualifying market IDs.
+	openWinner := make(map[string]bool, len(eventInfo.Markets))
+	for i := range eventInfo.Markets {
+		mkt := &eventInfo.Markets[i]
+		if mkt.Active && !mkt.Closed && SeriesWatchMarket(mkt.Question) {
+			openWinner[mkt.ID] = true
+		}
+	}
 	for _, sm := range sms {
-		if sm.MarketID == marketID {
+		if sm.MarketID == marketID || openWinner[sm.MarketID] {
+			sm.EventSlug = eventSlug
 			m.snipeWatcher.WatchHeld(telegramID, sm, SnipeHeldTTL)
 		}
 	}

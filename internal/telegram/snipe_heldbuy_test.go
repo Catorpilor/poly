@@ -23,6 +23,7 @@ type recordingHeldWatch struct {
 	renewed     []string
 	held        []string
 	renewResult bool
+	eventSlug   string // served by EventSlugOf (series-walk tests, issue #94)
 }
 
 func (r *recordingHeldWatch) WatchArmed(live.SnipeMarket) {}
@@ -39,6 +40,11 @@ func (r *recordingHeldWatch) RenewHeldMarket(_ int64, tokenID string, _ time.Dur
 	result := r.renewResult
 	r.mu.Unlock()
 	return result
+}
+func (x *recordingHeldWatch) EventSlugOf(string) string {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.eventSlug
 }
 func (r *recordingHeldWatch) SiblingTokenIDs(_, _ string) []string { return nil }
 

@@ -40,6 +40,24 @@ var subMarketKeywords = []string{
 }
 
 // isSubMarketQuestion checks if a market question contains sub-market keywords
+// SeriesWatchMarket reports whether an event market belongs in the snipe
+// watcher's series-continuation set (issue #94): the main moneyline plus the
+// per-game/map WINNER markets — never the prop sub-markets. Game winners are
+// sub-markets to the feed renderer (subMarketKeywords lists "game "/"map "),
+// but for crash recipiency they are first-class: both recipients=0 misses
+// (VISION G3, FUT Map 4) were game-winner markets of an event the holder was
+// already exposed to. Pure — table-tested.
+func SeriesWatchMarket(question string) bool {
+	if !isSubMarketQuestion(question) {
+		return true // the event's moneyline
+	}
+	q := strings.ToLower(question)
+	if !strings.Contains(q, "winner") {
+		return false
+	}
+	return strings.Contains(q, "game ") || strings.Contains(q, "map ")
+}
+
 func isSubMarketQuestion(question string) bool {
 	questionLower := strings.ToLower(question)
 	for _, keyword := range subMarketKeywords {
