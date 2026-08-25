@@ -31,6 +31,10 @@ type fakeStore struct {
 	// disarmFailN makes the next N Disarm calls fail with a generic error
 	// (simulates a transient DB outage; not ErrSLTPArmNotFound).
 	disarmFailN int
+	// issue #92 residual restore counters
+	rearmTPCalls       int
+	restoreLadderCalls int
+	reinsertCalls      int
 }
 
 type ladderAdvance struct {
@@ -107,6 +111,49 @@ func (s *fakeStore) Disarm(_ context.Context, telegramID int64, tokenID string) 
 		}
 	}
 	return repositories.ErrSLTPArmNotFound
+}
+
+func (s *fakeStore) RearmTP(_ context.Context, telegramID int64, tokenID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.byToken[tokenID] {
+		if a.TelegramID == telegramID {
+			a.TPArmed = true
+			s.rearmTPCalls++
+			return nil
+		}
+	}
+	return repositories.ErrSLTPArmNotFound
+}
+
+func (s *fakeStore) RestoreLadderRungs(_ context.Context, telegramID int64, tokenID string, expectedFired, rungsFired int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.byToken[tokenID] {
+		if a.TelegramID == telegramID && a.LadderRungsFired == expectedFired {
+			a.LadderRungsFired = rungsFired
+			if rungsFired == 0 {
+				a.LadderBaseShares = 0
+			}
+			s.restoreLadderCalls++
+			return nil
+		}
+	}
+	return repositories.ErrSLTPArmNotFound
+}
+
+func (s *fakeStore) Reinsert(_ context.Context, arm *database.SLTPArm) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.byToken[arm.TokenID] {
+		if a.TelegramID == arm.TelegramID {
+			return nil // ON CONFLICT DO NOTHING — the existing row wins
+		}
+	}
+	cp := *arm
+	s.byToken[arm.TokenID] = append(s.byToken[arm.TokenID], &cp)
+	s.reinsertCalls++
+	return nil
 }
 
 func (s *fakeStore) UpdateHWM(_ context.Context, telegramID int64, tokenID string, hwm float64) error {

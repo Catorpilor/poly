@@ -32,6 +32,24 @@ type SLTPArmRepository interface {
 	// so SL can continue watching the remaining shares.
 	ClearTP(ctx context.Context, telegramID int64, tokenID string) error
 
+	// RearmTP restores tp_armed = TRUE on an existing row — ClearTP's undo for
+	// a TP fire whose sell definitively sold nothing (issue #92 residual: a
+	// phantom print must not consume the flag without an exit).
+	// ErrSLTPArmNotFound when the row is gone (user disarmed meanwhile).
+	RearmTP(ctx context.Context, telegramID int64, tokenID string) error
+
+	// RestoreLadderRungs is AdvanceLadder's undo for a rung sell that sold
+	// nothing: CAS the fired count back from expectedFired to rungsFired
+	// (SQL WHERE ladder_rungs_fired = expectedFired); a restore to zero also
+	// unfreezes ladder_base_shares. ErrSLTPArmNotFound when the row is gone or
+	// the count moved (a concurrent eval owns the state) — the caller yields.
+	RestoreLadderRungs(ctx context.Context, telegramID int64, tokenID string, expectedFired, rungsFired int) error
+
+	// Reinsert restores a ceiling-deleted arm row verbatim (all fields,
+	// including high_water_mark, ladder state, and created_at). ON CONFLICT DO
+	// NOTHING — a concurrent re-arm wins and nil is returned either way.
+	Reinsert(ctx context.Context, arm *database.SLTPArm) error
+
 	// GetByUserAndToken returns the arm row or nil if not found.
 	GetByUserAndToken(ctx context.Context, telegramID int64, tokenID string) (*database.SLTPArm, error)
 
@@ -203,6 +221,61 @@ func (r *sltpArmRepo) ArmTPOnly(ctx context.Context, arm *database.SLTPArm) (*da
 		return nil, fmt.Errorf("failed to arm sltp (tp-only): %w", err)
 	}
 	return result, nil
+}
+
+func (r *sltpArmRepo) RearmTP(ctx context.Context, telegramID int64, tokenID string) error {
+	query := `UPDATE sltp_arms SET tp_armed = TRUE, updated_at = NOW()
+		WHERE telegram_id = $1 AND token_id = $2`
+	tag, err := r.db.Pool.Exec(ctx, query, telegramID, tokenID)
+	if err != nil {
+		return fmt.Errorf("failed to rearm tp: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrSLTPArmNotFound
+	}
+	return nil
+}
+
+func (r *sltpArmRepo) RestoreLadderRungs(ctx context.Context, telegramID int64, tokenID string, expectedFired, rungsFired int) error {
+	query := `UPDATE sltp_arms SET
+			ladder_rungs_fired = $3,
+			ladder_base_shares = CASE WHEN $3 = 0 THEN 0 ELSE ladder_base_shares END,
+			updated_at = NOW()
+		WHERE telegram_id = $1 AND token_id = $2 AND ladder_rungs_fired = $4`
+	tag, err := r.db.Pool.Exec(ctx, query, telegramID, tokenID, rungsFired, expectedFired)
+	if err != nil {
+		return fmt.Errorf("failed to restore ladder rungs: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrSLTPArmNotFound
+	}
+	return nil
+}
+
+func (r *sltpArmRepo) Reinsert(ctx context.Context, arm *database.SLTPArm) error {
+	tickSize := arm.TickSize
+	if tickSize <= 0 {
+		tickSize = 0.01
+	}
+	// The row's original serial id is reinserted explicitly (safe: it was
+	// sequence-allocated and deleted, the sequence never re-issues it) so the
+	// monitor's id-keyed state — depth-confirm slots, SL state — keeps
+	// addressing the same arm across the restore.
+	query := `INSERT INTO sltp_arms (
+			id, telegram_id, token_id, condition_id, market_id, outcome,
+			avg_price, shares_at_arm, high_water_mark, tick_size, tp_armed, sl_armed,
+			neg_risk, lottery_ticket_armed, ladder_rungs_fired, ladder_base_shares, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+		ON CONFLICT (telegram_id, token_id) DO NOTHING`
+	_, err := r.db.Pool.Exec(ctx, query,
+		arm.ID, arm.TelegramID, arm.TokenID, arm.ConditionID, arm.MarketID, arm.Outcome,
+		arm.AvgPrice, arm.SharesAtArm, arm.HighWaterMark, tickSize, arm.TPArmed, arm.SLArmed,
+		arm.NegRisk, arm.LotteryTicketArmed, arm.LadderRungsFired, arm.LadderBaseShares, arm.CreatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to reinsert arm: %w", err)
+	}
+	return nil
 }
 
 func (r *sltpArmRepo) Disarm(ctx context.Context, telegramID int64, tokenID string) error {
