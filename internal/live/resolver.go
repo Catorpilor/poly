@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -57,6 +59,24 @@ func SeriesWatchMarket(question string) bool {
 	}
 	return strings.Contains(q, "game ") || strings.Contains(q, "map ")
 }
+
+// GameNumber extracts the game/map ordinal from a winner-market question
+// ("… - Game 3 Winner", "… - Map 4 Winner") — 0 when the question is not a
+// game-winner (series moneylines, props). Pure — table-tested. The future-game
+// gate (issue #97) uses it to order an event's games.
+func GameNumber(question string) int {
+	m := gameWinnerRe.FindStringSubmatch(question)
+	if m == nil {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+var gameWinnerRe = regexp.MustCompile(`(?i)(?:game|map)\s+(\d+)\s+winner`)
 
 func isSubMarketQuestion(question string) bool {
 	questionLower := strings.ToLower(question)
