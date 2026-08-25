@@ -604,6 +604,8 @@ func snipeSkipNote(res snipeBuyResult) string {
 		reason = "you already hold this token — not topping up a held position"
 	case snipeBuyBoxedWait:
 		reason = "you hold the other side — laddering the flip deep ($5 at ≤ $0.10 + $5 at ≤ $0.05)"
+	case snipeBuyFutureGame:
+		reason = "this game hasn't started (an earlier game of the series is still live) — the crash is series-sweep repricing, not an in-play collapse"
 	case snipeBuyManualArmed:
 		// Issue #86: an active manual stop already governs this token. The auto-buy
 		// would be stop-sold moments later or ride unprotected; the manual tap stays
@@ -968,7 +970,7 @@ func (b *Bot) snipeDeepAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyR
 		question: market.Question,
 		outcome:  market.Outcome,
 	}
-	res := b.snipeGuardedBuyRefuse(ctx, user, entry, snipeDeepBuyUSD, snipeRefuseDeepBuy, false)
+	res := b.snipeGuardedBuyRefuse(ctx, user, entry, snipeDeepBuyUSD, snipeRefuseDeepBuy, false, true)
 	if res.outcome != snipeBuyFilled {
 		b.snipeDeepSpend.release(chatID, snipeDeepBuyUSD)
 		log.Printf("Snipe deep-buy: skipped chat=%d token=%.12s… reason=%d err=%v msg=%s",
@@ -1546,8 +1548,8 @@ func (b *Bot) snipeAutoBuyExec(ctx context.Context, chatID int64, user *database
 		question: market.Question,
 		outcome:  market.Outcome,
 	}
-	// corpseGuard=true adds Gate 2 to the shared guarded buy.
-	res := b.snipeGuardedBuyRefuse(ctx, user, entry, amount, snipeRefuseBuy, true)
+	// corpseGuard=true adds Gate 2; futureGate=true adds the issue #97 gate.
+	res := b.snipeGuardedBuyRefuse(ctx, user, entry, amount, snipeRefuseBuy, true, true)
 	if res.outcome != snipeBuyFilled {
 		b.snipeSpend.release(chatID, amount)
 		log.Printf("Snipe auto-buy: skipped chat=%d token=%.12s… reason=%d err=%v msg=%s",
@@ -1586,6 +1588,7 @@ const (
 	snipeBuyDeepHeld                     // deep holdings gate: recipient already holds the crashed token
 	snipeBuyBoxedWait                    // boxed tier: recipient holds the other side — postpone until ask ≤ $0.10
 	snipeBuyManualArmed                  // manual-arm gate (issue #86): recipient has an ACTIVE sl_armed stop on the crashed token
+	snipeBuyFutureGame                   // future-game gate (issue #97): an earlier game of the event is still live — this game hasn't started
 )
 
 // snipeBuyResult carries what each caller needs to message the user.
@@ -1627,7 +1630,8 @@ func snipeRefuseDeepBuy(ask float64, ok bool) bool {
 // token-index verify, buy, MarkBought on success. Claiming the registry entry
 // and cap accounting stay with the callers.
 func (b *Bot) snipeGuardedBuy(ctx context.Context, user *database.User, entry snipeAlertEntry, amount float64) snipeBuyResult {
-	return b.snipeGuardedBuyRefuse(ctx, user, entry, amount, snipeRefuseBuy, false)
+	// Manual taps: no corpse gate, no future-game gate — judgment buys.
+	return b.snipeGuardedBuyRefuse(ctx, user, entry, amount, snipeRefuseBuy, false, false)
 }
 
 // snipeGuardedBuyRefuse is snipeGuardedBuy with a caller-chosen repricing guard
@@ -1635,7 +1639,7 @@ func (b *Bot) snipeGuardedBuy(ctx context.Context, user *database.User, entry sn
 // corpse-spread gate (Gate 2, in-band $10 only). When corpseGuard is set, the
 // same fresh-book read that feeds the repricing guard also reads the best bid
 // and skips the buy on corpse geometry.
-func (b *Bot) snipeGuardedBuyRefuse(ctx context.Context, user *database.User, entry snipeAlertEntry, amount float64, refuse func(ask float64, ok bool) bool, corpseGuard bool) snipeBuyResult {
+func (b *Bot) snipeGuardedBuyRefuse(ctx context.Context, user *database.User, entry snipeAlertEntry, amount float64, refuse func(ask float64, ok bool) bool, corpseGuard, futureGate bool) snipeBuyResult {
 	var ask, bid float64
 	var ok, bidOK bool
 	if b.snipeFeed != nil {
@@ -1671,6 +1675,17 @@ func (b *Bot) snipeGuardedBuyRefuse(ctx context.Context, user *database.User, en
 	if idx < 0 {
 		return snipeBuyResult{outcome: snipeBuyMismatch}
 	}
+	// Future-game gate (issue #97, auto tiers only): per-game markets carry the
+	// SERIES gameStartTime, so a not-yet-played game passes the in-play gate the
+	// moment the series starts. When an EARLIER game of the same event is
+	// demonstrably still live, this crash is series-sweep repricing, not an
+	// in-play collapse — the band's economics don't cover "game happens AND
+	// team wins it". Positive evidence only: fail-open on any doubt (a genuine
+	// live-game crash — the r105 winner class — must never be false-gated).
+	if futureGate && b.snipeFutureGame(ctx, mc, market) {
+		log.Printf("Snipe auto-buy: future-game-gated token=%.12s… q=%q", entry.tokenID, market.Question)
+		return snipeBuyResult{outcome: snipeBuyFutureGame, ask: ask, askOK: ok}
+	}
 
 	exec := b.snipeBuyExec
 	if exec == nil {
@@ -1689,6 +1704,65 @@ func (b *Bot) snipeGuardedBuyRefuse(ctx context.Context, user *database.User, en
 		outcome: snipeBuyFilled, ask: ask, orderID: result.OrderID,
 		market: market, idx: idx, filledSize: result.FilledSize, filledPrice: result.AveragePrice,
 	}
+}
+
+// snipeFutureGame reports whether market's game has demonstrably NOT started:
+// it is a game/map-winner with ordinal N ≥ 2 and an earlier game-winner of the
+// same event is still LIVE — open and with both outcome prices strictly inside
+// the decided bands. Everything else — series moneylines, game 1, decided or
+// closed earlier games (the between-games gap), fetch/parse trouble — is
+// fail-open: only positive evidence withholds a buy (issue #97).
+func (b *Bot) snipeFutureGame(ctx context.Context, mc *polymarket.MarketClient, market *polymarket.GammaMarket) bool {
+	n := live.GameNumber(market.Question)
+	if n <= 1 {
+		return false
+	}
+	slug := ""
+	if len(market.Events) > 0 {
+		slug = market.Events[0].Slug
+	}
+	if slug == "" {
+		return false
+	}
+	// Own tight timeout: a HUNG (not erroring) Gamma must not hold the buy
+	// path for the caller's full 60s ctx — cap it and fail open.
+	gateCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	mates, err := mc.GetEventMarkets(gateCtx, slug)
+	if err != nil {
+		log.Printf("Snipe future-game gate: event fetch %s: %v — failing open", slug, err)
+		return false
+	}
+	for _, mate := range mates {
+		if mate == nil || mate.Closed {
+			continue
+		}
+		m := live.GameNumber(mate.Question)
+		if m >= 1 && m < n && snipeGameLive(mate.GetOutcomePrices()) {
+			return true
+		}
+	}
+	return false
+}
+
+// snipeGameLive reports whether outcome prices describe a game still being
+// played: every parsed price strictly inside (0.03, 0.97). Decided games print
+// ~0/1 (redeem pending) even before Gamma flips closed. Unparseable or missing
+// prices are NOT live (fail-open for the gate). Pure — table-tested.
+func snipeGameLive(prices []string) bool {
+	if len(prices) == 0 {
+		return false
+	}
+	for _, p := range prices {
+		v, err := strconv.ParseFloat(p, 64)
+		if err != nil {
+			return false
+		}
+		if v <= 0.03 || v >= 0.97 {
+			return false
+		}
+	}
+	return true
 }
 
 // handleSnipeCallback executes the one-tap snipe buy.
