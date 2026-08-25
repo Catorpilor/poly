@@ -38,6 +38,13 @@ type SLTPArmStore interface {
 	// row copies can never double-sell an overlapping slice. ErrSLTPArmNotFound ⇒
 	// another eval already advanced the row (or it is gone) ⇒ the caller aborts.
 	AdvanceLadder(ctx context.Context, telegramID int64, tokenID string, expectedFired, rungsFired int, baseShares float64) error
+
+	// RearmTP / RestoreLadderRungs / Reinsert undo a committed fire whose sell
+	// definitively sold nothing (issue #92 residual: a phantom print into an
+	// empty book must not consume protection state). See SLTPArmRepository.
+	RearmTP(ctx context.Context, telegramID int64, tokenID string) error
+	RestoreLadderRungs(ctx context.Context, telegramID int64, tokenID string, expectedFired, rungsFired int) error
+	Reinsert(ctx context.Context, arm *database.SLTPArm) error
 }
 
 // HoldingReader reports a recipient's CURRENT share balance for an arm's token,
@@ -297,6 +304,10 @@ type SLTPMonitor struct {
 	// the cooldown on every tick and defeat it. Entries are pruned on terminal
 	// disarm/sweep.
 	depthConfirm map[int]*depthConfirmState
+	// sellFailures tracks sold-nothing sell failures by (chat, token) — see
+	// sellFailKey (issue #92 residual): backoff + once-per-streak
+	// notification. Guarded by mu.
+	sellFailures map[string]*sellFailState
 }
 
 // depthConfirmState is one arm's depth-confirm slot: an in-flight flag
@@ -334,6 +345,7 @@ func NewSLTPMonitor(
 		sweepInterval:      sltpSweepInterval,
 		pauseNotified:      make(map[int64]bool),
 		slState:            make(map[int]*slArmState),
+		sellFailures:       make(map[string]*sellFailState),
 		depthConfirm:       make(map[int]*depthConfirmState),
 	}
 }
@@ -566,6 +578,7 @@ func (m *SLTPMonitor) sweepClosedArms() {
 		}
 		m.clearSLState(arm.ID)
 		m.clearDepthConfirm(arm.ID)
+		m.clearSellFailure(arm)
 		m.unsubscribeIfLast(arm.TokenID)
 		if _, seen := sweptOutcomes[arm.TelegramID]; !seen {
 			notifyOrder = append(notifyOrder, arm.TelegramID)
@@ -757,6 +770,78 @@ func (m *SLTPMonitor) confirmFire(arm *database.SLTPArm, kind string, fireBid, t
 	return false
 }
 
+// failedSellBackoff suppresses re-fires after a sell that sold nothing (the
+// restored state would otherwise re-fire every tick against the same empty
+// book, spamming sells and DMs). Long enough to let a flash resolve, short
+// enough that a genuine recovery retries within two ticks.
+const failedSellBackoff = 90 * time.Second
+
+// sellFailState tracks a streak of definitive no-fill sell failures, keyed by
+// (telegramID, tokenID) — NOT arm.ID, which changes when the ceiling path
+// reinserts a restored row (review: an id-keyed backoff would be structurally
+// dead there). failedAt arms the backoff; streak gates the user DM to the
+// first failure (later identical failures log only). Cleared on any
+// successful sell and on removal paths; a stale streak (failedAt older than
+// sellFailStreakStale) resets so a fresh failure notifies again.
+type sellFailState struct {
+	failedAt time.Time
+	streak   int
+}
+
+// sellFailStreakStale bounds how long a quiet streak keeps suppressing DMs.
+const sellFailStreakStale = 10 * failedSellBackoff
+
+func sellFailKey(telegramID int64, tokenID string) string {
+	return fmt.Sprintf("%d:%s", telegramID, tokenID)
+}
+
+// sellSoldNothing reports a definitive no-fill sell failure — never a
+// balance shortfall, which retryTPShortfall owns (issue #24/#92).
+func sellSoldNothing(result *polymarket.TradeResult) bool {
+	return result == nil || (!result.Success && !result.InsufficientBalance)
+}
+
+// noteSellFailure stamps the failed-sell backoff for the arm's (chat, token)
+// and reports whether this is the streak's first failure (notify once per
+// streak). A stale streak resets first, so a failure long after the last one
+// notifies again.
+func (m *SLTPMonitor) noteSellFailure(arm *database.SLTPArm) bool {
+	key := sellFailKey(arm.TelegramID, arm.TokenID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st := m.sellFailures[key]
+	if st == nil {
+		st = &sellFailState{}
+		m.sellFailures[key] = st
+	}
+	if !st.failedAt.IsZero() && m.now().Sub(st.failedAt) > sellFailStreakStale {
+		st.streak = 0
+	}
+	st.failedAt = m.now()
+	st.streak++
+	return st.streak == 1
+}
+
+// inSellFailureBackoff reports whether the arm's (chat, token) is inside the
+// failed-sell backoff. Checked by the TP-family fire paths ONLY — the
+// trailing stop must never be delayed by a TP fire's failure (review F2).
+func (m *SLTPMonitor) inSellFailureBackoff(arm *database.SLTPArm) bool {
+	key := sellFailKey(arm.TelegramID, arm.TokenID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st := m.sellFailures[key]
+	return st != nil && m.now().Sub(st.failedAt) < failedSellBackoff
+}
+
+// clearSellFailure resets the (chat, token) failure streak (successful sell,
+// disarm, or sweep).
+func (m *SLTPMonitor) clearSellFailure(arm *database.SLTPArm) {
+	key := sellFailKey(arm.TelegramID, arm.TokenID)
+	m.mu.Lock()
+	delete(m.sellFailures, key)
+	m.mu.Unlock()
+}
+
 // claimDepthConfirm atomically acquires the single per-arm depth-confirm slot,
 // so the caller may proceed to the (expensive) holdings read and fresh book
 // fetch. It returns false — bail BEFORE any I/O — when a recent refusal's
@@ -809,6 +894,11 @@ func (m *SLTPMonitor) clearDepthConfirm(armID int) {
 // fireTP clears the tp_armed flag (double-fire guard), sells TPSellFraction of
 // the snapshot shares, and notifies the user. SL stays armed on the remainder.
 func (m *SLTPMonitor) fireTP(arm *database.SLTPArm, bid float64) {
+	// Failed-sell backoff (issue #92 residual): TP-family only — the trailing
+	// stop is never gated by this.
+	if m.inSellFailureBackoff(arm) {
+		return
+	}
 	// Depth-confirm slot claimed FIRST — cheap, in-memory — so a standing
 	// refusal's cooldown skips the holdings read below entirely (F2) and
 	// concurrent evals can't both reach the book fetch (F3).
@@ -853,6 +943,20 @@ func (m *SLTPMonitor) fireTP(arm *database.SLTPArm, bid float64) {
 	if handled {
 		return
 	}
+	if sellSoldNothing(result) {
+		// Nothing sold (issue #92 residual): restore tp_armed so the TP can
+		// retry once the book heals — the phantom print must not consume it.
+		if err := m.store.RearmTP(m.ctx, arm.TelegramID, arm.TokenID); err != nil && !errors.Is(err, repositories.ErrSLTPArmNotFound) {
+			log.Printf("SLTPMonitor: TP rearm after failed sell for %d/%s: %v", arm.TelegramID, arm.TokenID, err)
+		}
+		first := m.noteSellFailure(arm)
+		log.Printf("SLTPMonitor: TP sell sold nothing user=%d token=%s — tp re-armed, backoff %s", arm.TelegramID, arm.TokenID, failedSellBackoff)
+		if first {
+			m.notifier.NotifySLTPFired(arm.TelegramID, "TP", arm, bid, result)
+		}
+		return
+	}
+	m.clearSellFailure(arm)
 	m.notifier.NotifySLTPFired(arm.TelegramID, "TP", arm, bid, result)
 }
 
@@ -884,6 +988,13 @@ func (m *SLTPMonitor) fireLadder(arm *database.SLTPArm, bid float64) bool {
 	candidate := arm.DeepEntryRungsCrossed(bid)
 	if candidate <= fired {
 		return false // the bid reached no new rung — let the SL evaluate
+	}
+
+	// Failed-sell backoff (issue #92 residual): TP-family only. Deliberately
+	// does NOT consume the tick — a manual deep arm's trailing stop must
+	// evaluate normally while the ladder cools down (review F2).
+	if m.inSellFailureBackoff(arm) {
+		return false
 	}
 
 	// Depth-confirm slot claimed FIRST (cheap, in-memory) so a standing refusal's
@@ -958,6 +1069,25 @@ func (m *SLTPMonitor) fireLadder(arm *database.SLTPArm, bid float64) bool {
 	if handled {
 		return true
 	}
+	if sellSoldNothing(result) {
+		// Nothing sold (issue #92 residual — ledger r106: all four rungs
+		// consumed on a phantom 0.27 print into an empty book): CAS the rungs
+		// back so the mid-range harvest can retry once the book heals.
+		if err := m.store.RestoreLadderRungs(m.ctx, arm.TelegramID, arm.TokenID, target, fired); err != nil && !errors.Is(err, repositories.ErrSLTPArmNotFound) {
+			log.Printf("SLTPMonitor: ladder restore after failed sell for %d/%s: %v", arm.TelegramID, arm.TokenID, err)
+		}
+		arm.LadderRungsFired = fired
+		if fired == 0 {
+			arm.LadderBaseShares = 0
+		}
+		first := m.noteSellFailure(arm)
+		log.Printf("SLTPMonitor: TP-ladder sell sold nothing user=%d token=%s — rungs %d→%d restored, backoff %s", arm.TelegramID, arm.TokenID, target, fired, failedSellBackoff)
+		if first {
+			m.notifier.NotifySLTPFired(arm.TelegramID, "TP-ladder", arm, bid, result)
+		}
+		return true
+	}
+	m.clearSellFailure(arm)
 	m.notifier.NotifySLTPFired(arm.TelegramID, "TP-ladder", arm, bid, result)
 	return true
 }
@@ -1014,6 +1144,7 @@ func (m *SLTPMonitor) armSettling(arm *database.SLTPArm) bool {
 func (m *SLTPMonitor) disarmGonePosition(arm *database.SLTPArm) {
 	m.clearSLState(arm.ID)
 	m.clearDepthConfirm(arm.ID)
+	m.clearSellFailure(arm)
 	if err := m.store.Disarm(m.ctx, arm.TelegramID, arm.TokenID); err != nil && !errors.Is(err, repositories.ErrSLTPArmNotFound) {
 		log.Printf("SLTPMonitor: disarm gone position for %d/%s: %v", arm.TelegramID, arm.TokenID, err)
 	}
@@ -1158,6 +1289,7 @@ func (m *SLTPMonitor) completeSLExit(arm *database.SLTPArm, kind string, bid, fl
 	} else {
 		m.clearSLState(arm.ID)
 		m.clearDepthConfirm(arm.ID)
+		m.clearSellFailure(arm)
 		m.unsubscribeIfLast(arm.TokenID)
 	}
 	m.notifier.NotifySLTPFired(arm.TelegramID, kind, arm, bid, result)
@@ -1310,6 +1442,10 @@ func (m *SLTPMonitor) unsubscribeIfLast(tokenID string) {
 // difference is intent: SL is a downside exit, ceiling-TP is an upside exit
 // when there's no meaningful upside left to chase.
 func (m *SLTPMonitor) fireCeilingTP(arm *database.SLTPArm, bid float64) {
+	// Failed-sell backoff (issue #92 residual): TP-family only.
+	if m.inSellFailureBackoff(arm) {
+		return
+	}
 	// Depth-confirm slot claimed FIRST (see fireTP): a standing refusal skips
 	// the holdings read (F2); concurrent evals can't double-fetch (F3).
 	if !m.claimDepthConfirm(arm.ID, m.now()) {
@@ -1356,6 +1492,23 @@ func (m *SLTPMonitor) fireCeilingTP(arm *database.SLTPArm, bid float64) {
 	if handled {
 		return
 	}
+	if sellSoldNothing(result) {
+		// Nothing sold (issue #92 residual): the row was already deleted —
+		// reinsert it verbatim so the ceiling can retry once the book heals.
+		// ON CONFLICT DO NOTHING yields to a concurrent manual re-arm. The
+		// feed subscription is deliberately KEPT (no unsubscribeIfLast) — the
+		// arm lives again.
+		if err := m.store.Reinsert(m.ctx, arm); err != nil {
+			log.Printf("SLTPMonitor: ceiling reinsert after failed sell for %d/%s: %v", arm.TelegramID, arm.TokenID, err)
+		}
+		first := m.noteSellFailure(arm)
+		log.Printf("SLTPMonitor: TP-ceiling sell sold nothing user=%d token=%s — arm reinserted, backoff %s", arm.TelegramID, arm.TokenID, failedSellBackoff)
+		if first {
+			m.notifier.NotifySLTPFired(arm.TelegramID, "TP-ceiling", arm, bid, result)
+		}
+		return
+	}
+	m.clearSellFailure(arm)
 	m.notifier.NotifySLTPFired(arm.TelegramID, "TP-ceiling", arm, bid, result)
 
 	// Lottery ticket: cheap insurance on the losing side. Only attempt when
