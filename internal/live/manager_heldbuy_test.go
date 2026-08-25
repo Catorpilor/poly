@@ -78,16 +78,18 @@ func TestRegisterHeldBuy(t *testing.T) {
 				t.Errorf("%s holder expiry = %v, want now+SnipeHeldTTL %v", tok, exp, wantExp)
 			}
 		}
-		// Both sides subscribed to the feed (they are not otherwise on it).
+		// All four tokens subscribed to the feed (they are not otherwise on
+		// it): the bought market's both sides plus the open Game 3 Winner's —
+		// the series watch (issue #94) registers the event's winner-class
+		// markets alongside the bought one.
 		feed.mu.Lock()
 		subs := append([]string(nil), feed.subscribes...)
 		feed.mu.Unlock()
-		if len(subs) != 2 {
-			t.Fatalf("feed subscribes = %v, want both ml-blg and ml-hle", subs)
+		if len(subs) != 4 {
+			t.Fatalf("feed subscribes = %v, want ml-blg/ml-hle plus g3-blg/g3-hle (series watch)", subs)
 		}
-		// The other market's tokens stay untouched.
-		if st := heldStateOf(t, w, "g3-blg"); st != nil {
-			t.Errorf("g3-blg registered from a buy in the ml market: %+v", st)
+		if st := heldStateOf(t, w, "g3-blg"); st == nil {
+			t.Errorf("g3-blg not registered — the event's open winner markets join the series watch (issue #94)")
 		}
 	})
 

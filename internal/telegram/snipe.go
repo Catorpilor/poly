@@ -33,6 +33,9 @@ type snipeWatch interface {
 	WatchArmed(m live.SnipeMarket)
 	UnwatchArmed(tokenID string)
 	WatchHeld(chatID int64, m live.SnipeMarket, ttl time.Duration)
+	// EventSlugOf returns a watched token's event slug ("" when unwatched or
+	// unknown) — the renewal path's key into the series walk (issue #94).
+	EventSlugOf(tokenID string) string
 	// RenewHeldMarket extends the holder TTL for the token AND its watched
 	// siblings (issue #78), so a position refresh keeps both sides of a held
 	// market alive. False ⇒ unwatched, caller must WatchHeld with metadata.
@@ -1366,6 +1369,11 @@ func (b *Bot) snipeAutoArmTPOnly(chatID int64, tokenID, question, outcome string
 	}
 	if b.snipeWatcher != nil {
 		b.snipeWatcher.WatchArmed(snipeMarketFromGamma(res.market, tokenID, outcome))
+		// Series walk (issue #94): the snipe auto-buy flow was the recipients=0
+		// incident path — the buyer must become a held watcher of the event's
+		// other winner markets, surviving this arm's eventual sweep. Already in
+		// the async arm goroutine, so the Gamma fetch blocks no handler.
+		b.snipeWatchEventMates(chatID, res.market, live.SnipeHeldTTL)
 	}
 	b.sendMessage(chatID, snipeAutoArmedText(question, outcome, saved))
 }
@@ -1772,12 +1780,22 @@ func snipeMarketFromGamma(market *polymarket.GammaMarket, tokenID, fallbackOutco
 			break
 		}
 	}
+	// EventSlug takes only a GENUINE parent-event slug — GetEventSlug's
+	// market-slug fallback would launder single-market positions into hourly
+	// bogus event fetches via the renewal trigger (round-2 review F2).
+	// Grouping loses nothing: a slugless token falls back to same-market
+	// renewal, which is all a single-market position has.
+	eventSlug := ""
+	if len(market.Events) > 0 {
+		eventSlug = market.Events[0].Slug
+	}
 	return live.SnipeMarket{
 		TokenID:   tokenID,
 		MarketID:  market.ID,
 		Question:  market.Question,
 		Outcome:   outcome,
 		GameStart: market.GetGameStartTime(),
+		EventSlug: eventSlug,
 	}
 }
 
@@ -1845,6 +1863,102 @@ func (b *Bot) snipeWatchHeldMarket(chatID int64, market *polymarket.GammaMarket,
 		}
 		b.snipeWatcher.WatchHeld(chatID, snipeMarketFromGamma(market, tokenID, outcome), ttl)
 	}
+	b.snipeWatchEventMates(chatID, market, ttl)
+}
+
+// snipeEventMateMaxTokens bounds the series-watch fan-out per registration —
+// generous for a BO5 (series + 5 games = 12 tokens) while capping a pathological
+// event. Drops are logged, never silent.
+const snipeEventMateMaxTokens = 16
+
+// snipeWatchEventMates walks the held market's parent event. The slug comes
+// from the market's Events list directly — GetEventSlug's market-slug fallback
+// would trigger a bogus event fetch.
+func (b *Bot) snipeWatchEventMates(chatID int64, market *polymarket.GammaMarket, ttl time.Duration) {
+	slug := ""
+	if len(market.Events) > 0 {
+		slug = market.Events[0].Slug
+	}
+	if slug == "" {
+		return // no parent event known: single-market position, nothing to walk
+	}
+	b.snipeWalkEventSlug(chatID, slug, market.ID, ttl)
+}
+
+// snipeSeriesWalkInterval bounds how often one event is re-walked per bot
+// process: the walk is idempotent but each run costs a Gamma fetch, and the
+// renewal paths call in on every /positions view.
+const snipeSeriesWalkInterval = time.Hour
+
+// snipeSeriesWalkDue reports whether eventSlug's walk interval has elapsed and
+// stamps the attempt. Per-(chat,event): two holders of the same event each get
+// their own registration.
+func (b *Bot) snipeSeriesWalkDue(chatID int64, eventSlug string) bool {
+	key := fmt.Sprintf("%d:%s", chatID, eventSlug)
+	b.snipeSeriesWalkMu.Lock()
+	defer b.snipeSeriesWalkMu.Unlock()
+	if b.snipeSeriesWalked == nil {
+		b.snipeSeriesWalked = make(map[string]time.Time)
+	}
+	if last, ok := b.snipeSeriesWalked[key]; ok && time.Since(last) < snipeSeriesWalkInterval {
+		return false
+	}
+	b.snipeSeriesWalked[key] = time.Now()
+	return true
+}
+
+// snipeWalkEventSlug registers the WINNER-class markets of eventSlug (series
+// moneyline + game/map winners, active and unresolved) as held watches for
+// chatID (issue #94): a series' next game must not crash to recipients=0 while
+// the holder's exposure carries over. Props never register; excludeMarketID
+// (the already-registered held market) is skipped. Rate-limited per
+// (chat, event) by snipeSeriesWalkInterval; fail-open on fetch errors — the
+// held market itself stays watched regardless.
+func (b *Bot) snipeWalkEventSlug(chatID int64, eventSlug, excludeMarketID string, ttl time.Duration) {
+	if b.snipeWatcher == nil || eventSlug == "" || !b.snipeSeriesWalkDue(chatID, eventSlug) {
+		return
+	}
+	mc := b.snipeMarkets
+	if mc == nil {
+		mc = polymarket.NewMarketClient()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	mates, err := mc.GetEventMarkets(ctx, eventSlug)
+	if err != nil {
+		// Un-stamp so the next trigger retries: a stamped failure would leave
+		// the recipients=0 window open for the whole walk interval (round-2
+		// review F1). Retry pressure stays bounded — triggers are buy events
+		// and user-driven position views.
+		b.snipeSeriesWalkMu.Lock()
+		delete(b.snipeSeriesWalked, fmt.Sprintf("%d:%s", chatID, eventSlug))
+		b.snipeSeriesWalkMu.Unlock()
+		log.Printf("Snipe series watch: event fetch %s: %v — held market stays watched alone, walk retryable", eventSlug, err)
+		return
+	}
+	count := 0
+	for _, mate := range mates {
+		if mate == nil || mate.ID == "" || mate.ID == excludeMarketID ||
+			!mate.Active || mate.Closed || !live.SeriesWatchMarket(mate.Question) {
+			continue
+		}
+		outcomes := mate.GetOutcomes()
+		for i, tokenID := range mate.GetClobTokenIds() {
+			if tokenID == "" {
+				continue
+			}
+			if count >= snipeEventMateMaxTokens {
+				log.Printf("Snipe series watch: event %s exceeds %d tokens — remaining winner markets dropped", eventSlug, snipeEventMateMaxTokens)
+				return
+			}
+			outcome := ""
+			if i < len(outcomes) {
+				outcome = outcomes[i]
+			}
+			b.snipeWatcher.WatchHeld(chatID, snipeMarketFromGamma(mate, tokenID, outcome), ttl)
+			count++
+		}
+	}
 }
 
 // registerSnipeHeld registers fetched positions as held-token watches with a
@@ -1869,6 +1983,13 @@ func (b *Bot) registerSnipeHeld(chatID int64, positions []*polymarket.Position) 
 			continue
 		}
 		if b.snipeWatcher.RenewHeldMarket(chatID, pos.TokenID, live.SnipeHeldTTL) {
+			// Renewed without a metadata fetch — but the series walk must still
+			// run for events whose mates were never registered (armed-only or
+			// pre-#94 states) or have lapsed. Deduped per (chat, event) by
+			// snipeSeriesWalkInterval, so steady-state refreshes stay free.
+			if slug := b.snipeWatcher.EventSlugOf(pos.TokenID); slug != "" {
+				b.snipeWalkEventSlug(chatID, slug, "", live.SnipeHeldTTL)
+			}
 			continue
 		}
 		if pos.MarketID == "" {
@@ -1933,7 +2054,21 @@ func (b *Bot) snipeRegisterBoughtToken(chatID int64, market *polymarket.GammaMar
 	if idx < 0 || idx >= len(tokenIDs) || tokenIDs[idx] == "" {
 		return
 	}
-	b.snipeWatchHeldMarket(chatID, market, live.SnipeHeldTTL)
+	// Own-market registration stays inline (in-memory, cheap); the series walk
+	// does a Gamma fetch and must not block the buy handler (issue #94 review
+	// F3) — it runs detached.
+	outcomes := market.GetOutcomes()
+	for i, tokenID := range tokenIDs {
+		if tokenID == "" {
+			continue
+		}
+		outcome := ""
+		if i < len(outcomes) {
+			outcome = outcomes[i]
+		}
+		b.snipeWatcher.WatchHeld(chatID, snipeMarketFromGamma(market, tokenID, outcome), live.SnipeHeldTTL)
+	}
+	go b.snipeWatchEventMates(chatID, market, live.SnipeHeldTTL)
 }
 
 // snipeRegisterHeldForUser fetches the user's positions and registers them as

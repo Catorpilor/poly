@@ -232,7 +232,8 @@ type fakeSnipeWatch struct {
 	mu       sync.Mutex
 	bought   []string
 	armed    []live.SnipeMarket
-	siblings []string // returned by SiblingTokenIDs (boxed case-3 tests)
+	held     []live.SnipeMarket // WatchHeld registrations (series-watch tests)
+	siblings []string           // returned by SiblingTokenIDs (boxed case-3 tests)
 }
 
 func (f *fakeSnipeWatch) WatchArmed(m live.SnipeMarket) {
@@ -240,9 +241,23 @@ func (f *fakeSnipeWatch) WatchArmed(m live.SnipeMarket) {
 	f.armed = append(f.armed, m)
 	f.mu.Unlock()
 }
-func (f *fakeSnipeWatch) UnwatchArmed(string)                               {}
-func (f *fakeSnipeWatch) WatchHeld(int64, live.SnipeMarket, time.Duration)  {}
+func (f *fakeSnipeWatch) UnwatchArmed(string) {}
+func (f *fakeSnipeWatch) WatchHeld(_ int64, m live.SnipeMarket, _ time.Duration) {
+	f.mu.Lock()
+	f.held = append(f.held, m)
+	f.mu.Unlock()
+}
+func (f *fakeSnipeWatch) heldTokens() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.held))
+	for _, m := range f.held {
+		out = append(out, m.TokenID)
+	}
+	return out
+}
 func (f *fakeSnipeWatch) RenewHeldMarket(int64, string, time.Duration) bool { return true }
+func (f *fakeSnipeWatch) EventSlugOf(string) string                         { return "" }
 
 func (f *fakeSnipeWatch) MarkBought(tokenID string) {
 	f.mu.Lock()

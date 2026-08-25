@@ -112,6 +112,11 @@ type SnipeMarket struct {
 	// (gameStartTime). Zero means unknown — such tokens are never considered
 	// in-play and never alert (fewer alerts, never wrong ones).
 	GameStart time.Time
+	// EventSlug groups the market's tokens with their event-mates (issue #94):
+	// a held-watch renewal extends every watched token of the same event, so a
+	// series' later games stay watched as long as any of its positions renew.
+	// Empty (legacy callers) falls back to same-market grouping only.
+	EventSlug string
 }
 
 // SnipeNotifier delivers snipe alerts to one recipient. NotifySnipeDeepCrash
@@ -408,11 +413,12 @@ func (w *SnipeWatcher) WatchHeld(chatID int64, m SnipeMarket, ttl time.Duration)
 }
 
 // RenewHeldMarket extends chatID's holder TTL for tokenID AND every currently
-// watched token sharing its market (the sibling watch, issue #78). A position
-// refresh usually sees only the held side; without renewing the flip side too,
-// the sibling's TTL lapses and only one side stays watched — regressing the
-// sibling registration. Returns false when tokenID is not watched (the caller
-// must WatchHeld with full metadata, which co-registers the siblings).
+// watched token sharing its market (the sibling watch, issue #78) or its event
+// (the series watch, issue #94). A position refresh usually sees only the held
+// side; without renewing the group, the flip side's and the series' later
+// games' TTLs lapse out from under the registration. Returns false when
+// tokenID is not watched (the caller must WatchHeld with full metadata, which
+// co-registers the group).
 func (w *SnipeWatcher) RenewHeldMarket(chatID int64, tokenID string, ttl time.Duration) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -422,11 +428,15 @@ func (w *SnipeWatcher) RenewHeldMarket(chatID int64, tokenID string, ttl time.Du
 	}
 	exp := w.now().Add(ttl)
 	st.holders[chatID] = exp
-	if marketID := st.market.MarketID; marketID != "" {
-		for id, other := range w.tokens {
-			if id != tokenID && other.market.MarketID == marketID {
-				other.holders[chatID] = exp
-			}
+	marketID, eventSlug := st.market.MarketID, st.market.EventSlug
+	for id, other := range w.tokens {
+		if id == tokenID {
+			continue
+		}
+		sameMarket := marketID != "" && other.market.MarketID == marketID
+		sameEvent := eventSlug != "" && other.market.EventSlug == eventSlug
+		if sameMarket || sameEvent {
+			other.holders[chatID] = exp
 		}
 	}
 	return true
@@ -507,7 +517,22 @@ func (w *SnipeWatcher) ensureStateLocked(m SnipeMarket) *snipeTokenState {
 	if st.market.GameStart.IsZero() {
 		st.market.GameStart = m.GameStart
 	}
+	if st.market.EventSlug == "" {
+		st.market.EventSlug = m.EventSlug
+	}
 	return st
+}
+
+// EventSlugOf returns the watched token's event slug ("" when unwatched or
+// unknown). The renewal paths use it to decide whether a series walk is due
+// for a token they renewed without fetching metadata (issue #94).
+func (w *SnipeWatcher) EventSlugOf(tokenID string) string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if st := w.tokens[tokenID]; st != nil {
+		return st.market.EventSlug
+	}
+	return ""
 }
 
 // seedFromHistory fetches the token's recent trade high and applies it as the
