@@ -299,3 +299,123 @@ re-arming a log monitor, verify the follower process attached (ps for
 the `logs -f` pipeline) — the 08-14 syntax-fumble lesson repeated today
 before being caught by exactly that check (build the grep pattern in a
 shell variable; never inline a quote-heavy pattern into a one-liner).
+
+## 2026-08-26 — Verify the fix by replaying the incident through it
+Two of this session's four fixes were disqualified in review round 1
+because the patched code never ran on the path that caused the incident:
+the #94 series walk lived only in the held-registration helper while the
+actual recipients=0 incident flowed through snipe auto-buy → WatchArmed
+(which never called it), and a renewal short-circuit defeated the
+/positions rescue on top; the #92 fill-confirm's first draft re-created
+the original orphan on every in-play order via the bet-delay 404 — a
+failure mode the repo's own #27 lesson already documented for the FOK
+path. Rules: (1) the highest-value verification question is "trace the
+ORIGINAL incident, event by event, through the new code" — green tests
+prove the new paths work, not that the incident's path reaches them;
+(2) when a fix touches a flow with siblings (buy paths, registration
+paths), enumerate every entry point and say explicitly which are covered
+and which are not; (3) before designing around an external system's
+async behavior, grep lessons.md and the adjacent subsystem for the same
+failure signature — the bet-delay grace existed 30 lines from where it
+was needed.
+
+## 2026-08-26 — The bot's own messages are not tape
+Two message-truth defects in one day: the SL-fire DM reported "filled at
+$0.63" while the data-api tape showed the actual fill at 0.71 (the DM
+renders the floor, not the execution — a ledger row settled off it was
+wrong by $4), and "auto-sniped $5" went out for a GTC order that never
+filled (it rested, then filled 24 minutes later unarmed). Extends the
+08-05 settle-by-evidence rule: the bot's own notifications are claims,
+not evidence — settle P&L, sizes, and prices ONLY from data-api activity
+and prices-history, and treat any DM copy that asserts an execution fact
+as a defect unless the code verifiably has that fact at send time
+(otherwise disclose: "fill not confirmed yet"). When a message and the
+tape disagree, the tape wins and the message becomes a bug to file.
+
+## 2026-08-26 — Commit-then-I/O needs an undo, keyed by identity that survives
+The fire paths committed their destructive step before selling (ClearTP /
+AdvanceLadder / Disarm — deliberate double-fire guards), so a sell that
+sold NOTHING (phantom print into an empty book, r106) permanently
+consumed protection: flag dead, rungs spent, row deleted. Rules: (1) any
+"commit state, then do I/O" sequence must answer "what if the I/O does
+nothing?" — the answer is a CAS-guarded undo + retry backoff + notify,
+with the undo yielding in the no-double-execution direction on every
+race; (2) key the operational state (backoffs, streaks) by natural
+identity (chat, token), never by a serial row id — the ceiling restore
+REINSERTS the row and an id-keyed backoff dies with the old id, turning
+the guard into a per-tick spam loop; (3) when a test fake models a DB
+write, its IDENTITY semantics must match the SQL (the fake's
+id-preserving copy made the suite structurally blind to the churn) —
+fake/SQL parity means serial allocation and conflict behavior, not just
+the happy-path data.
+
+## 2026-08-26 — Escape sequences don't survive tooling heredocs
+A Go regex written through a python heredoc shipped with literal
+backspace bytes: python silently turned `\b` into \x08 inside the
+'''string''' (only `\s` warned), the pattern compiled fine and matched
+nothing, and the future-game gate was a silent no-op until the red test
+caught it. Rules: (1) never route escape-bearing source lines (regexes,
+format strings) through an interpreter's string literals — use the Edit
+tool or bytes-mode patches for those lines; (2) when a pattern "compiles
+but never matches", hexdump the source line (od -c) before debugging the
+pattern's logic; (3) a table test on the pure function is the detector
+that makes this a 2-minute fix instead of a shipped no-op — classifiers
+get table tests, always.
+
+## 2026-08-26 — A filter encodes its consumer's purpose; audit before reuse
+GetAllMLMarkets deliberately classifies game/map-winner markets as
+sub-markets — correct for its consumer (the feed renderer, which must
+not show a BO3 as a fake 3-way market), and exactly wrong for #94's
+recipiency walk, whose entire point was those game-winner markets. Blind
+reuse would have shipped a filter excluding precisely the targets, with
+every test green. Rules: (1) before reusing a classifier/filter, read
+its exclusion list against YOUR purpose, not its name — "moneyline" meant
+"what the renderer treats as primary", not "what a watcher should watch";
+(2) when purposes diverge, write a new named predicate beside the old one
+with a comment stating both purposes and why they differ (SeriesWatchMarket
+vs isSubMarketQuestion); (3) the same applies in reverse: changing a
+shared filter for your consumer silently re-scopes every other caller —
+grep them first.
+
+## 2026-08-26 — Stub the exact route form, and curl it for the exact field first
+
+**Mechanism:** v0.22.2's series walk shipped verified (TDD green, two adversarial
+rounds) and was structurally dead in production for three days: the walk reads
+`market.Events[0].Slug`, the test stub served `/markets/{id}` WITH an `events`
+field, but real Gamma omits `events[]` on the path form — only the list form
+`/markets?id=` carries it. Every Telegram path uses `GetMarketByID` (path form),
+so all three walk triggers silently no-opped (issue #99, ledger r107/r108: two
+holders in one BO3 each alerted only on the game they personally bought).
+**Incident:** the production-facts check for that fix verified `/events?slug=`
+carried `outcomePrices` — the field the NEW code read — but never verified the
+EXISTING fetch the fix piggybacked on carried what the new code needed from it.
+**Rules:** (1) Before stubbing an external endpoint, curl the production
+response for the exact route form the code hits and diff the fields the change
+depends on — sibling route forms of the same API are not interchangeable
+(`/markets/{id}` vs `/markets?id=` vs `?condition_ids=` each drop different
+fields; gameStartTime already taught this once). (2) A silent early-return on
+missing data (`if slug == "" { return }`) turns a wrong assumption into an
+unobservable dead feature — when a guard encodes "this field is expected
+present", log the bail at least once so production tape can falsify the
+assumption. (3) Adversarial verify rounds inherit the fixture's worldview;
+only a production read breaks the loop.
+
+## 2026-08-28: Settled a ledger row from a search-result video title (self-caught)
+
+**Mechanism:** Scoring the Ferencvárosi–Trabzonspor spread alert, I settled
+"final 3–2, +1.5 covered, untapped +$48.8 winner" from a UEFA highlights
+video TITLE in web-search results. The video was the same fixture from the
+2023-24 UECL group stage — the actual 2026-08-27 match ended 2-0 (margin 2,
+opposite resolution). Caught one event later only because Gamma's 0.835/0.165
+lean contradicted the story; the ESPN box score for the dated gameId settled it.
+**Aggravator:** the CLOB tape had already falsified my version — 0.03 asks
+sitting unfilled for minutes is impossible on a side heading to $1 — and I
+explained it away ("thin market apathy") instead of treating it as evidence.
+**Rules:** (1) Settle outcomes only from a source pinned to the exact date/
+match-id (ESPN gameId, UEFA match page, resolved market) — never from titles
+or summaries in search listings; recurring fixtures make title collisions
+likely. (2) When the order book contradicts the narrative (free money not
+taken), the book wins — stop and re-verify before writing the outcome.
+(3) Same class as ledger r21 (user-corrected mis-settlement by inference);
+this one was self-caught but only after publishing a wrong row — verify
+BEFORE the first write, not after.
