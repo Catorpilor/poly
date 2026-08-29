@@ -247,7 +247,7 @@ func TestSnipeWatcher_TriggerBoundaries(t *testing.T) {
 		{
 			name: "instant recover-and-recrash yields one alert — reset needs a sustained hold (#50)",
 			steps: [][2]float64{
-				{0.45, 0.50}, {0.10, 0.17}, {0.12, 0.34}, {0.08, 0.16},
+				{0.45, 0.50}, {0.10, 0.17}, {0.32, 0.34}, {0.08, 0.16},
 			},
 			want: 1,
 		},
@@ -380,11 +380,24 @@ func TestSnipeWatcher_ShadowUnderdogDip(t *testing.T) {
 			steps: []step{
 				{bid: 0.36, ask: 0.40},
 				{bid: 0.10, ask: 0.12}, // shadow #1
-				{bid: 0.12, ask: 0.34},
-				{bid: 0.12, ask: 0.34, advance: snipeResetConfirm + time.Second},
+				{bid: 0.32, ask: 0.34}, // corroborated recovery (bid >= snipeResetBid, #100)
+				{bid: 0.32, ask: 0.34, advance: snipeResetConfirm + time.Second},
 				{bid: 0.08, ask: 0.11}, // shadow #2
 			},
 			wantShadows: 2, wantAlerts: 0,
+		},
+		{
+			// Issue #100 for the shadow tier: pulled asks over a frozen bid must
+			// not un-latch a shadow episode any more than a real one.
+			name: "#100: pulled asks over a frozen bid never re-arm the shadow",
+			steps: []step{
+				{bid: 0.36, ask: 0.40},
+				{bid: 0.10, ask: 0.12},                                           // shadow #1
+				{bid: 0.12, ask: 0.34, advance: snipeResetConfirm + time.Second}, // MMs pull asks
+				{bid: 0.12, ask: 0.34, advance: snipeResetConfirm + time.Second}, // bid frozen
+				{bid: 0.08, ask: 0.11},                                           // re-dip: still latched
+			},
+			wantShadows: 1, wantAlerts: 0,
 		},
 	}
 	for _, tt := range tests {
@@ -441,37 +454,126 @@ func TestSnipeWatcher_ResetRequiresSustainedRecovery(t *testing.T) {
 			want: 1,
 		},
 		{
+			// Genuine recovery: bids corroborate above snipeResetBid (#100).
 			name: "Kudermetova replay: sustained recovery re-arms, re-crash fires twice",
 			steps: []step{
 				{bid: 0.45, ask: 0.50},
 				{bid: 0.10, ask: 0.17}, // alert #1
-				{bid: 0.12, ask: 0.34},
-				{bid: 0.12, ask: 0.34, advance: snipeResetConfirm + time.Second}, // held above reset
+				{bid: 0.32, ask: 0.34},
+				{bid: 0.32, ask: 0.34, advance: snipeResetConfirm + time.Second}, // held above reset
 				{bid: 0.08, ask: 0.16}, // alert #2
 			},
 			want: 2,
 		},
 		{
+			// Corroborating bids throughout; the ONLY thing breaking the streak is
+			// the ask dipping below the reset level.
 			name: "dip below reset restarts the confirm window",
 			steps: []step{
 				{bid: 0.45, ask: 0.50},
 				{bid: 0.10, ask: 0.17}, // alert #1
-				{bid: 0.12, ask: 0.34},
-				{bid: 0.12, ask: 0.25, advance: 6 * time.Second}, // streak broken
-				{bid: 0.12, ask: 0.34, advance: 6 * time.Second}, // streak restarts here
+				{bid: 0.32, ask: 0.34},
+				{bid: 0.32, ask: 0.25, advance: 6 * time.Second}, // streak broken (ask below reset)
+				{bid: 0.32, ask: 0.34, advance: 6 * time.Second}, // streak restarts here
 				{bid: 0.08, ask: 0.16, advance: 6 * time.Second}, // 6s < confirm: no reset
 			},
 			want: 1,
 		},
 		{
+			// Corroborating bids throughout; the missing ask alone interrupts.
 			name: "missing ask interrupts the confirm window",
 			steps: []step{
 				{bid: 0.45, ask: 0.50},
 				{bid: 0.10, ask: 0.17}, // alert #1
-				{bid: 0.12, ask: 0.34},
-				{bid: 0.12, ask: 0, advance: 6 * time.Second},    // no data: streak broken
-				{bid: 0.12, ask: 0.34, advance: 6 * time.Second}, // restart
+				{bid: 0.32, ask: 0.34},
+				{bid: 0.32, ask: 0, advance: 6 * time.Second},    // no data: streak broken
+				{bid: 0.32, ask: 0.34, advance: 6 * time.Second}, // restart
 				{bid: 0.08, ask: 0.16, advance: 6 * time.Second}, // 6s < confirm: no reset
+			},
+			want: 1,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			w, _, rec, notif, clock := snipeHarness()
+			rec.eventSubs["evt"] = []int64{101}
+			w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+			for _, s := range tt.steps {
+				clock.advance(s.advance)
+				w.evaluate("T1", s.bid, s.ask)
+			}
+			if got := notif.count(); got != tt.want {
+				t.Errorf("alerts = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSnipeWatcher_BidCorroboratedReset covers issue #100: on 2026-08-27 the
+// Trabzonspor +1.5 token phantom-reset four times in 26 minutes because the
+// episode reset consulted only the ask. A dying book whose market makers pulled
+// their asks read ask > 0.30 sustained past the confirm window while the
+// trade-proxy bid stayed frozen at 0.120 — un-latching the episode and re-firing
+// the full alert cascade (two of the four re-alerts landed AFTER the match was
+// final). The reset now also requires a two-sided market above the crash band:
+// bid >= snipeResetBid(). A bid that could not itself re-fire the alert band is
+// not recovery evidence; a missing bid (feed no-data) fails corroboration and
+// holds the latch (fail-latched).
+func TestSnipeWatcher_BidCorroboratedReset(t *testing.T) {
+	t.Parallel()
+	type step struct {
+		bid, ask float64
+		advance  time.Duration // clock advance BEFORE this observation
+	}
+	tests := []struct {
+		name  string
+		steps []step
+		want  int
+	}{
+		{
+			name: "Trabzonspor phantom: pulled asks over a frozen 0.120 bid never un-latch",
+			steps: []step{
+				{bid: 0.55, ask: 0.50},                                           // session high
+				{bid: 0.12, ask: 0.18},                                           // alert #1
+				{bid: 0.12, ask: 0.34, advance: snipeResetConfirm + time.Second}, // MMs pull asks
+				{bid: 0.12, ask: 0.34, advance: snipeResetConfirm + time.Second}, // bid still frozen
+				{bid: 0.12, ask: 0.16, advance: time.Second},                     // re-crash: must NOT re-alert
+			},
+			want: 1,
+		},
+		{
+			name: "no bid data (feed no-data) holds the latch — fail-latched",
+			steps: []step{
+				{bid: 0.55, ask: 0.50},
+				{bid: 0.12, ask: 0.18},                                        // alert #1
+				{bid: 0, ask: 0.34, advance: snipeResetConfirm + time.Second}, // no bid
+				{bid: 0, ask: 0.34, advance: snipeResetConfirm + time.Second}, // still no bid
+				{bid: 0.10, ask: 0.16, advance: time.Second},                  // re-crash: must NOT re-alert
+			},
+			want: 1,
+		},
+		{
+			name: "boundary bid exactly 0.20 with a sustained above-band ask resets (>= semantics)",
+			steps: []step{
+				{bid: 0.55, ask: 0.50},
+				{bid: 0.12, ask: 0.18},                                           // alert #1
+				{bid: 0.20, ask: 0.34},                                           // both sides hold: streak starts
+				{bid: 0.20, ask: 0.34, advance: snipeResetConfirm + time.Second}, // held: episode resets
+				{bid: 0.08, ask: 0.16},                                           // re-crash: alert #2
+			},
+			want: 2,
+		},
+		{
+			name: "bid corroboration appears mid-window: a FULL confirm window with both sides is required",
+			steps: []step{
+				{bid: 0.55, ask: 0.50},
+				{bid: 0.10, ask: 0.18},                           // alert #1
+				{bid: 0.10, ask: 0.34, advance: 6 * time.Second}, // ask above band, bid fails: no clock
+				{bid: 0.10, ask: 0.34, advance: 6 * time.Second}, // 12s of pulled ask, still no clock
+				{bid: 0.32, ask: 0.34, advance: 2 * time.Second}, // bid corroborates NOW: clock starts here
+				{bid: 0.08, ask: 0.16, advance: 6 * time.Second}, // 6s < confirm since corroboration: no reset
 			},
 			want: 1,
 		},
@@ -590,9 +692,9 @@ func TestSnipeWatcher_DeepCrash(t *testing.T) {
 		w.evaluate("T1", 0.45, 0.50)
 		w.evaluate("T1", 0.10, 0.17) // alert #1 (no buy)
 		w.evaluate("T1", 0.01, 0.02) // deep #1
-		w.evaluate("T1", 0.12, 0.34)
+		w.evaluate("T1", 0.32, 0.34) // corroborated recovery (bid >= snipeResetBid, #100)
 		clock.advance(snipeResetConfirm + time.Second)
-		w.evaluate("T1", 0.12, 0.34) // sustained recovery: episode resets
+		w.evaluate("T1", 0.32, 0.34) // sustained recovery: episode resets
 		w.evaluate("T1", 0.08, 0.16) // alert #2
 		w.evaluate("T1", 0.01, 0.01) // deep #2
 		if notif.count() != 2 || notif.deepCount() != 2 {
@@ -804,9 +906,9 @@ func TestSnipeWatcher_Boxed(t *testing.T) {
 		if notif.boxedCount() != 2 {
 			t.Fatalf("episode 1 boxed=%d, want 2", notif.boxedCount())
 		}
-		w.evaluate("T1", 0.12, 0.34)
+		w.evaluate("T1", 0.32, 0.34) // corroborated recovery (bid >= snipeResetBid, #100)
 		clock.advance(snipeResetConfirm + time.Second)
-		w.evaluate("T1", 0.12, 0.34) // sustained recovery: episode resets
+		w.evaluate("T1", 0.32, 0.34) // sustained recovery: episode resets
 		w.evaluate("T1", 0.08, 0.16) // alert #2
 		w.evaluate("T1", 0.02, 0.04) // both tranches again
 		if notif.boxedCount() != 4 {
@@ -839,6 +941,36 @@ func TestSnipeWatcher_BoxedLogLine(t *testing.T) {
 	}
 }
 
+// TestSnipeWatcher_EpisodeResetLogLine pins the production log contract for the
+// bid-corroborated reset (#100): when the latch actually clears, the watcher
+// logs exactly one line with the "SnipeWatcher: episode reset" prefix (a monitor
+// greps it) carrying the token and the ask/bid that cleared it. Not parallel: it
+// redirects the global logger for the duration.
+func TestSnipeWatcher_EpisodeResetLogLine(t *testing.T) {
+	buf := &syncBuffer{}
+	log.SetOutput(buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	w, _, rec, _, clock := snipeHarness()
+	rec.eventSubs["evt"] = []int64{101}
+	w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+	w.evaluate("T1", 0.45, 0.50)
+	w.evaluate("T1", 0.10, 0.17) // in-band alert
+	w.evaluate("T1", 0.32, 0.34) // corroborated recovery: streak starts
+	clock.advance(snipeResetConfirm + time.Second)
+	w.evaluate("T1", 0.32, 0.34) // held past confirm: episode resets, logs once
+
+	out := buf.String()
+	for _, want := range []string{"SnipeWatcher: episode reset", "token=T1", "ask=0.340", "bid=0.320"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("episode-reset log missing %q in:\n%s", want, out)
+		}
+	}
+	if n := strings.Count(out, "SnipeWatcher: episode reset"); n != 1 {
+		t.Errorf("episode-reset log lines = %d, want exactly 1", n)
+	}
+}
+
 // TestSnipeWatcher_NoResetWhileDispatching: even a SUSTAINED above-reset
 // recovery observed while the alert is still being delivered must not
 // un-latch the episode (issue #50 belt-and-braces) — but once delivery
@@ -852,9 +984,9 @@ func TestSnipeWatcher_NoResetWhileDispatching(t *testing.T) {
 	w := NewSnipeWatcher(feed, rec, notif)
 	w.now = clock.now
 	notif.during = func() {
-		w.evaluate("T1", 0.10, 0.31)
+		w.evaluate("T1", 0.32, 0.31)
 		clock.advance(snipeResetConfirm + time.Second)
-		w.evaluate("T1", 0.10, 0.31) // sustained, but delivery in flight
+		w.evaluate("T1", 0.32, 0.31) // sustained + corroborated, but delivery in flight
 		w.evaluate("T1", 0.10, 0.14) // re-crash: must NOT re-alert
 	}
 
@@ -868,9 +1000,9 @@ func TestSnipeWatcher_NoResetWhileDispatching(t *testing.T) {
 	}
 
 	// Delivery done: the same sustained recovery now resets and re-fires.
-	w.evaluate("T1", 0.10, 0.31)
+	w.evaluate("T1", 0.32, 0.31)
 	clock.advance(snipeResetConfirm + time.Second)
-	w.evaluate("T1", 0.10, 0.31)
+	w.evaluate("T1", 0.32, 0.31)
 	w.evaluate("T1", 0.10, 0.14)
 	if got := notif.inner.count(); got != 2 {
 		t.Errorf("alerts after delivery completed = %d, want 2 (dispatching flag must clear)", got)
