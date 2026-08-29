@@ -32,6 +32,19 @@ func snipeResetAsk() float64 {
 	return (SnipeCrashAsk + SnipeCompetitiveBid) / 2
 }
 
+// snipeResetBid is the episode reset's bid-corroboration bar: the reset also
+// requires a two-sided market above the crash band, because a bid that could
+// not itself re-fire the alert band is not recovery evidence. Issue #100: a
+// dying book whose market makers pulled their asks read ask > 0.30 sustained
+// past the confirm window while the trade-proxy bid stayed frozen at 0.120 —
+// phantom-un-latching the episode four times in 26 minutes (two re-alerts
+// landed after the match was final). Genuine recoveries print bids well above
+// this bar; a frozen or missing bid fails corroboration and holds the latch.
+// Derived, never a literal.
+func snipeResetBid() float64 {
+	return SnipeCrashAsk
+}
+
 // SnipeDeepFloor bounds the Deep Crash tier (ADR 0007): inside an episode
 // that already produced a genuine in-band alert, an ask in
 // [SnipeDeepFloor, SnipeMinAsk) fires the deep tier — the prior alert is the
@@ -632,7 +645,10 @@ func (w *SnipeWatcher) askRelevant(tokenID string, bid float64) bool {
 // positive; a missing ask can neither fire nor reset.
 //
 //   - ratchet: sessionHigh = max(sessionHigh, bid)
-//   - episode reset: alerted clears once ask > snipeResetAsk()
+//   - episode reset: alerted clears once a two-sided market holds above the
+//     crash band — ask > snipeResetAsk() AND bid >= snipeResetBid() — for
+//     snipeResetConfirm (issue #100: a frozen bid under pulled asks is not
+//     recovery)
 //   - fire: sessionHigh >= SnipeCompetitiveBid && 0 < ask <= SnipeCrashAsk
 //     && !alerted && !bought && in-play (game started per Gamma metadata)
 //
@@ -661,7 +677,7 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 	if bid > st.sessionHigh {
 		st.sessionHigh = bid
 	}
-	if (st.alerted || st.shadowAlerted) && !st.dispatching && ask > snipeResetAsk() {
+	if (st.alerted || st.shadowAlerted) && !st.dispatching && ask > snipeResetAsk() && bid >= snipeResetBid() {
 		if st.resetSince.IsZero() {
 			st.resetSince = now
 		} else if now.Sub(st.resetSince) >= snipeResetConfirm {
@@ -671,6 +687,7 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 			st.boxed2Alerted = false
 			st.shadowAlerted = false
 			st.resetSince = time.Time{}
+			log.Printf("SnipeWatcher: episode reset token=%.12s… ask=%.3f bid=%.3f", tokenID, ask, bid)
 		}
 	} else {
 		st.resetSince = time.Time{}
