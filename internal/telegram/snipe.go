@@ -1862,6 +1862,13 @@ func (b *Bot) handleSnipeCallback(ctx context.Context, update *tgbotapi.Update) 
 		if b.snipeBoxedLatch != nil {
 			b.snipeBoxedLatch.clear(chatID, entry.tokenID)
 		}
+		// Register the tapped market as a DIRECT held watch (issue #102): a tap is
+		// the user personally trading this market, so it upgrades a series-walked
+		// entry to full auto-buy semantics for later crashes — and, via the house
+		// bought-token registration, brings the sibling watch every other buy path
+		// already has. res carries the market + bought index from the fill, so no
+		// refetch. In-memory and cheap; the event-mate walk inside runs detached.
+		b.snipeRegisterBoughtToken(chatID, res.market, res.idx)
 		// Confirm the fill, then arm TP + ceiling (no trailing SL) — async. The
 		// tap draws no auto-cap, so there is no ledger to release (issue #92).
 		go b.snipeConfirmFillThenArm(chatID, user, entry.tokenID, entry.question, entry.outcome, res, amount, nil)

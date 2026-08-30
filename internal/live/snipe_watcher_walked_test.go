@@ -156,6 +156,42 @@ func TestRenewHeldMarket_PreservesClass(t *testing.T) {
 	}
 }
 
+// RenewHeldMarket's group loop can ADD this chat to an already-watched sibling
+// or continuation it had no entry on (issue #102 over-spend hole): the class of
+// a NEWLY-ADDED entry must follow the group — a same-EVENT continuation defaults
+// WALKED (alert-only), a same-MARKET sibling of a market the chat actually holds
+// defaults DIRECT. Reachable when a /positions renewal runs before the
+// rate-limited walk has stamped the continuation walked; without this the chat
+// is promoted to full auto-buy on a market it never traded.
+func TestRenewHeldMarket_AddedHolderDefaultsByGroup(t *testing.T) {
+	t.Parallel()
+	w, _, _, _, _ := snipeHarness()
+
+	mk := func(tok, marketID, slug string) SnipeMarket {
+		m := startedMarket(tok)
+		m.MarketID = marketID
+		m.EventSlug = slug
+		return m
+	}
+	// Chat 7 holds ml-a directly. ml-b (same market) and g3-a (same event,
+	// different market) are watched by ANOTHER chat, so they sit in w.tokens but
+	// chat 7 has no entry on them until the group renewal adds it.
+	w.WatchHeld(7, mk("ml-a", "ml", "ev-1"), time.Hour)
+	w.WatchHeld(9, mk("ml-b", "ml", "ev-1"), time.Hour)
+	w.WatchHeld(9, mk("g3-a", "g3", "ev-1"), time.Hour)
+
+	if !w.RenewHeldMarket(7, "ml-a", time.Hour) {
+		t.Fatal("RenewHeldMarket returned false for a watched token")
+	}
+
+	if w.WalkedOnlyHolder(7, "ml-b") {
+		t.Error("ml-b added as walked — the sibling of a held market must default DIRECT")
+	}
+	if !w.WalkedOnlyHolder(7, "g3-a") {
+		t.Error("g3-a added as direct — an untouched continuation must default WALKED (over-spend hole)")
+	}
+}
+
 // TTL pruning is class-blind: sourcesLive still evicts an expired holder whether
 // it was walked or direct (invariant 6).
 func TestSourcesLive_PrunesWalkedAndDirect(t *testing.T) {

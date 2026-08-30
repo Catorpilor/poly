@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -74,6 +75,43 @@ func TestNotifySnipeDeepCrashSeriesWalkedSkips(t *testing.T) {
 	// Neither pool was touched.
 	if _, ok := h.bot.snipeDeepSpend.reserve(7, snipeDeepDailyCapUSD); !ok {
 		t.Error("series-walked deep skip consumed the deep pool")
+	}
+}
+
+// Tapping a walked market upgrades it to full semantics (ratified): the ⚡ tap
+// is never gated, and a SUCCESSFUL tap registers the bought market DIRECT via the
+// house bought-token registration — so WalkedOnlyHolder flips false and a later
+// qualifying crash auto-buys instead of skipping series-walked.
+func TestSnipeTapUpgradesWalkedMarket(t *testing.T) {
+	t.Parallel()
+	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.17, askOK: true, user: snipeWalletUser()})
+	m := testSnipeMarket()
+	h.watch.markWalkedOnly(m.TokenID)
+
+	// The walked market alerts alert-only (series-walked skip, no auto money).
+	h.bot.NotifySnipeAlert(7, m, 0.45, 0.17)
+	if got := h.buys.count(); got != 0 {
+		t.Fatalf("pre-tap buys = %d, want 0 (series-walked skip)", got)
+	}
+	tapData := callbackData(t, h.tg.sentAt(t, 0).markup, "⚡ Snipe $10")
+
+	// The tap itself buys (taps are never gated) and upgrades the market.
+	h.bot.handleSnipeCallback(context.Background(), snipeTapUpdate(7, tapData))
+	if got := h.buys.count(); got != 1 {
+		t.Fatalf("post-tap buys = %d, want 1 (the tap buy itself)", got)
+	}
+	if h.watch.WalkedOnlyHolder(7, m.TokenID) {
+		t.Error("tap-bought market still walked-only — a tap must upgrade it to direct")
+	}
+	// The bought market's tokens are now registered direct (sibling watch too).
+	if held := h.watch.heldTokens(); len(held) == 0 {
+		t.Error("tap success did not register the bought market as held")
+	}
+
+	// A subsequent qualifying crash now auto-buys — the gate no longer fires.
+	h.bot.NotifySnipeAlert(7, m, 0.45, 0.17)
+	if got := h.buys.count(); got != 2 {
+		t.Fatalf("post-upgrade buys = %d, want 2 (upgraded market auto-buys, no series-walked skip)", got)
 	}
 }
 

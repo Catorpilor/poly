@@ -247,6 +247,7 @@ func (f *fakeSnipeWatch) UnwatchArmed(string) {}
 func (f *fakeSnipeWatch) WatchHeld(_ int64, m live.SnipeMarket, _ time.Duration) {
 	f.mu.Lock()
 	f.held = append(f.held, m)
+	delete(f.walkedOnly, m.TokenID) // direct always wins: a direct register upgrades a walked entry
 	f.mu.Unlock()
 }
 func (f *fakeSnipeWatch) WatchWalked(_ int64, m live.SnipeMarket, _ time.Duration) {

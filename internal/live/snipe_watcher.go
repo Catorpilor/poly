@@ -491,7 +491,7 @@ func (w *SnipeWatcher) RenewHeldMarket(chatID int64, tokenID string, ttl time.Du
 		return false
 	}
 	exp := w.now().Add(ttl)
-	renewHolder(st, chatID, exp)
+	renewHolder(st, chatID, exp, false) // anchor is a held position → direct
 	marketID, eventSlug := st.market.MarketID, st.market.EventSlug
 	for id, other := range w.tokens {
 		if id == tokenID {
@@ -499,20 +499,30 @@ func (w *SnipeWatcher) RenewHeldMarket(chatID int64, tokenID string, ttl time.Du
 		}
 		sameMarket := marketID != "" && other.market.MarketID == marketID
 		sameEvent := eventSlug != "" && other.market.EventSlug == eventSlug
-		if sameMarket || sameEvent {
-			renewHolder(other, chatID, exp)
+		switch {
+		case sameMarket:
+			// Sibling of a market the chat actually holds → direct.
+			renewHolder(other, chatID, exp, false)
+		case sameEvent:
+			// Series continuation the chat never traded → walked (alert-only).
+			renewHolder(other, chatID, exp, true)
 		}
 	}
 	return true
 }
 
-// renewHolder extends chatID's holder TTL on st to exp while PRESERVING its
-// source class (issue #102): a renewal must never flip walked↔direct, so a
-// walked continuation stays alert-only and a direct hold stays auto-buyable
-// across position refreshes. A holder new to st (the pre-#102 group renewal
-// could add one) defaults to direct, matching the prior plain-expiry behavior.
-func renewHolder(st *snipeTokenState, chatID int64, exp time.Time) {
-	e := st.holders[chatID]
+// renewHolder extends chatID's holder TTL on st to exp while PRESERVING an
+// existing entry's source class (issue #102): a renewal must never flip
+// walked↔direct, so a walked continuation stays alert-only and a direct hold
+// stays auto-buyable across position refreshes. When the group renewal ADDS a
+// holder new to st, defaultWalked stamps the class by group — the over-spend
+// hole was defaulting these to direct, which promoted an untouched same-event
+// continuation to full auto-buy.
+func renewHolder(st *snipeTokenState, chatID int64, exp time.Time, defaultWalked bool) {
+	e, ok := st.holders[chatID]
+	if !ok {
+		e.walked = defaultWalked
+	}
 	e.expiry = exp
 	st.holders[chatID] = e
 }
