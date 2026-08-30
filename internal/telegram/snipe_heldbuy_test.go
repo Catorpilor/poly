@@ -21,7 +21,8 @@ import (
 type recordingHeldWatch struct {
 	mu          sync.Mutex
 	renewed     []string
-	held        []string
+	held        []string // WatchHeld (direct) token IDs
+	walked      []string // WatchWalked (series-walked) token IDs (issue #102)
 	renewResult bool
 	eventSlug   string // served by EventSlugOf (series-walk tests, issue #94)
 }
@@ -34,6 +35,12 @@ func (r *recordingHeldWatch) WatchHeld(_ int64, m live.SnipeMarket, _ time.Durat
 	r.held = append(r.held, m.TokenID)
 	r.mu.Unlock()
 }
+func (r *recordingHeldWatch) WatchWalked(_ int64, m live.SnipeMarket, _ time.Duration) {
+	r.mu.Lock()
+	r.walked = append(r.walked, m.TokenID)
+	r.mu.Unlock()
+}
+func (r *recordingHeldWatch) WalkedOnlyHolder(int64, string) bool { return false }
 func (r *recordingHeldWatch) RenewHeldMarket(_ int64, tokenID string, _ time.Duration) bool {
 	r.mu.Lock()
 	r.renewed = append(r.renewed, tokenID)
@@ -58,6 +65,12 @@ func (r *recordingHeldWatch) heldTokens() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]string(nil), r.held...)
+}
+
+func (r *recordingHeldWatch) walkedTokens() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.walked...)
 }
 
 // fakePositionSource is a scripted snipePositionSource.

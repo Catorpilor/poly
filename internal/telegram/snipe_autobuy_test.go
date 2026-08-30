@@ -229,11 +229,13 @@ func (br *buyRecorder) call(t *testing.T, i int) buyCall {
 // fakeSnipeWatch records MarkBought and WatchArmed calls; the other
 // watch-registration methods are no-ops.
 type fakeSnipeWatch struct {
-	mu       sync.Mutex
-	bought   []string
-	armed    []live.SnipeMarket
-	held     []live.SnipeMarket // WatchHeld registrations (series-watch tests)
-	siblings []string           // returned by SiblingTokenIDs (boxed case-3 tests)
+	mu         sync.Mutex
+	bought     []string
+	armed      []live.SnipeMarket
+	held       []live.SnipeMarket // WatchHeld (direct) registrations
+	walked     []live.SnipeMarket // WatchWalked (series-walked) registrations (issue #102)
+	walkedOnly map[string]bool    // tokenIDs for which WalkedOnlyHolder returns true
+	siblings   []string           // returned by SiblingTokenIDs (boxed case-3 tests)
 }
 
 func (f *fakeSnipeWatch) WatchArmed(m live.SnipeMarket) {
@@ -247,11 +249,41 @@ func (f *fakeSnipeWatch) WatchHeld(_ int64, m live.SnipeMarket, _ time.Duration)
 	f.held = append(f.held, m)
 	f.mu.Unlock()
 }
+func (f *fakeSnipeWatch) WatchWalked(_ int64, m live.SnipeMarket, _ time.Duration) {
+	f.mu.Lock()
+	f.walked = append(f.walked, m)
+	f.mu.Unlock()
+}
+func (f *fakeSnipeWatch) WalkedOnlyHolder(_ int64, tokenID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.walkedOnly[tokenID]
+}
+
+// markWalkedOnly makes WalkedOnlyHolder report tokenID as walked-only — the seam
+// the series-walked gate tests drive (issue #102).
+func (f *fakeSnipeWatch) markWalkedOnly(tokenID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.walkedOnly == nil {
+		f.walkedOnly = make(map[string]bool)
+	}
+	f.walkedOnly[tokenID] = true
+}
 func (f *fakeSnipeWatch) heldTokens() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]string, 0, len(f.held))
 	for _, m := range f.held {
+		out = append(out, m.TokenID)
+	}
+	return out
+}
+func (f *fakeSnipeWatch) walkedTokens() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.walked))
+	for _, m := range f.walked {
 		out = append(out, m.TokenID)
 	}
 	return out

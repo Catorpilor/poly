@@ -32,14 +32,14 @@ func TestRenewHeldMarket_EventGroup(t *testing.T) {
 	wantExp := clock.now().Add(time.Hour)
 	for _, tok := range []string{"ml-a", "ml-b", "g3-a"} {
 		w.mu.Lock()
-		exp := w.tokens[tok].holders[7]
+		exp := w.tokens[tok].holders[7].expiry
 		w.mu.Unlock()
 		if !exp.Equal(wantExp) {
 			t.Errorf("%s holder expiry = %v, want event-group renewal to %v", tok, exp, wantExp)
 		}
 	}
 	w.mu.Lock()
-	otherExp := w.tokens["other"].holders[7]
+	otherExp := w.tokens["other"].holders[7].expiry
 	w.mu.Unlock()
 	if otherExp.Equal(wantExp) {
 		t.Errorf("other-event token renewed — event grouping must not cross events")
@@ -64,7 +64,7 @@ func TestRenewHeldMarket_EmptySlugKeepsMarketGrouping(t *testing.T) {
 
 	wantExp := clock.now().Add(time.Hour)
 	w.mu.Lock()
-	sib, other := w.tokens["m1-b"].holders[7], w.tokens["m2-a"].holders[7]
+	sib, other := w.tokens["m1-b"].holders[7].expiry, w.tokens["m2-a"].holders[7].expiry
 	w.mu.Unlock()
 	if !sib.Equal(wantExp) {
 		t.Errorf("same-market sibling not renewed (issue #78 regression)")

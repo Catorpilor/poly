@@ -14,7 +14,8 @@ import (
 // flags any MarkBought — the direct-register helper must never latch bought.
 type capturingHeldWatch struct {
 	mu     sync.Mutex
-	calls  []heldWatchCall
+	calls  []heldWatchCall // WatchHeld (direct) calls
+	walked []heldWatchCall // WatchWalked (series-walked) calls (issue #102)
 	bought []string
 }
 
@@ -35,6 +36,12 @@ func (c *capturingHeldWatch) WatchHeld(chatID int64, m live.SnipeMarket, ttl tim
 	c.calls = append(c.calls, heldWatchCall{chatID: chatID, market: m, ttl: ttl})
 	c.mu.Unlock()
 }
+func (c *capturingHeldWatch) WatchWalked(chatID int64, m live.SnipeMarket, ttl time.Duration) {
+	c.mu.Lock()
+	c.walked = append(c.walked, heldWatchCall{chatID: chatID, market: m, ttl: ttl})
+	c.mu.Unlock()
+}
+func (c *capturingHeldWatch) WalkedOnlyHolder(int64, string) bool { return false }
 func (c *capturingHeldWatch) MarkBought(tokenID string) {
 	c.mu.Lock()
 	c.bought = append(c.bought, tokenID)

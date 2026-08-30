@@ -47,8 +47,8 @@ func TestRegisterHeldBuy(t *testing.T) {
 		if !ok {
 			t.Fatal("chatID 7 not among holders")
 		}
-		if want := clock.now().Add(SnipeHeldTTL); !exp.Equal(want) {
-			t.Errorf("holder expiry = %v, want now+SnipeHeldTTL %v", exp, want)
+		if want := clock.now().Add(SnipeHeldTTL); !exp.expiry.Equal(want) {
+			t.Errorf("holder expiry = %v, want now+SnipeHeldTTL %v", exp.expiry, want)
 		}
 	})
 
@@ -74,8 +74,8 @@ func TestRegisterHeldBuy(t *testing.T) {
 			if !ok {
 				t.Fatalf("%s: chatID 7 not among holders", tok)
 			}
-			if !exp.Equal(wantExp) {
-				t.Errorf("%s holder expiry = %v, want now+SnipeHeldTTL %v", tok, exp, wantExp)
+			if !exp.expiry.Equal(wantExp) {
+				t.Errorf("%s holder expiry = %v, want now+SnipeHeldTTL %v", tok, exp.expiry, wantExp)
 			}
 		}
 		// All four tokens subscribed to the feed (they are not otherwise on
