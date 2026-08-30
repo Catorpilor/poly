@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -46,24 +45,37 @@ func TestSnipeWatchHeldMarketRegistersEventMates(t *testing.T) {
 
 	b.snipeWatchHeldMarket(7, held, time.Hour)
 
-	got := watch.heldTokens()
-	want := map[string]bool{"m3a": true, "m3b": true, "m4a": true, "m4b": true}
-	if len(got) != len(want) {
-		t.Fatalf("held tokens = %v, want exactly %v (held market + open Map 4; no props, no closed Map 1, no double-register of m3)", got, want)
+	// The held market's own tokens register DIRECT; the event's open Map 4
+	// mates register WALKED (issue #102) — alert-only continuations.
+	gotDirect := watch.heldTokens()
+	wantDirect := map[string]bool{"m3a": true, "m3b": true}
+	if len(gotDirect) != len(wantDirect) {
+		t.Fatalf("direct held tokens = %v, want exactly %v (the held market only)", gotDirect, wantDirect)
 	}
-	for _, tok := range got {
-		if !want[tok] {
-			t.Errorf("unexpected held registration %q", tok)
+	for _, tok := range gotDirect {
+		if !wantDirect[tok] {
+			t.Errorf("unexpected direct held registration %q", tok)
 		}
 	}
-	// Event-mates carry the event slug for renewal grouping.
+	gotWalked := watch.walkedTokens()
+	wantWalked := map[string]bool{"m4a": true, "m4b": true}
+	if len(gotWalked) != len(wantWalked) {
+		t.Fatalf("walked tokens = %v, want exactly %v (open Map 4; no props, no closed Map 1, no double-register of m3)", gotWalked, wantWalked)
+	}
+	for _, tok := range gotWalked {
+		if !wantWalked[tok] {
+			t.Errorf("unexpected walked registration %q", tok)
+		}
+	}
+	// Walked event-mates carry the event slug and a real game start for renewal
+	// grouping and in-play gating.
 	watch.mu.Lock()
 	defer watch.mu.Unlock()
-	for _, m := range watch.held {
-		if strings.HasPrefix(m.TokenID, "m4") && m.EventSlug != "cs2-a-b-2026" {
+	for _, m := range watch.walked {
+		if m.EventSlug != "cs2-a-b-2026" {
 			t.Errorf("%s EventSlug = %q, want cs2-a-b-2026", m.TokenID, m.EventSlug)
 		}
-		if strings.HasPrefix(m.TokenID, "m4") && m.GameStart.IsZero() {
+		if m.GameStart.IsZero() {
 			t.Errorf("%s GameStart zero — an inert watch never alerts", m.TokenID)
 		}
 	}
@@ -129,11 +141,9 @@ func TestRegisterSnipeHeldRenewPathWalksSeries(t *testing.T) {
 
 	b.registerSnipeHeld(7, []*polymarket.Position{{TokenID: "m3a", MarketID: "m3"}})
 
-	watch.mu.Lock()
-	held := append([]string(nil), watch.held...)
-	watch.mu.Unlock()
-	if len(held) != 2 || held[0] != "m4a" || held[1] != "m4b" {
-		t.Fatalf("held after renew-path walk = %v, want [m4a m4b]", held)
+	walked := watch.walkedTokens()
+	if len(walked) != 2 || walked[0] != "m4a" || walked[1] != "m4b" {
+		t.Fatalf("walked after renew-path walk = %v, want [m4a m4b] (continuations are alert-only, issue #102)", walked)
 	}
 	if got := atomic.LoadInt32(&fetches); got != 1 {
 		t.Errorf("event fetches = %d, want 1", got)
@@ -175,9 +185,9 @@ func TestSnipeAutoArmWalksSeries(t *testing.T) {
 	if calls := repo.armedCalls(); len(calls) != 1 {
 		t.Fatalf("ArmTPOnly calls = %d, want 1", len(calls))
 	}
-	got := watch.heldTokens()
+	got := watch.walkedTokens()
 	if len(got) != 2 {
-		t.Fatalf("held after arm-path walk = %v, want the Map 4 mates", got)
+		t.Fatalf("walked after arm-path walk = %v, want the Map 4 mates (alert-only, issue #102)", got)
 	}
 }
 
@@ -204,14 +214,14 @@ func TestSeriesWalkFailureUnstampsDedup(t *testing.T) {
 	b := &Bot{snipeWatcher: watch, snipeMarkets: polymarket.NewMarketClientWithURL(gamma.URL)}
 
 	b.snipeWalkEventSlug(7, "cs2-a-b-2026", "", time.Hour)
-	if got := watch.heldTokens(); len(got) != 0 {
-		t.Fatalf("held after failed walk = %v, want none", got)
+	if got := watch.walkedTokens(); len(got) != 0 {
+		t.Fatalf("walked after failed walk = %v, want none", got)
 	}
 
 	fail = false
 	b.snipeWalkEventSlug(7, "cs2-a-b-2026", "", time.Hour)
-	if got := watch.heldTokens(); len(got) != 2 {
-		t.Fatalf("held after retried walk = %v, want the mates (failure must un-stamp)", got)
+	if got := watch.walkedTokens(); len(got) != 2 {
+		t.Fatalf("walked after retried walk = %v, want the mates (failure must un-stamp)", got)
 	}
 	if got := atomic.LoadInt32(&fetches); got != 2 {
 		t.Errorf("fetches = %d, want 2 (fail then retry)", got)

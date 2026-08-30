@@ -209,28 +209,40 @@ type snipeTokenState struct {
 	boxed1Alerted bool
 	boxed2Alerted bool
 	// Watch sources. A token stays watched while any source is live.
-	events  map[string]bool     // subscribed event slugs
-	armed   bool                // watched because an SL/TP arm exists
-	holders map[int64]time.Time // held-position chatID -> registration expiry
+	events  map[string]bool       // subscribed event slugs
+	armed   bool                  // watched because an SL/TP arm exists
+	holders map[int64]holderEntry // held-position chatID -> registration entry
 	// feedRef records whether the watcher holds its own price-feed
 	// subscription for this token (event/held sources). Armed tokens ride the
 	// SL/TP monitor's existing subscription and never set it.
 	feedRef bool
 }
 
+// holderEntry records one chat's held-watch registration for a token: its
+// expiry and whether it came ONLY from the series walk (issue #102). A walked
+// entry is alert-only — both auto-buy tiers skip it (see WalkedOnlyHolder) —
+// while a direct entry (bought / armed / positions / web) carries full auto-buy
+// semantics. Upgrade rule (direct always wins): a direct registration overwrites
+// walked=true, and a walk never downgrades an existing direct entry — the walk
+// re-runs hourly and must not clobber a real claim.
+type holderEntry struct {
+	expiry time.Time
+	walked bool
+}
+
 func newSnipeTokenState(m SnipeMarket) *snipeTokenState {
 	return &snipeTokenState{
 		market:  m,
 		events:  make(map[string]bool),
-		holders: make(map[int64]time.Time),
+		holders: make(map[int64]holderEntry),
 	}
 }
 
 // sourcesLive reports whether any watch source remains after pruning holders
 // expired at now.
 func (st *snipeTokenState) sourcesLive(now time.Time) bool {
-	for id, exp := range st.holders {
-		if now.After(exp) {
+	for id, e := range st.holders {
+		if now.After(e.expiry) {
 			delete(st.holders, id)
 		}
 	}
@@ -403,18 +415,40 @@ func (w *SnipeWatcher) UnwatchArmed(tokenID string) {
 	w.unsubscribeReleased(unsub)
 }
 
-// WatchHeld registers a held position: chatID is alerted while the
-// registration lives. The watcher holds a feed subscription for held tokens
-// (they are not otherwise on the feed) and releases it when the TTL expires
-// without renewal.
+// WatchHeld registers a DIRECT held position: chatID is alerted while the
+// registration lives AND both auto-buy tiers act on it (bought / armed /
+// positions / web). The watcher holds a feed subscription for held tokens (they
+// are not otherwise on the feed) and releases it when the TTL expires without
+// renewal. A direct registration always wins the upgrade rule — it overwrites a
+// prior walked entry for the same (chat, token).
 func (w *SnipeWatcher) WatchHeld(chatID int64, m SnipeMarket, ttl time.Duration) {
+	w.watchHeld(chatID, m, ttl, false)
+}
+
+// WatchWalked registers a SERIES-WALKED held watch (issue #102): chatID is
+// alerted exactly like a direct holder, but both auto-buy tiers treat the market
+// as alert-only — no auto money on a series continuation the recipient never
+// personally traded, armed, or subscribed. Only snipeWalkEventSlug's fan-out
+// registers this way. A later direct WatchHeld for the same (chat, token)
+// upgrades the entry; a re-walk NEVER downgrades an existing direct entry.
+func (w *SnipeWatcher) WatchWalked(chatID int64, m SnipeMarket, ttl time.Duration) {
+	w.watchHeld(chatID, m, ttl, true)
+}
+
+// watchHeld is the shared held-registration body for WatchHeld (direct) and
+// WatchWalked. The TTL always extends; the class follows the upgrade rule
+// (direct always wins — a walk never downgrades an existing direct entry).
+func (w *SnipeWatcher) watchHeld(chatID int64, m SnipeMarket, ttl time.Duration, walked bool) {
 	if m.TokenID == "" {
 		return
 	}
 	var subscribe bool
 	w.mu.Lock()
 	st := w.ensureStateLocked(m)
-	st.holders[chatID] = w.now().Add(ttl)
+	if prev, ok := st.holders[chatID]; ok && !prev.walked {
+		walked = false // never downgrade a direct claim
+	}
+	st.holders[chatID] = holderEntry{expiry: w.now().Add(ttl), walked: walked}
 	if !st.feedRef {
 		st.feedRef = true
 		subscribe = true
@@ -423,6 +457,23 @@ func (w *SnipeWatcher) WatchHeld(chatID int64, m SnipeMarket, ttl time.Duration)
 	if subscribe {
 		w.feed.Subscribe(m.TokenID)
 	}
+}
+
+// WalkedOnlyHolder reports whether chatID watches tokenID ONLY via the series
+// walk (issue #102) — the gate-time query both auto-buy tiers use to keep series
+// continuations alert-only. True iff chatID has a holder entry for the token and
+// that entry is walked; because the upgrade rule folds any direct claim into
+// walked=false, a walked entry is precisely a walked-only one. An unknown token
+// or absent holder is false (fail toward the existing auto-buy behavior).
+func (w *SnipeWatcher) WalkedOnlyHolder(chatID int64, tokenID string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	st := w.tokens[tokenID]
+	if st == nil {
+		return false
+	}
+	e, ok := st.holders[chatID]
+	return ok && e.walked
 }
 
 // RenewHeldMarket extends chatID's holder TTL for tokenID AND every currently
@@ -440,7 +491,7 @@ func (w *SnipeWatcher) RenewHeldMarket(chatID int64, tokenID string, ttl time.Du
 		return false
 	}
 	exp := w.now().Add(ttl)
-	st.holders[chatID] = exp
+	renewHolder(st, chatID, exp, false) // anchor is a held position → direct
 	marketID, eventSlug := st.market.MarketID, st.market.EventSlug
 	for id, other := range w.tokens {
 		if id == tokenID {
@@ -448,11 +499,32 @@ func (w *SnipeWatcher) RenewHeldMarket(chatID int64, tokenID string, ttl time.Du
 		}
 		sameMarket := marketID != "" && other.market.MarketID == marketID
 		sameEvent := eventSlug != "" && other.market.EventSlug == eventSlug
-		if sameMarket || sameEvent {
-			other.holders[chatID] = exp
+		switch {
+		case sameMarket:
+			// Sibling of a market the chat actually holds → direct.
+			renewHolder(other, chatID, exp, false)
+		case sameEvent:
+			// Series continuation the chat never traded → walked (alert-only).
+			renewHolder(other, chatID, exp, true)
 		}
 	}
 	return true
+}
+
+// renewHolder extends chatID's holder TTL on st to exp while PRESERVING an
+// existing entry's source class (issue #102): a renewal must never flip
+// walked↔direct, so a walked continuation stays alert-only and a direct hold
+// stays auto-buyable across position refreshes. When the group renewal ADDS a
+// holder new to st, defaultWalked stamps the class by group — the over-spend
+// hole was defaulting these to direct, which promoted an untouched same-event
+// continuation to full auto-buy.
+func renewHolder(st *snipeTokenState, chatID int64, exp time.Time, defaultWalked bool) {
+	e, ok := st.holders[chatID]
+	if !ok {
+		e.walked = defaultWalked
+	}
+	e.expiry = exp
+	st.holders[chatID] = e
 }
 
 // MarkBought latches the bought flag: a snipe buy silences the token's alerts

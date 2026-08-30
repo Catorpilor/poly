@@ -33,6 +33,14 @@ type snipeWatch interface {
 	WatchArmed(m live.SnipeMarket)
 	UnwatchArmed(tokenID string)
 	WatchHeld(chatID int64, m live.SnipeMarket, ttl time.Duration)
+	// WatchWalked registers a series-walked held watch (issue #102): alert-only,
+	// no auto-buy at either tier. A later direct WatchHeld upgrades it; the
+	// hourly re-walk never downgrades a direct entry.
+	WatchWalked(chatID int64, m live.SnipeMarket, ttl time.Duration)
+	// WalkedOnlyHolder reports whether chatID watches tokenID ONLY via the series
+	// walk — the gate-time query both auto-buy tiers use to keep continuations
+	// alert-only (issue #102).
+	WalkedOnlyHolder(chatID int64, tokenID string) bool
 	// EventSlugOf returns a watched token's event slug ("" when unwatched or
 	// unknown) — the renewal path's key into the series walk (issue #94).
 	EventSlugOf(tokenID string) string
@@ -606,6 +614,12 @@ func snipeSkipNote(res snipeBuyResult) string {
 		reason = "you hold the other side — laddering the flip deep ($5 at ≤ $0.10 + $5 at ≤ $0.05)"
 	case snipeBuyFutureGame:
 		reason = "this game hasn't started (an earlier game of the series is still live) — the crash is series-sweep repricing, not an in-play collapse"
+	case snipeBuySeriesWalked:
+		// Issue #102: the market entered this recipient's watch only via the series
+		// walk (holding/arming an EARLIER game registers the continuations). No auto
+		// money on a market they never personally traded; the tap buttons stay live.
+		// (The template appends "— tap below if you still want it.")
+		reason = "this market entered your watch from a series you traded — continuations are alert-only"
 	case snipeBuyManualArmed:
 		// Issue #86: an active manual stop already governs this token. The auto-buy
 		// would be stop-sold moments later or ride unprotected; the manual tap stays
@@ -929,6 +943,14 @@ func (b *Bot) snipeDeepMessage(chatID int64, alertID string, market live.SnipeMa
 // snipeDeepAutoBuy attempts the fixed $5 Deep Crash buy from the deep pool,
 // mirroring snipeAutoBuy's reserve-then-refund but with the strict zone guard.
 func (b *Bot) snipeDeepAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResult, float64, snipeAutoStatus) {
+	// Gate 0 (series-walked gate): alert-only for a market watched ONLY via the
+	// series walk (issue #102), mirroring the in-band tier — checked before the
+	// sport gate for consistent September attribution.
+	if b.snipeWatcher != nil && b.snipeWatcher.WalkedOnlyHolder(chatID, market.TokenID) {
+		log.Printf("Snipe deep-buy: series-walked chat=%d token=%.12s… q=%q", chatID, market.TokenID, market.Question)
+		return snipeBuyResult{outcome: snipeBuySeriesWalked}, 0, snipeAutoSkipped
+	}
+
 	// Gate 1 (sport gate): the deep tier is esports-only too.
 	if !snipeIsEsports(market.Question) {
 		log.Printf("Snipe deep-buy: sport-gated chat=%d token=%.12s… q=%q", chatID, market.TokenID, market.Question)
@@ -1432,6 +1454,16 @@ func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResul
 		b.snipeBoxedLatch.clear(chatID, market.TokenID)
 	}
 
+	// Gate 0 (series-walked gate): a market this recipient watches ONLY via the
+	// series walk (issue #102) is alert-only — no auto money on a continuation
+	// they never personally traded, armed, or subscribed. Checked BEFORE the sport
+	// gate so September attributes these skips to recipiency class, and before any
+	// wallet lookup or cap reservation. The tap buttons stay live.
+	if b.snipeWatcher != nil && b.snipeWatcher.WalkedOnlyHolder(chatID, market.TokenID) {
+		log.Printf("Snipe auto-buy: series-walked chat=%d token=%.12s… q=%q", chatID, market.TokenID, market.Question)
+		return snipeBuyResult{outcome: snipeBuySeriesWalked}, 0, snipeAutoSkipped
+	}
+
 	// Gate 1 (sport gate): auto-buy only esports; non-esports and
 	// unclassifiable markets stay alert-only. Checked before any wallet lookup
 	// or cap reservation — the classification alone decides.
@@ -1589,6 +1621,7 @@ const (
 	snipeBuyBoxedWait                    // boxed tier: recipient holds the other side — postpone until ask ≤ $0.10
 	snipeBuyManualArmed                  // manual-arm gate (issue #86): recipient has an ACTIVE sl_armed stop on the crashed token
 	snipeBuyFutureGame                   // future-game gate (issue #97): an earlier game of the event is still live — this game hasn't started
+	snipeBuySeriesWalked                 // series-walked gate (issue #102): market entered the watch ONLY via the series walk — alert-only
 )
 
 // snipeBuyResult carries what each caller needs to message the user.
@@ -1829,6 +1862,13 @@ func (b *Bot) handleSnipeCallback(ctx context.Context, update *tgbotapi.Update) 
 		if b.snipeBoxedLatch != nil {
 			b.snipeBoxedLatch.clear(chatID, entry.tokenID)
 		}
+		// Register the tapped market as a DIRECT held watch (issue #102): a tap is
+		// the user personally trading this market, so it upgrades a series-walked
+		// entry to full auto-buy semantics for later crashes — and, via the house
+		// bought-token registration, brings the sibling watch every other buy path
+		// already has. res carries the market + bought index from the fill, so no
+		// refetch. In-memory and cheap; the event-mate walk inside runs detached.
+		b.snipeRegisterBoughtToken(chatID, res.market, res.idx)
 		// Confirm the fill, then arm TP + ceiling (no trailing SL) — async. The
 		// tap draws no auto-cap, so there is no ledger to release (issue #92).
 		go b.snipeConfirmFillThenArm(chatID, user, entry.tokenID, entry.question, entry.outcome, res, amount, nil)
@@ -2029,7 +2069,9 @@ func (b *Bot) snipeWalkEventSlug(chatID int64, eventSlug, excludeMarketID string
 			if i < len(outcomes) {
 				outcome = outcomes[i]
 			}
-			b.snipeWatcher.WatchHeld(chatID, snipeMarketFromGamma(mate, tokenID, outcome), ttl)
+			// Series continuations register as WALKED (issue #102): alert-only —
+			// the holder never personally traded these markets, so no auto money.
+			b.snipeWatcher.WatchWalked(chatID, snipeMarketFromGamma(mate, tokenID, outcome), ttl)
 			count++
 		}
 	}
