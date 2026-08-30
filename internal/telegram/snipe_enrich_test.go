@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -173,6 +174,69 @@ func TestSnipeBoughtTokenPathFormRevivesWalk(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&idFetches); got != 1 {
 		t.Errorf("list-form enrichment fetches = %d, want exactly 1 (idempotent across seams)", got)
+	}
+}
+
+// TestSnipeWatchEventMatesDoesNotMutateMarket: the catch-all walk seam must NOT
+// write market.Events (issue #99 hardening). On the tap path two sibling
+// goroutines — the walk (spawned by snipeRegisterBoughtToken) and the arm
+// (snipeConfirmFillThenArm) — share res.market; a graft here would race the
+// other's graft and the arm's read. The slug is resolved locally instead.
+// RED on the mutating branch: snipeWatchEventMates grafts, so Events != nil.
+func TestSnipeWatchEventMatesDoesNotMutateMarket(t *testing.T) {
+	t.Parallel()
+	var idFetches, walkFetches int32
+	gamma := enrichGammaStub(t, &idFetches, &walkFetches)
+
+	watch := &fakeSnipeWatch{}
+	b := &Bot{snipeWatcher: watch, snipeMarkets: polymarket.NewMarketClientWithURL(gamma.URL)}
+
+	market := pathFormBoughtMarket() // path form: gameStartTime, no events[]
+	b.snipeWatchEventMates(7, market, time.Hour)
+
+	// The walk fired (slug resolved from the list form)...
+	if got := watch.walkedTokens(); len(got) != 2 {
+		t.Fatalf("walked = %v, want the Map 4 continuations — the walk must still fire", got)
+	}
+	// ...but the shared market pointer must be left untouched, so a concurrent
+	// sibling goroutine can never observe (or race) a torn Events slice header.
+	if market.Events != nil {
+		t.Fatalf("snipeWatchEventMates mutated market.Events = %+v, want it left nil (non-mutating local resolution)", market.Events)
+	}
+}
+
+// TestSnipeWatchEventMatesConcurrentNoRace reproduces the tap-path hazard the
+// verifier found: when the inline graft did not populate Events, two sibling
+// goroutines (the walk spawned by snipeRegisterBoughtToken and the arm's direct
+// call) resolve the walk for the SAME res.market. The non-mutating seam lets
+// them run without racing a write on the shared pointer (issue #99). Run under
+// -race: on the old mutating seam this is a data race on market.Events.
+func TestSnipeWatchEventMatesConcurrentNoRace(t *testing.T) {
+	t.Parallel()
+	var idFetches, walkFetches int32
+	gamma := enrichGammaStub(t, &idFetches, &walkFetches)
+
+	watch := &fakeSnipeWatch{}
+	b := &Bot{snipeWatcher: watch, snipeMarkets: polymarket.NewMarketClientWithURL(gamma.URL)}
+
+	market := pathFormBoughtMarket() // one shared pointer, no events[]
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			b.snipeWatchEventMates(7, market, time.Hour)
+		}()
+	}
+	wg.Wait()
+
+	if market.Events != nil {
+		t.Fatalf("shared market mutated concurrently: Events = %+v, want nil", market.Events)
+	}
+	// The 1h snipeSeriesWalkDue dedup means exactly one goroutine registers the
+	// mates; the other resolves the slug then short-circuits.
+	if got := watch.walkedTokens(); len(got) != 2 {
+		t.Fatalf("walked = %v, want the 2 Map 4 mates exactly once (deduped)", got)
 	}
 }
 
