@@ -52,3 +52,54 @@ func TestRegisterHeldBuy_SeriesWatch(t *testing.T) {
 	}
 	_ = time.Hour
 }
+
+// Source class on the web buy path (issue #102): the BOUGHT market's tokens
+// (both sides — the sibling watch) register DIRECT and keep full auto-buy; the
+// event's OTHER winner-class markets (the continuations the buyer never touched)
+// register WALKED and are alert-only. This is the live production path that
+// registered the r114/r115 specimen, so the class must be stamped here.
+func TestRegisterHeldBuy_ContinuationsAreWalked(t *testing.T) {
+	t.Parallel()
+	m, w, _ := newSnipeWiredManager(t)
+
+	m.RegisterHeldBuy(7, pinnedFeedEventSlug, "ml-blg", snipeWiringEvent())
+
+	// Bought market (series moneyline) — both sides direct.
+	for _, tok := range []string{"ml-blg", "ml-hle"} {
+		if w.WalkedOnlyHolder(7, tok) {
+			t.Errorf("%s classified walked-only — the bought market must stay DIRECT (full auto-buy)", tok)
+		}
+	}
+	// Continuation (Game 3 Winner) — both sides walked-only (alert-only).
+	for _, tok := range []string{"g3-blg", "g3-hle"} {
+		if !w.WalkedOnlyHolder(7, tok) {
+			t.Errorf("%s not walked-only — an untouched continuation must be alert-only (issue #102)", tok)
+		}
+	}
+}
+
+// The upgrade rule composes on the web path: buying game 1 registers the series'
+// later games as walked; a LATER buy of one of those games re-registers ITS
+// market direct (upgrade), and the re-walk of the now-held earlier market never
+// downgrades it.
+func TestRegisterHeldBuy_LaterBuyUpgradesContinuation(t *testing.T) {
+	t.Parallel()
+	m, w, _ := newSnipeWiredManager(t)
+
+	// Buy the series moneyline: ml direct, g3 walked.
+	m.RegisterHeldBuy(7, pinnedFeedEventSlug, "ml-blg", snipeWiringEvent())
+	if !w.WalkedOnlyHolder(7, "g3-blg") {
+		t.Fatal("precondition: g3-blg should be walked after the moneyline buy")
+	}
+
+	// Now buy Game 3 itself: g3's market becomes the bought market ⇒ direct
+	// (upgrade); ml is now an event-mate continuation whose re-walk must NOT
+	// downgrade the existing direct entry.
+	m.RegisterHeldBuy(7, pinnedFeedEventSlug, "g3-blg", snipeWiringEvent())
+	if w.WalkedOnlyHolder(7, "g3-blg") {
+		t.Error("g3-blg still walked-only — a direct buy of its market must UPGRADE it")
+	}
+	if w.WalkedOnlyHolder(7, "ml-blg") {
+		t.Error("ml-blg downgraded to walked-only — a re-walk must never clobber a direct entry")
+	}
+}

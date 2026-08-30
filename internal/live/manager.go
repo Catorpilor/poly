@@ -594,10 +594,23 @@ func (m *LiveTradeManager) RegisterHeldBuy(telegramID int64, eventSlug, tokenID 
 			openWinner[mkt.ID] = true
 		}
 	}
+	// Source class (issue #102): the bought market's own tokens (both sides —
+	// the sibling watch) register DIRECT and keep full auto-buy; the event's
+	// OTHER winner-class markets are series CONTINUATIONS the buyer never touched,
+	// so they register WALKED and are alert-only. This is the live production buy
+	// path (the Telegram walk is dead per #99), so the alert-only policy must be
+	// stamped here or the r114/r115 auto-buys ship unfixed. The upgrade rule
+	// composes: a later buy of a continuation's own market re-registers it DIRECT
+	// (bought branch) and the re-walk of the now-held earlier market never
+	// downgrades it.
 	for _, sm := range sms {
-		if sm.MarketID == marketID || openWinner[sm.MarketID] {
+		switch {
+		case sm.MarketID == marketID:
 			sm.EventSlug = eventSlug
 			m.snipeWatcher.WatchHeld(telegramID, sm, SnipeHeldTTL)
+		case openWinner[sm.MarketID]:
+			sm.EventSlug = eventSlug
+			m.snipeWatcher.WatchWalked(telegramID, sm, SnipeHeldTTL)
 		}
 	}
 }
