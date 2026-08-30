@@ -83,7 +83,11 @@ func TestSnipeRegisterBoughtToken(t *testing.T) {
 		t.Run(fmt.Sprintf("bought idx %d registers both sides", idx), func(t *testing.T) {
 			t.Parallel()
 			watch := &capturingHeldWatch{}
-			b := &Bot{snipeWatcher: watch}
+			// boughtTokenMarket carries gameStartTime (a sports market), so the
+			// registration reaches the events enrichment seam (issue #99); a
+			// hermetic no-events client keeps it off the network — this test's
+			// focus is direct registration, not the walk.
+			b := &Bot{snipeWatcher: watch, snipeMarkets: noEventsGammaClient(t)}
 
 			b.snipeRegisterBoughtToken(7, boughtTokenMarket(), idx)
 

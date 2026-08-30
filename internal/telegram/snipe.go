@@ -2002,6 +2002,15 @@ func (b *Bot) ensureMarketEvents(market *polymarket.GammaMarket) {
 	if market == nil || market.ID == "" || len(market.Events) > 0 {
 		return
 	}
+	// Every walk-relevant market is in-play sports and carries gameStartTime on
+	// the path form (issue #99). A market with no game start can never pass the
+	// in-play gate, so it can never alert and needs no series walk — skip it
+	// (no fetch, no bail). This kills the two-fetch amplification a /positions
+	// sweep would otherwise pay on every single-market, non-sports position.
+	// Same empty/zero semantics as the in-play gate (fetchSnipeMarket).
+	if market.GetGameStartTime().IsZero() {
+		return
+	}
 	mc := b.snipeMarkets
 	if mc == nil {
 		mc = polymarket.NewMarketClient()
@@ -2202,10 +2211,6 @@ func (b *Bot) snipeRegisterBoughtToken(chatID int64, market *polymarket.GammaMar
 	if b.snipeWatcher == nil || market == nil {
 		return
 	}
-	// The buy handlers fetch by path form, which omits events[] (issue #99).
-	// Graft it before own-token registration so BOTH this market's EventSlug
-	// stamping (renewal grouping) and the series walk below have the slug.
-	b.ensureMarketEvents(market)
 	tokenIDs := market.GetClobTokenIds()
 	// idx validates the buy is real (the caller's bought outcome); the fan-out
 	// then registers BOTH sides of the market, since the flip side is where the
@@ -2213,6 +2218,11 @@ func (b *Bot) snipeRegisterBoughtToken(chatID int64, market *polymarket.GammaMar
 	if idx < 0 || idx >= len(tokenIDs) || tokenIDs[idx] == "" {
 		return
 	}
+	// The buy handlers fetch by path form, which omits events[] (issue #99).
+	// Graft it before own-token registration so BOTH this market's EventSlug
+	// stamping (renewal grouping) and the series walk below have the slug — but
+	// after the guards above, so a rejected registration never fetches.
+	b.ensureMarketEvents(market)
 	// Own-market registration stays inline (in-memory, cheap); the series walk
 	// does a Gamma fetch and must not block the buy handler (issue #94 review
 	// F3) — it runs detached.
