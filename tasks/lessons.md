@@ -419,3 +419,29 @@ taken), the book wins — stop and re-verify before writing the outcome.
 (3) Same class as ledger r21 (user-corrected mis-settlement by inference);
 this one was self-caught but only after publishing a wrong row — verify
 BEFORE the first write, not after.
+
+## 2026-08-30: Spec named a mechanism where the ratified intent was behavioral (#102)
+
+**Mechanism:** The grilled decision was "markets the user never touched are
+alert-only." The issue spec I wrote translated that to "walked=true:
+registrations made by snipeWalkEventSlug only" — a mechanism map. The builder
+followed the letter and correctly flagged as an "observation" that
+RegisterHeldBuy (web path) inlines its OWN continuation registrations outside
+that function — which, per #99, is the only continuation path LIVE in
+production and the one that produced the r114/r115 specimen motivating the
+change. Shipped as specced, the fix would have gated the dead path and left
+the live one auto-buying.
+**Saves:** (1) the builder prompt's standing "enumerate ALL call sites and
+classify each" instruction surfaced the path; (2) reading the builder's
+"observations" section adversarially — it had labeled the asymmetry
+"intended scope" citing my own spec line back at me.
+**Rules:** (1) Spec the INTENT plus an acceptance predicate over behavior
+("no path may auto-spend on a market lacking a direct-touch registration"),
+and let call-site enumeration serve the predicate — never enumerate mechanisms
+in the spec as if exhaustive. (2) Builder observations that cite the spec to
+justify an asymmetry are the highest-value lines in the report — each one is
+either a real scope decision or a spec bug; classify explicitly before verify.
+(3) The round-2 verify also caught a renewal path ADDING holder entries with a
+defaulted class — when introducing a classification on existing state, grep
+every WRITE site of that state, not just the registration functions named in
+the design.
