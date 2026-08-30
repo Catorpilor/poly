@@ -323,6 +323,43 @@ func (mc *MarketClient) GetMarketByID(ctx context.Context, id string) (*GammaMar
 	return &market, nil
 }
 
+// GetMarketEvents fetches the parent event(s) of a market via the list form
+// GET /markets?id={id}. The path form GET /markets/{id} omits events[] entirely
+// (issue #99), which silently kills the series walk that keys off the event
+// slug. The list form carries events[] for in-play sports markets — but it is
+// UNRELIABLE at lifecycle edges (empty for brand-new and recently-closed
+// markets), so an empty array (or an element without events) is NOT an error:
+// it returns nil events with a nil error and the caller keeps the un-enriched
+// path-form market. Only a transport/HTTP/decode failure is an error.
+func (mc *MarketClient) GetMarketEvents(ctx context.Context, id string) ([]*GammaEvent, error) {
+	reqURL := fmt.Sprintf("%s/markets?id=%s", mc.gammaAPIURL, url.QueryEscape(id))
+
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := mc.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch market events: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Gamma API returned status %d", resp.StatusCode)
+	}
+
+	var markets []*GammaMarket
+	if err := json.NewDecoder(resp.Body).Decode(&markets); err != nil {
+		return nil, fmt.Errorf("failed to decode market events: %w", err)
+	}
+	if len(markets) == 0 || markets[0] == nil {
+		return nil, nil // list form empty at a lifecycle edge — fail open
+	}
+	return markets[0].Events, nil
+}
+
 // ErrMarketNotFound reports that a condition-ID lookup returned no market.
 // For the closed-only variant this is the common negative — the market exists
 // but Gamma does not consider it closed yet — so callers (the resolved-arm

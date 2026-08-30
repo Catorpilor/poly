@@ -1966,6 +1966,9 @@ func (b *Bot) snipeWatchHeldMarket(chatID int64, market *polymarket.GammaMarket,
 	if b.snipeWatcher == nil || market == nil {
 		return
 	}
+	// Path-form fetches omit events[] (issue #99); graft it before own-token
+	// registration so EventSlug stamping and the walk below both see the slug.
+	b.ensureMarketEvents(market)
 	outcomes := market.GetOutcomes()
 	for i, tokenID := range market.GetClobTokenIds() {
 		if tokenID == "" {
@@ -1985,10 +1988,46 @@ func (b *Bot) snipeWatchHeldMarket(chatID int64, market *polymarket.GammaMarket,
 // event. Drops are logged, never silent.
 const snipeEventMateMaxTokens = 16
 
+// ensureMarketEvents lazily grafts the parent event onto a market fetched via
+// the path form GET /markets/{id}, which omits events[] (issue #99). The series
+// walk keys off market.Events[0].Slug, so an un-enriched market silently
+// no-ops. Idempotent — a no-op once Events is present — so composing it across
+// the walk-trigger seams (bought-token, held-market, event-mates) costs at most
+// one list-form fetch per registration on the happy path. Fail-open: an
+// enrichment error or an empty list-form response leaves the market
+// un-enriched (the held/bought market itself stays watched) and logs one bail
+// line. The path form is authority for every other field — only events[] is
+// grafted.
+func (b *Bot) ensureMarketEvents(market *polymarket.GammaMarket) {
+	if market == nil || market.ID == "" || len(market.Events) > 0 {
+		return
+	}
+	mc := b.snipeMarkets
+	if mc == nil {
+		mc = polymarket.NewMarketClient()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	events, err := mc.GetMarketEvents(ctx, market.ID)
+	if err != nil {
+		log.Printf("Snipe series watch: events enrichment failed market=%s: %v", market.ID, err)
+		return
+	}
+	if len(events) == 0 {
+		log.Printf("Snipe series watch: events enrichment empty market=%s — walk unavailable", market.ID)
+		return
+	}
+	market.Events = events
+}
+
 // snipeWatchEventMates walks the held market's parent event. The slug comes
 // from the market's Events list directly — GetEventSlug's market-slug fallback
 // would trigger a bogus event fetch.
 func (b *Bot) snipeWatchEventMates(chatID int64, market *polymarket.GammaMarket, ttl time.Duration) {
+	// Idempotent catch-all: covers the arm path's direct call (~:1400) where no
+	// earlier seam grafted; a no-op when snipeRegisterBoughtToken/
+	// snipeWatchHeldMarket already enriched this market (issue #99).
+	b.ensureMarketEvents(market)
 	slug := ""
 	if len(market.Events) > 0 {
 		slug = market.Events[0].Slug
@@ -2163,6 +2202,10 @@ func (b *Bot) snipeRegisterBoughtToken(chatID int64, market *polymarket.GammaMar
 	if b.snipeWatcher == nil || market == nil {
 		return
 	}
+	// The buy handlers fetch by path form, which omits events[] (issue #99).
+	// Graft it before own-token registration so BOTH this market's EventSlug
+	// stamping (renewal grouping) and the series walk below have the slug.
+	b.ensureMarketEvents(market)
 	tokenIDs := market.GetClobTokenIds()
 	// idx validates the buy is real (the caller's bought outcome); the fan-out
 	// then registers BOTH sides of the market, since the flip side is where the
