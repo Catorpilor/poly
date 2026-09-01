@@ -235,13 +235,11 @@ collapsing until its ask prints below the corpse floor (zone 0.005 ≤ ask
 traded down through the crash band while watched, which is the only
 evidence that distinguishes a live panic from a corpse first sighted
 cheap. Fires once per episode, past the bought latch (the in-band $10
-usually already bought), notifies with an explicit corpse warning, and
-auto-buys a fixed $5 from a separate, smaller daily pool — executed only
-if a fresh ask is still inside the zone at buy time, the market is
-esports, and the recipient holds no shares of the token (2026-08-14: a
-held position is never topped up — every losing deep fire was a top-up
-onto a held corpse; the deep buy is a catch-up entry for when the
-in-band buy never funded). Below 0.005 is settlement dust and never
+usually already bought), and notifies with an explicit corpse warning
+plus tap buttons — **alert-only since 2026-09-01 (#105)**: the fixed $5
+auto-buy and its daily pool were retired after the September review
+scored the tier 0-for-13 (−$64.73); any entry at this depth is the
+user's tap. Below 0.005 is settlement dust and never
 fires. Named distinctly from Lottery Ticket,
 which it is not: a Deep Crash doubles down on the same side; a Lottery
 Ticket buys the opposite side after our own ceiling exit.

@@ -62,18 +62,11 @@ const (
 	// snipeAutoBuyDailyCapUSD bounds one recipient's auto-snipe spend per UTC
 	// day.
 	snipeAutoBuyDailyCapUSD = 50.0
-	// snipeDeepBuyUSD is the fixed stake auto-bought on a Deep Crash fire
-	// (ADR 0007) — deliberately half the in-band stake: the base rate below
-	// the corpse floor is worse and the payoff floor is 33×.
-	snipeDeepBuyUSD = 5.0
 	// snipeBoxedTrancheUSD is the stake per boxed ladder rung (issue #78): the
 	// case-3 flip is bought as two $5 tranches ($5 at ≤ $0.10, $5 at ≤ $0.05)
 	// instead of a single $10 at ≤ $0.10 — same $10 max exposure, half the corpse
 	// bleed on the shallower rung. Each tranche draws the main daily cap.
 	snipeBoxedTrancheUSD = 5.0
-	// snipeDeepDailyCapUSD bounds Deep Crash spend in its own pool, isolating
-	// corpse false-positives from the main band's budget.
-	snipeDeepDailyCapUSD = 20.0
 )
 
 // Comeback Snipe auto-buy gates (feat/snipe-auto-buy-gates). Alerts and manual
@@ -165,18 +158,17 @@ const snipeBuyPersistTimeout = 5 * time.Second
 // snipeBoughtRecord tracks, per recipient, the tokens the bot snipe-bought via
 // the in-band auto-buy, a one-tap buy, or a boxed tranche. In-memory, never
 // cleared during a run — matches end with their markets, so staleness is
-// bounded. Gate 3 (Deep holdings) reads it so a $5 Deep Crash top-up never funds
-// a token the in-band buy already holds (all 11 losing deep fires were top-ups
-// onto held corpses). This is the lag-free half of the holdings check; the Data
-// API positions read is the other half, and it lags fills by seconds — hence
-// both.
+// bounded. The boxed case-3 sibling gate reads it as the lag-free half of the
+// holdings check — it must not ladder a flip a prior buy already funds — with
+// the Data API positions read as the lagging other half; hence both. (Until
+// issue #105 the Deep Crash tier read it too; that tier is now alert-only.)
 //
 // It also OWNS the durable buy-log write-through (issue #84): when a store is
-// wired, mark() and logDeepBuy() persist one row per accepted buy so a restart
-// can rebuild this record, the watcher's bought latch, and the spend ledgers.
-// Keeping the write-through here is the single seam the spec asks for — every
-// main-pool accept already funnels through mark(); the deep tier (which
-// deliberately does NOT mark this record) gets logDeepBuy(), the one exception.
+// wired, mark() persists one row per accepted buy so a restart can rebuild this
+// record, the watcher's bought latch, and the main spend ledger. Every accept
+// funnels through mark() — the retired Deep Crash tier's own write-through
+// (logDeepBuy) is gone with the tier (issue #105), so 'main' is now the only
+// pool ever written.
 type snipeBoughtRecord struct {
 	mu     sync.Mutex
 	bought map[int64]map[string]bool // chatID -> tokenID -> true
@@ -208,15 +200,6 @@ func (r *snipeBoughtRecord) mark(chatID int64, tokenID string, amountUSD float64
 	store := r.store
 	r.mu.Unlock()
 	writeSnipeBuy(store, chatID, tokenID, amountUSD, database.SnipeBuyPoolMain)
-}
-
-// logDeepBuy persists a Deep Crash fire to the durable log as a 'deep' row
-// WITHOUT touching the in-memory record — the deep tier never feeds this record
-// (Gate 3a semantics: it is a catch-up entry, not a holding that gates further
-// deep buys), but its $5 spend must be restorable into the deep ledger after a
-// restart (issue #84). No-op with a nil store.
-func (r *snipeBoughtRecord) logDeepBuy(chatID int64, tokenID string, amountUSD float64) {
-	writeSnipeBuy(r.store, chatID, tokenID, amountUSD, database.SnipeBuyPoolDeep)
 }
 
 // restore sets the in-memory bought flag WITHOUT writing through — used by boot
@@ -739,38 +722,36 @@ func (b *Bot) restoreSnipeBuysAt(ctx context.Context, now time.Time) (restored i
 		return 0, fmt.Errorf("restore snipe buys: %w", err)
 	}
 	today := now.Format("2006-01-02")
-	var seededMain, seededDeep int
+	var seededMain, ignoredDeep int
 	for _, row := range rows {
-		// (b) Re-latch the watcher for EVERY buy tier — all call MarkBought live.
-		// Lazy: a not-yet-watched token latches when it is first registered.
+		// (b) Re-latch the watcher for EVERY buy tier — all called MarkBought
+		// live. Lazy: a not-yet-watched token latches when it is first
+		// registered. Historical 'deep' rows re-latch too: the old $5 fill was a
+		// real holding, so suppressing its re-alert stays correct.
 		if b.snipeWatcher != nil {
 			b.snipeWatcher.MarkBought(row.TokenID)
 		}
-		// (a) Rebuild the bought record — main pool only (deep never marks it).
-		if row.Pool != database.SnipeBuyPoolDeep {
-			b.snipeBought.restore(row.ChatID, row.TokenID)
+		// (a) Rebuild the bought record and seed the spend ledger — 'main' rows
+		// only. Historical 'deep' rows (the retired Deep Crash tier, issue #105)
+		// never fed the record and now seed no pool — the deep pool is gone. They
+		// are tolerated without error; no new deep rows are ever written.
+		if row.Pool == database.SnipeBuyPoolDeep {
+			ignoredDeep++
+			restored++
+			continue
 		}
-		// (c) Seed the matching spend ledger — current UTC day only, so a
-		// pre-midnight row (still in the 24h window above) does not resurrect
-		// spend into a freshly rolled-over day.
-		if row.BoughtAt.UTC().Format("2006-01-02") == today {
-			switch row.Pool {
-			case database.SnipeBuyPoolDeep:
-				if b.snipeDeepSpend != nil {
-					b.snipeDeepSpend.seed(row.ChatID, row.AmountUSD)
-					seededDeep++
-				}
-			default:
-				if b.snipeSpend != nil {
-					b.snipeSpend.seed(row.ChatID, row.AmountUSD)
-					seededMain++
-				}
-			}
+		b.snipeBought.restore(row.ChatID, row.TokenID)
+		// (c) Seed the main spend ledger — current UTC day only, so a pre-midnight
+		// row (still in the 24h window above) does not resurrect spend into a
+		// freshly rolled-over day.
+		if b.snipeSpend != nil && row.BoughtAt.UTC().Format("2006-01-02") == today {
+			b.snipeSpend.seed(row.ChatID, row.AmountUSD)
+			seededMain++
 		}
 		restored++
 	}
-	log.Printf("Snipe buys: restored %d row(s) in %s (bought record + watcher latch); seeded %d main + %d deep spend row(s) for %s",
-		restored, snipeBuyRestoreWindow, seededMain, seededDeep, today)
+	log.Printf("Snipe buys: restored %d row(s) in %s (bought record + watcher latch); seeded %d main spend row(s) for %s (ignored %d historical deep row(s))",
+		restored, snipeBuyRestoreWindow, seededMain, today, ignoredDeep)
 	return restored, nil
 }
 
@@ -895,151 +876,30 @@ func snipeDeepText(question, outcome string, alertAsk, ask float64) string {
 			"*%s*\n"+
 			"*Outcome:* %s\n\n"+
 			"Alerted at $%.2f earlier — now $%.3f ask. %.0f× if it turns.\n\n"+
-			"⚠️ Corpse territory: games this cheap are usually over. Anything "+
-			"beyond the system's stake is your read of the game state.",
+			"⚠️ Corpse territory: games this cheap are usually over. Any entry "+
+			"here is your read of the game state.",
 		truncateUTF8(question, 60), outcome, alertAsk, ask, multiple)
 }
 
-// snipeDeepBoughtText builds the Deep Crash auto-buy confirmation. Pure —
-// table-tested.
-func snipeDeepBoughtText(question, outcome string, alertAsk, ask, amount float64, orderID string, poolLeft float64) string {
-	return snipeDeepText(question, outcome, alertAsk, ask) + fmt.Sprintf(
-		"\n\n⚡ *$%.0f auto-bought* (deep pool)\n"+
-			"*Order ID:* %s\n"+
-			"Deep pool left today: $%.0f",
-		amount, orderID, poolLeft)
-}
-
-// snipeDeepCapNote is appended to the Deep Crash alert when the deep pool
-// blocked the buy.
-const snipeDeepCapNote = "\n\n⚠️ Deep pool exhausted — manual taps only until UTC midnight."
+// snipeDeepAlertOnlyNote is the honest one-liner every Deep Crash DM carries:
+// the tier is alert-only — no $5 auto-buy at this depth (retired by the
+// September review, issue #105; the pool was 0-for-13, −$64.73). The message
+// must not imply a buy happened or will (v0.18.1 message-truth rule); the ⚡ tap
+// buttons stay live for a judgment buy on a real comeback read.
+const snipeDeepAlertOnlyNote = "\n\nDeep crashes are alert-only — no auto-buy at this depth. Tap below if you read a comeback."
 
 // NotifySnipeDeepCrash implements the Deep Crash tier of live.SnipeNotifier
-// (ADR 0007): registers the alert for one-tap buying, attempts the $5
-// auto-buy from the deep pool behind the strict zone guard, and DMs the
-// recipient. Delivery is unconditional, exactly like the in-band tier.
+// (ADR 0007, retired to alert-only by the September review — issue #105): the
+// $5 deep auto-buy is gone, so this always registers the alert for one-tap
+// buying and DMs the alert-only Deep Crash notice — the crash summary, the
+// corpse-territory warning, an honest no-auto-buy line, and the ⚡ Snipe $10/$25
+// tap buttons for a judgment buy. Delivery is unconditional. sessionHigh and
+// sinceAlert are unused now (no auto-buy decision consumes them) but stay in the
+// signature the watcher calls.
 func (b *Bot) NotifySnipeDeepCrash(chatID int64, market live.SnipeMarket, sessionHigh, ask, alertAsk float64, sinceAlert time.Duration) {
 	alertID := b.snipeAlerts.add(market)
-	text, keyboard := b.snipeDeepMessage(chatID, alertID, market, ask, alertAsk)
-	b.sendMessageWithKeyboard(chatID, text, keyboard)
-}
-
-// snipeDeepMessage picks the Deep Crash body and buttons from the auto-buy's
-// status, mirroring snipeAlertMessage.
-func (b *Bot) snipeDeepMessage(chatID int64, alertID string, market live.SnipeMarket, ask, alertAsk float64) (string, tgbotapi.InlineKeyboardMarkup) {
-	res, poolLeft, status := b.snipeDeepAutoBuy(chatID, market)
-	base := snipeDeepText(market.Question, market.Outcome, alertAsk, ask)
-	switch status {
-	case snipeAutoBought:
-		return snipeDeepBoughtText(market.Question, market.Outcome, alertAsk, ask, snipeDeepBuyUSD, res.orderID, poolLeft) + snipeFillNote(res),
-			snipeAutoBoughtKeyboard(alertID)
-	case snipeAutoCapReached:
-		return base + snipeDeepCapNote, snipeKeyboard(alertID)
-	default:
-		return base + snipeSkipNote(res), snipeKeyboard(alertID)
-	}
-}
-
-// snipeDeepAutoBuy attempts the fixed $5 Deep Crash buy from the deep pool,
-// mirroring snipeAutoBuy's reserve-then-refund but with the strict zone guard.
-func (b *Bot) snipeDeepAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResult, float64, snipeAutoStatus) {
-	// Gate 0 (series-walked gate): alert-only for a market watched ONLY via the
-	// series walk (issue #102), mirroring the in-band tier — checked before the
-	// sport gate for consistent September attribution.
-	if b.snipeWatcher != nil && b.snipeWatcher.WalkedOnlyHolder(chatID, market.TokenID) {
-		log.Printf("Snipe deep-buy: series-walked chat=%d token=%.12s… q=%q", chatID, market.TokenID, market.Question)
-		return snipeBuyResult{outcome: snipeBuySeriesWalked}, 0, snipeAutoSkipped
-	}
-
-	// Gate 1 (sport gate): the deep tier is esports-only too.
-	if !snipeIsEsports(market.Question) {
-		log.Printf("Snipe deep-buy: sport-gated chat=%d token=%.12s… q=%q", chatID, market.TokenID, market.Question)
-		return snipeBuyResult{outcome: snipeBuyNotEsports}, 0, snipeAutoSkipped
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	user, err := b.userRepo.GetByTelegramID(ctx, chatID)
-	if err != nil || user == nil {
-		return snipeBuyResult{outcome: snipeBuyNoWallet}, 0, snipeAutoSkipped
-	}
-
-	// Gate 3 (deep holdings gate): never top up a token the recipient already
-	// holds — all 11 losing deep fires were top-ups onto held corpses. The deep
-	// buy is only a catch-up entry for when the in-band buy never funded. Two
-	// independent checks; either one showing exposure ⇒ skip.
-	if b.snipeBought != nil && b.snipeBought.held(chatID, market.TokenID) {
-		log.Printf("Snipe deep-buy: holdings-gated (record) chat=%d token=%.12s…", chatID, market.TokenID)
-		return snipeBuyResult{outcome: snipeBuyDeepHeld}, 0, snipeAutoSkipped
-	}
-	if held, ok := b.snipeHoldsPosition(ctx, user, market.TokenID); ok && held {
-		log.Printf("Snipe deep-buy: holdings-gated (positions) chat=%d token=%.12s…", chatID, market.TokenID)
-		return snipeBuyResult{outcome: snipeBuyDeepHeld}, 0, snipeAutoSkipped
-	}
-	// ok==false means the positions read failed: fall back to the record alone,
-	// which is empty here (checked above) ⇒ allow the buy (the deep pool is
-	// small and capped).
-
-	poolLeft, ok := b.snipeDeepSpend.reserve(chatID, snipeDeepBuyUSD)
-	if !ok {
-		log.Printf("Snipe deep-buy: pool reached chat=%d", chatID)
-		return snipeBuyResult{}, poolLeft, snipeAutoCapReached
-	}
-	entry := snipeAlertEntry{
-		tokenID:  market.TokenID,
-		marketID: market.MarketID,
-		question: market.Question,
-		outcome:  market.Outcome,
-	}
-	res := b.snipeGuardedBuyRefuse(ctx, user, entry, snipeDeepBuyUSD, snipeRefuseDeepBuy, false, true)
-	if res.outcome != snipeBuyFilled {
-		b.snipeDeepSpend.release(chatID, snipeDeepBuyUSD)
-		log.Printf("Snipe deep-buy: skipped chat=%d token=%.12s… reason=%d err=%v msg=%s",
-			chatID, market.TokenID, res.outcome, res.err, res.errorMsg)
-		return res, 0, snipeAutoSkipped
-	}
-	// Persist the deep fire to the durable log (pool 'deep') so a restart can
-	// re-seed the deep ledger (issue #84). Deliberately does NOT mark the
-	// in-memory bought record — the deep tier never does (Gate 3a). No-op when no
-	// store is wired.
-	if b.snipeBought != nil {
-		b.snipeBought.logDeepBuy(chatID, market.TokenID, snipeDeepBuyUSD)
-	}
-	// Confirm the fill, then arm TP + ceiling (no trailing SL) — async. An
-	// unfilled order is cancelled and the $5 released back to the deep pool
-	// (issue #92).
-	go b.snipeConfirmFillThenArm(chatID, user, market.TokenID, market.Question, market.Outcome, res, snipeDeepBuyUSD,
-		func(a float64) { b.snipeDeepSpend.release(chatID, a) })
-	log.Printf("Snipe deep-buy: accepted chat=%d token=%.12s… $%.0f order=%s pool-left=$%.2f",
-		chatID, market.TokenID, snipeDeepBuyUSD, res.orderID, poolLeft)
-	return res, poolLeft, snipeAutoBought
-}
-
-// snipeHoldsPosition reports whether the user's proxy holds shares of tokenID
-// (Gate 3b). It mirrors snipeRegisterHeldForUser's Data API read, using the
-// same injectable snipePositions seam. Returns ok=false when the position can't
-// be determined (no proxy, or the Data API errored) — the caller falls back to
-// the local bought record.
-func (b *Bot) snipeHoldsPosition(ctx context.Context, user *database.User, tokenID string) (held, ok bool) {
-	if user.ProxyAddress == "" {
-		return false, false
-	}
-	scanner := b.snipePositions
-	if scanner == nil {
-		scanner = polymarket.NewUnifiedPositionScanner()
-	}
-	positions, err := scanner.GetPositions(ctx, common.HexToAddress(user.ProxyAddress))
-	if err != nil {
-		log.Printf("Snipe deep-buy: positions read failed for holdings gate: %v", err)
-		return false, false
-	}
-	for _, pos := range positions {
-		if pos.TokenID == tokenID && pos.Shares != nil && pos.Shares.Sign() > 0 {
-			return true, true
-		}
-	}
-	return false, true
+	text := snipeDeepText(market.Question, market.Outcome, alertAsk, ask) + snipeDeepAlertOnlyNote
+	b.sendMessageWithKeyboard(chatID, text, snipeKeyboard(alertID))
 }
 
 // snipeHoldsSibling reports whether chatID already holds ANY OTHER token of the
@@ -1588,10 +1448,10 @@ func (b *Bot) snipeAutoBuyExec(ctx context.Context, chatID int64, user *database
 			chatID, market.TokenID, res.outcome, res.err, res.errorMsg)
 		return res, 0, snipeAutoSkipped
 	}
-	// Record the holding so a later Deep Crash fire on this token is
-	// holdings-gated (Gate 3a). Only the in-band auto-buy, one-tap, and boxed
-	// tranches feed this record — never the deep tier itself. mark also writes
-	// the durable buy row (pool 'main', this stake) when a store is wired (#84).
+	// Record the holding — the boxed case-3 sibling gate and restart restore
+	// read this record (the deep holdings gate it once fed retired with the
+	// deep auto-buy, #105). mark also writes the durable buy row (pool 'main',
+	// this stake) when a store is wired (#84).
 	if b.snipeBought != nil {
 		b.snipeBought.mark(chatID, market.TokenID, amount)
 	}
@@ -1649,15 +1509,6 @@ type snipeBuyResult struct {
 	boxedTranche int
 }
 
-// snipeRefuseDeepBuy is the Deep Crash buy guard (ADR 0007): strict zone
-// check — the $5 executes only while the fresh ask is still inside
-// [SnipeDeepFloor, SnipeMinAsk). A bounce out of the zone means the dip is
-// gone (the in-band tranche is already riding it); below the floor is dust.
-// Pure — table-tested.
-func snipeRefuseDeepBuy(ask float64, ok bool) bool {
-	return !ok || ask < live.SnipeDeepFloor || ask >= live.SnipeMinAsk
-}
-
 // snipeGuardedBuy is the shared guarded snipe buy behind the one-tap callback
 // (manual taps are never gated): repricing guard on a fresh ask, market fetch,
 // token-index verify, buy, MarkBought on success. Claiming the registry entry
@@ -1668,10 +1519,9 @@ func (b *Bot) snipeGuardedBuy(ctx context.Context, user *database.User, entry sn
 }
 
 // snipeGuardedBuyRefuse is snipeGuardedBuy with a caller-chosen repricing guard
-// (the Deep Crash tier substitutes its strict zone check) and an optional
-// corpse-spread gate (Gate 2, in-band $10 only). When corpseGuard is set, the
-// same fresh-book read that feeds the repricing guard also reads the best bid
-// and skips the buy on corpse geometry.
+// and an optional corpse-spread gate (Gate 2, in-band $10 only). When
+// corpseGuard is set, the same fresh-book read that feeds the repricing guard
+// also reads the best bid and skips the buy on corpse geometry.
 func (b *Bot) snipeGuardedBuyRefuse(ctx context.Context, user *database.User, entry snipeAlertEntry, amount float64, refuse func(ask float64, ok bool) bool, corpseGuard, futureGate bool) snipeBuyResult {
 	var ask, bid float64
 	var ok, bidOK bool
@@ -1850,9 +1700,9 @@ func (b *Bot) handleSnipeCallback(ctx context.Context, update *tgbotapi.Update) 
 			"❌ *Snipe failed*\n\n*Market:* %s\n*Error:* %s",
 			question, res.errorMsg))
 	case snipeBuyFilled:
-		// Record the holding so a later Deep Crash fire on this token is
-		// holdings-gated (Gate 3a), same as the in-band auto-buy. mark also writes
-		// the durable buy row (pool 'main', this tap's stake) when wired (#84).
+		// Record the holding — boxed case-3 gating and restore read it, same as
+		// the in-band auto-buy (#105 retired the deep gate it once fed). mark
+		// also writes the durable buy row (pool 'main', this tap's stake) (#84).
 		if b.snipeBought != nil {
 			b.snipeBought.mark(chatID, entry.tokenID, amount)
 		}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"strings"
 	"testing"
-	"time"
 )
 
 // Issue #102 (ledger r114/r115): a recipient whose ONLY claim on the crashed
@@ -48,33 +47,6 @@ func TestNotifySnipeAlertSeriesWalkedSkips(t *testing.T) {
 	// The daily cap was never touched (no reserve on a class skip).
 	if _, ok := h.bot.snipeSpend.reserve(7, snipeAutoBuyDailyCapUSD); !ok {
 		t.Error("series-walked skip consumed the daily cap")
-	}
-}
-
-// Deep tier: walked-only recipient + qualifying deep crash ⇒ alert-only too.
-func TestNotifySnipeDeepCrashSeriesWalkedSkips(t *testing.T) {
-	t.Parallel()
-	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.02, askOK: true, user: snipeWalletUser()})
-	m := testSnipeMarket()
-	h.watch.markWalkedOnly(m.TokenID)
-
-	h.bot.NotifySnipeDeepCrash(7, m, 0.45, 0.02, 0.09, 3*time.Minute)
-
-	if got := h.buys.count(); got != 0 {
-		t.Fatalf("deep buy calls = %d, want 0 — a series-walked market must never auto-buy", got)
-	}
-	sent := h.tg.sentAt(t, 0)
-	if strings.Contains(sent.text, "auto-bought") {
-		t.Errorf("series-walked deep alert must not claim an auto-buy:\n%s", sent.text)
-	}
-	for _, want := range []string{"Deep Crash", "Auto-buy skipped", "continuations are alert-only"} {
-		if !strings.Contains(sent.text, want) {
-			t.Errorf("series-walked deep skip note missing %q in:\n%s", want, sent.text)
-		}
-	}
-	// Neither pool was touched.
-	if _, ok := h.bot.snipeDeepSpend.reserve(7, snipeDeepDailyCapUSD); !ok {
-		t.Error("series-walked deep skip consumed the deep pool")
 	}
 }
 

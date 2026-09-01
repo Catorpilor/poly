@@ -1,15 +1,12 @@
 package telegram
 
 import (
-	"errors"
-	"math/big"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Catorpilor/poly/internal/database"
 	"github.com/Catorpilor/poly/internal/live"
-	"github.com/Catorpilor/poly/internal/polymarket"
 )
 
 // snipeWalletUserWithProxy is snipeWalletUser plus a Trading Wallet address, so
@@ -140,30 +137,6 @@ func TestNotifySnipeAlertEsportsProceeds(t *testing.T) {
 	}
 }
 
-// TestNotifySnipeDeepCrashSportGate: the sport gate also blocks the $5 deep
-// auto-buy; the deep alert with its corpse warning still sends.
-func TestNotifySnipeDeepCrashSportGate(t *testing.T) {
-	t.Parallel()
-	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.02, askOK: true, user: snipeWalletUser()})
-
-	h.bot.NotifySnipeDeepCrash(7, nonEsportsMarket(), 0.45, 0.02, 0.09, time.Minute)
-
-	if got := h.buys.count(); got != 0 {
-		t.Fatalf("buy calls = %d, want 0 (sport gate)", got)
-	}
-	sent := h.tg.sentAt(t, 0)
-	if !strings.Contains(sent.text, "Deep Crash") || strings.Contains(sent.text, "auto-bought") {
-		t.Errorf("sport-gated deep alert wrong:\n%s", sent.text)
-	}
-	if !strings.Contains(sent.text, "esports") {
-		t.Errorf("sport-gated deep alert must name the reason:\n%s", sent.text)
-	}
-	// The deep pool must be untouched.
-	if _, ok := h.bot.snipeDeepSpend.reserve(7, snipeDeepDailyCapUSD); !ok {
-		t.Error("deep pool consumed by a sport-gated deep alert")
-	}
-}
-
 // --- Gate 2 (corpse-spread gate, in-band $10 only) ---
 
 // TestNotifySnipeAlertCorpseSpreadSkips: a fresh bid far below the ask is the
@@ -229,124 +202,10 @@ func TestNotifySnipeAlertCorpseSpreadBoundary(t *testing.T) {
 	}
 }
 
-// TestNotifySnipeDeepCrashIgnoresCorpseSpread: Gate 2 is in-band only — the deep
-// tier buys even on corpse geometry (its own zone guard already governs it).
-func TestNotifySnipeDeepCrashIgnoresCorpseSpread(t *testing.T) {
-	t.Parallel()
-	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{
-		ask: 0.02, askOK: true, bidSet: true, bid: 0.001, bidOK: true, user: snipeWalletUser(),
-	})
-
-	h.bot.NotifySnipeDeepCrash(7, testSnipeMarket(), 0.45, 0.02, 0.09, time.Minute)
-
-	if got := h.buys.count(); got != 1 {
-		t.Fatalf("deep buy calls = %d, want 1 (Gate 2 does not apply to deep)", got)
-	}
-}
-
-// --- Gate 3 (deep holdings gate, $5 deep only) ---
-
-// TestNotifySnipeDeepCrashHoldingsRecord: the bot's own in-band buy record for
-// this token skips the $5 deep top-up.
-func TestNotifySnipeDeepCrashHoldingsRecord(t *testing.T) {
-	t.Parallel()
-	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.02, askOK: true, user: snipeWalletUserWithProxy()})
-	m := testSnipeMarket()
-	h.bot.snipeBought.mark(7, m.TokenID, snipeAutoBuyUSD) // in-band auto-buy already funded it
-
-	h.bot.NotifySnipeDeepCrash(7, m, 0.45, 0.02, 0.09, time.Minute)
-
-	if got := h.buys.count(); got != 0 {
-		t.Fatalf("buy calls = %d, want 0 (already held per record)", got)
-	}
-	sent := h.tg.sentAt(t, 0)
-	if !strings.Contains(sent.text, "Deep Crash") || strings.Contains(sent.text, "auto-bought") {
-		t.Errorf("holdings-gated deep alert wrong:\n%s", sent.text)
-	}
-	if !strings.Contains(sent.text, "already hold") {
-		t.Errorf("holdings-gated deep alert must name the reason:\n%s", sent.text)
-	}
-	if _, ok := h.bot.snipeDeepSpend.reserve(7, snipeDeepDailyCapUSD); !ok {
-		t.Error("deep pool consumed by a holdings-gated deep alert")
-	}
-}
-
-// TestNotifySnipeDeepCrashHoldingsPositions: the positions API showing shares of
-// this token skips the $5 deep top-up even when the local record is empty.
-func TestNotifySnipeDeepCrashHoldingsPositions(t *testing.T) {
-	t.Parallel()
-	m := testSnipeMarket()
-	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{
-		ask: 0.02, askOK: true, user: snipeWalletUserWithProxy(),
-		positions: []*polymarket.Position{{TokenID: m.TokenID, Shares: big.NewInt(100_000_000)}},
-	})
-
-	h.bot.NotifySnipeDeepCrash(7, m, 0.45, 0.02, 0.09, time.Minute)
-
-	if got := h.buys.count(); got != 0 {
-		t.Fatalf("buy calls = %d, want 0 (positions show holdings)", got)
-	}
-	sent := h.tg.sentAt(t, 0)
-	if !strings.Contains(sent.text, "already hold") {
-		t.Errorf("positions-gated deep alert must name the reason:\n%s", sent.text)
-	}
-}
-
-// TestNotifySnipeDeepCrashNoHoldingsProceeds: empty record and empty positions ⇒
-// the deep buy is the intended catch-up entry and proceeds.
-func TestNotifySnipeDeepCrashNoHoldingsProceeds(t *testing.T) {
-	t.Parallel()
-	m := testSnipeMarket()
-	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{
-		ask: 0.02, askOK: true, user: snipeWalletUserWithProxy(),
-		positions: []*polymarket.Position{{TokenID: "some-other-token", Shares: big.NewInt(5)}},
-	})
-
-	h.bot.NotifySnipeDeepCrash(7, m, 0.45, 0.02, 0.09, time.Minute)
-
-	if got := h.buys.count(); got != 1 {
-		t.Fatalf("buy calls = %d, want 1 (no holdings ⇒ deep proceeds)", got)
-	}
-}
-
-// TestNotifySnipeDeepCrashPositionsErrorFallsBackToRecord: a positions API error
-// with an empty local record allows the buy (deep pool is small and capped).
-func TestNotifySnipeDeepCrashPositionsErrorFallsBackToRecord(t *testing.T) {
-	t.Parallel()
-	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{
-		ask: 0.02, askOK: true, user: snipeWalletUserWithProxy(),
-		posErr: errors.New("data api down"),
-	})
-
-	h.bot.NotifySnipeDeepCrash(7, testSnipeMarket(), 0.45, 0.02, 0.09, time.Minute)
-
-	if got := h.buys.count(); got != 1 {
-		t.Fatalf("buy calls = %d, want 1 (positions error + empty record ⇒ allow)", got)
-	}
-}
-
-// TestNotifySnipeDeepCrashPositionsErrorButRecordSkips: a positions API error is
-// backstopped by the local record — a recorded in-band buy still skips the deep.
-func TestNotifySnipeDeepCrashPositionsErrorButRecordSkips(t *testing.T) {
-	t.Parallel()
-	m := testSnipeMarket()
-	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{
-		ask: 0.02, askOK: true, user: snipeWalletUserWithProxy(),
-		posErr: errors.New("data api down"),
-	})
-	h.bot.snipeBought.mark(7, m.TokenID, snipeAutoBuyUSD)
-
-	h.bot.NotifySnipeDeepCrash(7, m, 0.45, 0.02, 0.09, time.Minute)
-
-	if got := h.buys.count(); got != 0 {
-		t.Fatalf("buy calls = %d, want 0 (record backstops the positions error)", got)
-	}
-}
-
 // TestSnipeInBandBuyRecordsHolding: a successful in-band auto-buy records the
-// holding, so a later deep fire on the same token is holdings-gated. The deep
-// tier's own fill must NOT feed the record (or repeated deep fires would
-// self-gate), which the four-$5 pool test also relies on.
+// holding — the lag-free half of the boxed case-3 sibling gate, and the record
+// the durable buy-log write-through rebuilds. Only the in-band auto-buy, a
+// one-tap, and boxed tranches feed it.
 func TestSnipeInBandBuyRecordsHolding(t *testing.T) {
 	t.Parallel()
 	m := testSnipeMarket()
@@ -359,9 +218,30 @@ func TestSnipeInBandBuyRecordsHolding(t *testing.T) {
 	if !h.bot.snipeBought.held(7, m.TokenID) {
 		t.Fatal("in-band auto-buy did not record the holding")
 	}
+}
 
-	h.bot.NotifySnipeDeepCrash(7, m, 0.45, 0.02, 0.09, time.Minute)
-	if got := h.buys.count(); got != 1 {
-		t.Fatalf("deep buy after in-band = %d, want still 1 (holdings-gated)", got)
+// TestNotifySnipeDeepCrashAlertOnly (issue #105): the Deep Crash tier is
+// alert-only — a fully-qualified deep fire (esports market, recipient holds
+// nothing, fresh day) attempts ZERO buys and DMs the alert-only Deep Crash
+// notice with ⚡ tap buttons. Regression for the September retirement of the
+// 0-for-13, −$64.73 $5 auto-pool.
+func TestNotifySnipeDeepCrashAlertOnly(t *testing.T) {
+	t.Parallel()
+	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.02, askOK: true, user: snipeWalletUser()})
+
+	h.bot.NotifySnipeDeepCrash(7, testSnipeMarket(), 0.45, 0.02, 0.09, time.Minute)
+
+	if got := h.buys.count(); got != 0 {
+		t.Fatalf("deep buy calls = %d, want 0 — the deep tier is alert-only", got)
 	}
+	if got := h.watch.boughtCount(); got != 0 {
+		t.Errorf("MarkBought calls = %d, want 0 (no auto-buy at this depth)", got)
+	}
+	sent := h.tg.sentAt(t, 0)
+	if !strings.Contains(sent.text, "Deep Crash") || !strings.Contains(sent.text, "Corpse territory") {
+		t.Errorf("deep alert missing the crash summary + corpse warning:\n%s", sent.text)
+	}
+	// Tap buttons stay live — the user still judges the game.
+	callbackData(t, sent.markup, "⚡ Snipe $10")
+	callbackData(t, sent.markup, "⚡ Snipe $25")
 }

@@ -309,28 +309,6 @@ func TestSnipeAutoArmRepoErrorDoesNotBlockBuy(t *testing.T) {
 	}
 }
 
-// TestSnipeAutoArmDeep: a successful $5 deep auto-buy TP-only-arms with the deep
-// stake and its guard ask.
-func TestSnipeAutoArmDeep(t *testing.T) {
-	t.Parallel()
-	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.02, askOK: true, user: snipeWalletUser()})
-	repo := &recordingArmRepo{}
-	h.bot.sltpArmRepo = repo
-
-	h.bot.NotifySnipeDeepCrash(7, testSnipeMarket(), 0.45, 0.02, 0.09, time.Minute)
-
-	arm := waitArmed(t, repo)
-	if !arm.TPArmed || arm.SLArmed {
-		t.Errorf("deep arm flags = TP:%v SL:%v, want TP:true SL:false", arm.TPArmed, arm.SLArmed)
-	}
-	if arm.AvgPrice != 0.02 {
-		t.Errorf("deep arm AvgPrice = %v, want 0.02", arm.AvgPrice)
-	}
-	if want := snipeDeepBuyUSD / 0.02; arm.SharesAtArm != want {
-		t.Errorf("deep arm SharesAtArm = %v, want %v (deep stake/price)", arm.SharesAtArm, want)
-	}
-}
-
 // TestSnipeAutoArmTap: a one-tap buy in handleSnipeCallback TP-only-arms with
 // the tapped amount as the stake.
 func TestSnipeAutoArmTap(t *testing.T) {
