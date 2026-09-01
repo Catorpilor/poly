@@ -74,8 +74,8 @@ func (s *fakeSnipeBuyStore) savedCalls() []savedSnipeBuy {
 // --- write-through: the seam ---
 
 // TestSnipeBoughtRecordWriteThrough: mark writes ONE 'main' row with the stake
-// and latches the in-memory record; logDeepBuy writes ONE 'deep' row WITHOUT
-// touching the in-memory record (Gate 3a semantics).
+// and latches the in-memory record. 'main' is the only pool ever written now the
+// Deep Crash tier is alert-only (issue #105).
 func TestSnipeBoughtRecordWriteThrough(t *testing.T) {
 	t.Parallel()
 	store := &fakeSnipeBuyStore{}
@@ -83,18 +83,13 @@ func TestSnipeBoughtRecordWriteThrough(t *testing.T) {
 	r.SetStore(store)
 
 	r.mark(7, "tokMain", snipeAutoBuyUSD)
-	r.logDeepBuy(7, "tokDeep", snipeDeepBuyUSD)
 
 	if !r.held(7, "tokMain") {
 		t.Error("mark did not latch the in-memory record")
 	}
-	if r.held(7, "tokDeep") {
-		t.Error("logDeepBuy must NOT latch the in-memory record (deep never marks it)")
-	}
 	got := store.savedCalls()
 	want := []savedSnipeBuy{
 		{7, "tokMain", snipeAutoBuyUSD, database.SnipeBuyPoolMain},
-		{7, "tokDeep", snipeDeepBuyUSD, database.SnipeBuyPoolDeep},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("saved %d rows, want %d: %+v", len(got), len(want), got)
@@ -106,21 +101,17 @@ func TestSnipeBoughtRecordWriteThrough(t *testing.T) {
 	}
 }
 
-// TestSnipeBoughtRecordNilStoreUnchanged: with no store, mark/logDeepBuy are
-// byte-identical to pre-#84 — the in-memory record still latches, nothing
-// persists, and nothing panics.
+// TestSnipeBoughtRecordNilStoreUnchanged: with no store, mark is byte-identical
+// to pre-#84 — the in-memory record still latches, nothing persists, and nothing
+// panics.
 func TestSnipeBoughtRecordNilStoreUnchanged(t *testing.T) {
 	t.Parallel()
 	r := newSnipeBoughtRecord() // no store
 
 	r.mark(7, "tok", snipeAutoBuyUSD)
-	r.logDeepBuy(7, "tokD", snipeDeepBuyUSD)
 
 	if !r.held(7, "tok") {
 		t.Error("mark with nil store must still latch the in-memory record")
-	}
-	if r.held(7, "tokD") {
-		t.Error("logDeepBuy must never latch the record")
 	}
 }
 
@@ -187,9 +178,10 @@ func TestSnipeBoxedTranchePersistsMainRow(t *testing.T) {
 	}
 }
 
-// TestSnipeDeepCrashPersistsDeepRow: a Deep Crash fire writes one 'deep' row for
-// the $5 stake.
-func TestSnipeDeepCrashPersistsDeepRow(t *testing.T) {
+// TestSnipeDeepCrashPersistsNoRow (issue #105): the alert-only Deep Crash tier
+// never buys, so it writes NO durable row — deep-spend persistence ends with the
+// auto-buy path it rode.
+func TestSnipeDeepCrashPersistsNoRow(t *testing.T) {
 	t.Parallel()
 	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.02, askOK: true, user: snipeWalletUser()})
 	store := &fakeSnipeBuyStore{}
@@ -198,12 +190,8 @@ func TestSnipeDeepCrashPersistsDeepRow(t *testing.T) {
 
 	h.bot.NotifySnipeDeepCrash(7, m, 0.45, 0.02, 0.17, time.Minute)
 
-	got := store.savedCalls()
-	if len(got) != 1 {
-		t.Fatalf("saved %d rows, want 1: %+v", len(got), got)
-	}
-	if got[0] != (savedSnipeBuy{7, m.TokenID, snipeDeepBuyUSD, database.SnipeBuyPoolDeep}) {
-		t.Errorf("deep row = %+v, want {7, token, $5, deep}", got[0])
+	if got := store.savedCalls(); len(got) != 0 {
+		t.Fatalf("deep fire persisted %d row(s), want 0 (alert-only): %+v", len(got), got)
 	}
 }
 
@@ -245,23 +233,23 @@ func TestSnipeWriteFailureDoesNotBlockBuy(t *testing.T) {
 func restoreTestBot(store *fakeSnipeBuyStore, now time.Time) (*Bot, *fakeSnipeWatch) {
 	watch := &fakeSnipeWatch{}
 	b := &Bot{
-		snipeBought:    newSnipeBoughtRecord(),
-		snipeSpend:     newSnipeSpendLedger(snipeAutoBuyDailyCapUSD),
-		snipeDeepSpend: newSnipeSpendLedger(snipeDeepDailyCapUSD),
-		snipeWatcher:   watch,
+		snipeBought:  newSnipeBoughtRecord(),
+		snipeSpend:   newSnipeSpendLedger(snipeAutoBuyDailyCapUSD),
+		snipeWatcher: watch,
 	}
 	b.SetSnipeBuyStore(store)
 	b.snipeSpend.now = func() time.Time { return now }
-	b.snipeDeepSpend.now = func() time.Time { return now }
 	return b, watch
 }
 
 // TestRestoreSnipeBuysWindowAndPools pins the whole restore contract in one
 // scenario: the 24h window filters old rows; the bought record rebuilds from
-// MAIN rows only; MarkBought re-latches EVERY row (main + deep); the spend
-// ledgers seed per pool for the CURRENT UTC day only — with the deliberate
-// asymmetry that a yesterday-23:50 row (inside 24h) restores the bought latch
-// but NOT the already-rolled-over cap.
+// MAIN rows only; MarkBought re-latches EVERY row (main + a historical deep row);
+// the MAIN ledger seeds for the CURRENT UTC day only — with the deliberate
+// asymmetry that a yesterday-23:50 row (inside 24h) restores the bought latch but
+// NOT the already-rolled-over cap. A historical 'deep' row (the retired tier,
+// issue #105) is tolerated: re-latched, but it never enters the bought record and
+// seeds NO pool — the deep pool is gone.
 func TestRestoreSnipeBuysWindowAndPools(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 8, 20, 8, 46, 0, 0, time.UTC)
@@ -318,11 +306,9 @@ func TestRestoreSnipeBuysWindowAndPools(t *testing.T) {
 	if left, ok := b.snipeSpend.reserve(7, 40); !ok || left != 0 {
 		t.Errorf("main reserve(40) = (%.0f, %v), want (0, true) — seed survives the first reserve's roll", left, ok)
 	}
-
-	// Deep ledger seeded $5.
-	if left, ok := b.snipeDeepSpend.reserve(7, 16); ok || left != 15 {
-		t.Errorf("deep reserve(16) = (%.0f, %v), want (15, false) — $5 seeded", left, ok)
-	}
+	// The historical deep row seeded no pool: the $10 main seed above proves the
+	// deep $5 did not leak into the main ledger, and there is no deep pool left to
+	// check (issue #105).
 }
 
 // TestRestoreSnipeBuysPostMidnightNoResurrection: a boot minutes after UTC
@@ -359,10 +345,9 @@ func TestRestoreSnipeBuysPostMidnightNoResurrection(t *testing.T) {
 func TestRestoreSnipeBuysNilStore(t *testing.T) {
 	t.Parallel()
 	b := &Bot{
-		snipeBought:    newSnipeBoughtRecord(),
-		snipeSpend:     newSnipeSpendLedger(snipeAutoBuyDailyCapUSD),
-		snipeDeepSpend: newSnipeSpendLedger(snipeDeepDailyCapUSD),
-		snipeWatcher:   &fakeSnipeWatch{},
+		snipeBought:  newSnipeBoughtRecord(),
+		snipeSpend:   newSnipeSpendLedger(snipeAutoBuyDailyCapUSD),
+		snipeWatcher: &fakeSnipeWatch{},
 	}
 	restored, err := b.RestoreSnipeBuys(context.Background())
 	if err != nil || restored != 0 {

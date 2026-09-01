@@ -403,7 +403,6 @@ func newSnipeAutoBuyHarness(t *testing.T, cfg snipeHarnessConfig) *snipeAutoBuyH
 		snipeFeed:       &fakeAskSource{ask: cfg.ask, askOK: cfg.askOK, bid: bid, bidOK: bidOK},
 		snipeAlerts:     newSnipeAlertRegistry(),
 		snipeSpend:      newSnipeSpendLedger(snipeAutoBuyDailyCapUSD),
-		snipeDeepSpend:  newSnipeSpendLedger(snipeDeepDailyCapUSD),
 		snipeBought:     newSnipeBoughtRecord(),
 		snipeBoxedLatch: newSnipeBoxedLatch(),
 		snipePositions:  &fakePositionSource{positions: cfg.positions, err: cfg.posErr},
@@ -617,36 +616,9 @@ func TestNotifySnipeAlertBuyFailureFallsBack(t *testing.T) {
 	}
 }
 
-// TestSnipeRefuseDeepBuy: the Deep Crash guard only buys inside
-// [SnipeDeepFloor, SnipeMinAsk) — ADR 0007's strict zone check.
-func TestSnipeRefuseDeepBuy(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name   string
-		ask    float64
-		ok     bool
-		refuse bool
-	}{
-		{"mid-zone buys", 0.02, true, false},
-		{"exactly at the floor buys", live.SnipeDeepFloor, true, false},
-		{"just above the zone refuses (in-band territory)", live.SnipeMinAsk, true, true},
-		{"bounced out refuses", 0.08, true, true},
-		{"dust below the floor refuses", 0.004, true, true},
-		{"no ask refuses", 0, false, true},
-	}
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if got := snipeRefuseDeepBuy(tt.ask, tt.ok); got != tt.refuse {
-				t.Errorf("snipeRefuseDeepBuy(%v, %v) = %v, want %v", tt.ask, tt.ok, got, tt.refuse)
-			}
-		})
-	}
-}
-
 // TestSnipeDeepText: the Deep Crash body carries the term, both prices, the
-// multiple, and the corpse warning.
+// multiple, and the corpse warning — and, post-retirement (issue #105), no
+// longer implies a "system's stake" that no auto-buy places.
 func TestSnipeDeepText(t *testing.T) {
 	t.Parallel()
 	got := snipeDeepText("Will X win?", "X", 0.09, 0.02)
@@ -655,78 +627,36 @@ func TestSnipeDeepText(t *testing.T) {
 			t.Errorf("snipeDeepText missing %q in:\n%s", want, got)
 		}
 	}
-	bought := snipeDeepBoughtText("Will X win?", "X", 0.09, 0.02, snipeDeepBuyUSD, "ord-d1", 15)
-	for _, want := range []string{"$5 auto-bought", "ord-d1", "Deep pool left today: $15"} {
-		if !strings.Contains(bought, want) {
-			t.Errorf("snipeDeepBoughtText missing %q in:\n%s", want, bought)
-		}
+	if strings.Contains(got, "system's stake") {
+		t.Errorf("snipeDeepText must not imply a system stake (message truth) — the deep tier is alert-only:\n%s", got)
 	}
 }
 
-// TestNotifySnipeDeepCrash: the $5 executes from the deep pool behind the
-// strict zone guard, and each failure mode degrades to the manual Deep Crash
-// alert with a reason.
-func TestNotifySnipeDeepCrash(t *testing.T) {
+// TestNotifySnipeDeepCrashDMHonest (issue #105): the alert-only Deep Crash DM
+// carries the honest no-auto-buy line and must NOT claim or imply a buy — no
+// "Auto-buy skipped" (there is no auto-buy to skip) and no "auto-bought".
+func TestNotifySnipeDeepCrashDMHonest(t *testing.T) {
 	t.Parallel()
+	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.02, askOK: true, user: snipeWalletUser()})
 
-	t.Run("in-zone ask buys $5 from the deep pool", func(t *testing.T) {
-		t.Parallel()
-		h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.02, askOK: true, user: snipeWalletUser()})
-		h.bot.NotifySnipeDeepCrash(7, testSnipeMarket(), 0.45, 0.02, 0.09, 3*time.Minute)
+	h.bot.NotifySnipeDeepCrash(7, testSnipeMarket(), 0.45, 0.02, 0.09, 3*time.Minute)
 
-		if got := h.buys.count(); got != 1 {
-			t.Fatalf("buy calls = %d, want 1", got)
+	if got := h.buys.count(); got != 0 {
+		t.Fatalf("buy calls = %d, want 0 (deep tier is alert-only)", got)
+	}
+	sent := h.tg.sentAt(t, 0)
+	if !strings.Contains(sent.text, "alert-only") || !strings.Contains(sent.text, "no auto-buy at this depth") {
+		t.Errorf("deep DM missing the honest alert-only line:\n%s", sent.text)
+	}
+	for _, forbidden := range []string{"Auto-buy skipped", "auto-bought"} {
+		if strings.Contains(sent.text, forbidden) {
+			t.Errorf("deep DM must not contain %q (message truth):\n%s", forbidden, sent.text)
 		}
-		if c := h.buys.call(t, 0); c.amount != snipeDeepBuyUSD {
-			t.Errorf("deep buy amount = %v, want %v", c.amount, snipeDeepBuyUSD)
-		}
-		sent := h.tg.sentAt(t, 0)
-		if !strings.Contains(sent.text, "Deep Crash") || !strings.Contains(sent.text, "$5 auto-bought") {
-			t.Errorf("deep bought message wrong:\n%s", sent.text)
-		}
-		// The MAIN pool is untouched — full $50 still reservable.
-		if _, ok := h.bot.snipeSpend.reserve(7, snipeAutoBuyDailyCapUSD); !ok {
-			t.Error("deep buy consumed the main pool")
-		}
-	})
-
-	t.Run("bounced-out ask skips the buy with a reason", func(t *testing.T) {
-		t.Parallel()
-		h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.08, askOK: true, user: snipeWalletUser()})
-		h.bot.NotifySnipeDeepCrash(7, testSnipeMarket(), 0.45, 0.02, 0.09, time.Minute)
-
-		if got := h.buys.count(); got != 0 {
-			t.Fatalf("buy calls = %d, want 0 (zone guard)", got)
-		}
-		sent := h.tg.sentAt(t, 0)
-		if !strings.Contains(sent.text, "Deep Crash") || !strings.Contains(sent.text, "Auto-buy skipped") {
-			t.Errorf("deep skip message wrong:\n%s", sent.text)
-		}
-		// Refunded: the full deep pool remains.
-		if _, ok := h.bot.snipeDeepSpend.reserve(7, snipeDeepDailyCapUSD); !ok {
-			t.Error("deep pool not refunded after guard refusal")
-		}
-	})
-
-	t.Run("deep pool exhausts after four $5s and degrades with the cap note", func(t *testing.T) {
-		t.Parallel()
-		h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.02, askOK: true, user: snipeWalletUser()})
-		m := testSnipeMarket()
-		for i := 0; i < 4; i++ {
-			h.bot.NotifySnipeDeepCrash(7, m, 0.45, 0.02, 0.09, time.Minute)
-		}
-		if got := h.buys.count(); got != 4 {
-			t.Fatalf("buys before exhaustion = %d, want 4", got)
-		}
-		h.bot.NotifySnipeDeepCrash(7, m, 0.45, 0.02, 0.09, time.Minute)
-		if got := h.buys.count(); got != 4 {
-			t.Fatalf("buy past the deep pool executed")
-		}
-		sent := h.tg.sentAt(t, 4)
-		if !strings.Contains(sent.text, "Deep pool exhausted") {
-			t.Errorf("exhaustion message missing the deep cap note:\n%s", sent.text)
-		}
-	})
+	}
+	// The MAIN pool is never touched by a deep fire.
+	if _, ok := h.bot.snipeSpend.reserve(7, snipeAutoBuyDailyCapUSD); !ok {
+		t.Error("deep alert consumed the main pool")
+	}
 }
 
 // TestNotifySnipeAlertDailyCap: the fifth $10 auto-buy lands exactly on the

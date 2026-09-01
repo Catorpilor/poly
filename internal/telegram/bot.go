@@ -49,14 +49,13 @@ type Bot struct {
 	// maps short callback IDs to token/market info (token IDs are ~78 digits,
 	// far beyond Telegram's 64-byte callback data); spend ledger caps the v2
 	// auto-buys per UTC day.
-	snipeWatcher   snipeWatch
-	snipeFeed      SnipeAskSource
-	snipeAlerts    *snipeAlertRegistry
-	snipeSpend     *snipeSpendLedger
-	snipeDeepSpend *snipeSpendLedger
-	// snipeBought records tokens snipe-bought per recipient (in-band auto-buy
-	// or one-tap) — read by the Deep Crash holdings gate to avoid topping up a
-	// held corpse.
+	snipeWatcher snipeWatch
+	snipeFeed    SnipeAskSource
+	snipeAlerts  *snipeAlertRegistry
+	snipeSpend   *snipeSpendLedger
+	// snipeBought records tokens snipe-bought per recipient (in-band auto-buy,
+	// one-tap, or boxed tranche) — read by the boxed case-3 sibling gate to
+	// avoid laddering a flip a prior buy already funds.
 	snipeBought *snipeBoughtRecord
 	// snipeBoxedLatch records who was case-3 (postponed flip) at each in-band
 	// alert; the boxed ladder buys per tranche for latched recipients only
@@ -167,7 +166,6 @@ func NewBot(cfg *config.Config, db *database.DB) (*Bot, error) {
 		liveManager:     liveManager,
 		snipeAlerts:     newSnipeAlertRegistry(),
 		snipeSpend:      newSnipeSpendLedger(snipeAutoBuyDailyCapUSD),
-		snipeDeepSpend:  newSnipeSpendLedger(snipeDeepDailyCapUSD),
 		snipeBought:     newSnipeBoughtRecord(),
 		snipeBoxedLatch: newSnipeBoxedLatch(),
 	}

@@ -104,7 +104,6 @@ func futureGameHarness(t *testing.T, game2Prices string, game2Closed bool, event
 		snipeFeed:       &fakeAskSource{ask: 0.20, askOK: true, bid: 0.20, bidOK: true},
 		snipeAlerts:     newSnipeAlertRegistry(),
 		snipeSpend:      newSnipeSpendLedger(snipeAutoBuyDailyCapUSD),
-		snipeDeepSpend:  newSnipeSpendLedger(snipeDeepDailyCapUSD),
 		snipeBought:     newSnipeBoughtRecord(),
 		snipeBoxedLatch: newSnipeBoxedLatch(),
 		snipePositions:  &fakePositionSource{},
