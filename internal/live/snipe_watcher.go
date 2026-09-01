@@ -80,6 +80,14 @@ const (
 	snipeShadowCrashAsk = 0.15 // ask at or below this fires the shadow log
 )
 
+// snipeFavCollapseHigh splits the in-band alert cohort for the favorite-collapse
+// review (issue #107, September review proposal #2). Session-high ≥ 0.90
+// auto-taps are 0-for-3+ lifetime (r35 .945, r72 .960, r94 .955 all lost; r16 at
+// .880 WON — so the cut sits above .88), but the sample is too small for a hard
+// gate. LOG-ONLY — never gates, never notifies, exists so a future review can
+// decide a gate on production win-rate data instead of a four-row anecdote.
+const snipeFavCollapseHigh = 0.90
+
 // snipeResetConfirm is how long the ask must HOLD above snipeResetAsk before
 // the episode un-latches. A single tick above the reset level used to clear
 // the latch instantly — in a whipsawing thin book that re-alerted the same
@@ -863,6 +871,13 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		// pair is the see-saw signature.
 		log.Printf("SnipeWatcher: alert token=%.12s… high=%.3f ask=%.3f bid=%.3f impliedComplement=%.3f pairAlerted=%s recipients=%d",
 			tokenID, high, ask, bid, 1-ask, pairAgo, recipients)
+		// Favorite-collapse shadow split (issue #107, log-only): a session high
+		// that reached snipeFavCollapseHigh before crashing into the band is the
+		// 0-for-3+ anti-signal cohort. Rides the in-band alert fire (once per
+		// episode via the alerted latch) — never gates, never notifies.
+		if high >= snipeFavCollapseHigh {
+			log.Printf("SnipeWatcher: favorite-collapse token=%.12s… high=%.3f ask=%.3f", tokenID, high, ask)
+		}
 	}
 	if deepFire {
 		recipients := 0

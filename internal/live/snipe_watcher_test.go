@@ -971,6 +971,110 @@ func TestSnipeWatcher_EpisodeResetLogLine(t *testing.T) {
 	}
 }
 
+// TestSnipeWatcher_FavoriteCollapseLogLine pins the log-only favorite-collapse
+// split (issue #107, September review proposal #2): when an in-band alert fires
+// on a token whose session high reached snipeFavCollapseHigh (≥ 0.90), the
+// watcher emits exactly one additional "SnipeWatcher: favorite-collapse" line —
+// once per episode, never gating or notifying. It rides the in-band alert fire
+// only (never deep-crash, boxed, or shadow-dip) and re-fires per episode. Not
+// parallel: it redirects the global logger for the duration.
+func TestSnipeWatcher_FavoriteCollapseLogLine(t *testing.T) {
+	type step struct {
+		bid, ask float64
+		advance  time.Duration // clock advance BEFORE this observation
+	}
+	tests := []struct {
+		name       string
+		steps      []step
+		wantFav    int      // "SnipeWatcher: favorite-collapse" lines
+		wantAlerts int      // "SnipeWatcher: alert" lines (must stay unchanged)
+		favFields  []string // substrings the split line must carry (checked when wantFav >= 1)
+	}{
+		{
+			name: "high 0.945 crash fires one favorite-collapse split with correct fields",
+			steps: []step{
+				{bid: 0.945, ask: 0.95},
+				{bid: 0.10, ask: 0.17}, // in-band alert
+			},
+			wantFav:    1,
+			wantAlerts: 1,
+			favFields:  []string{"SnipeWatcher: favorite-collapse", "token=T1", "high=0.945", "ask=0.170"},
+		},
+		{
+			name: "high 0.880 crash logs no favorite-collapse split (the cut sits above 0.88)",
+			steps: []step{
+				{bid: 0.880, ask: 0.90},
+				{bid: 0.10, ask: 0.17}, // in-band alert, but sub-0.90 high
+			},
+			wantFav:    0,
+			wantAlerts: 1,
+		},
+		{
+			name: "boundary high exactly 0.90 emits the split (>= semantics)",
+			steps: []step{
+				{bid: 0.90, ask: 0.92},
+				{bid: 0.10, ask: 0.17}, // in-band alert
+			},
+			wantFav:    1,
+			wantAlerts: 1,
+			favFields:  []string{"high=0.900", "ask=0.170"},
+		},
+		{
+			name: "deep/boxed continuation in the same episode does not re-emit the split",
+			steps: []step{
+				{bid: 0.945, ask: 0.95},
+				{bid: 0.10, ask: 0.17}, // in-band alert → favorite-collapse #1
+				{bid: 0.01, ask: 0.02}, // deep + boxed zone, no new in-band fire
+			},
+			wantFav:    1,
+			wantAlerts: 1,
+		},
+		{
+			name: "bid-corroborated reset then re-crash emits a second split (per-episode)",
+			steps: []step{
+				{bid: 0.945, ask: 0.95},
+				{bid: 0.10, ask: 0.17},                                           // alert #1 → favorite-collapse #1
+				{bid: 0.32, ask: 0.34},                                           // corroborated recovery: streak starts
+				{bid: 0.32, ask: 0.34, advance: snipeResetConfirm + time.Second}, // held past confirm: resets
+				{bid: 0.08, ask: 0.16},                                           // alert #2 → favorite-collapse #2
+			},
+			wantFav:    2,
+			wantAlerts: 2,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			buf := &syncBuffer{}
+			log.SetOutput(buf)
+			t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+			w, _, rec, _, clock := snipeHarness()
+			rec.eventSubs["evt"] = []int64{101}
+			w.WatchEventMarkets("evt", []SnipeMarket{startedMarket("T1")})
+			for _, s := range tt.steps {
+				clock.advance(s.advance)
+				w.evaluate("T1", s.bid, s.ask)
+			}
+
+			out := buf.String()
+			if n := strings.Count(out, "SnipeWatcher: favorite-collapse"); n != tt.wantFav {
+				t.Errorf("favorite-collapse lines = %d, want %d; log:\n%s", n, tt.wantFav, out)
+			}
+			if n := strings.Count(out, "SnipeWatcher: alert"); n != tt.wantAlerts {
+				t.Errorf("alert lines = %d, want %d; log:\n%s", n, tt.wantAlerts, out)
+			}
+			if tt.wantFav >= 1 {
+				for _, want := range tt.favFields {
+					if !strings.Contains(out, want) {
+						t.Errorf("favorite-collapse log missing %q in:\n%s", want, out)
+					}
+				}
+			}
+		})
+	}
+}
+
 // TestSnipeWatcher_NoResetWhileDispatching: even a SUSTAINED above-reset
 // recovery observed while the alert is still being delivered must not
 // un-latch the episode (issue #50 belt-and-braces) — but once delivery
