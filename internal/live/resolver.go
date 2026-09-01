@@ -78,6 +78,37 @@ func GameNumber(question string) int {
 
 var gameWinnerRe = regexp.MustCompile(`(?i)(?:game|map)\s+(\d+)\s+winner`)
 
+// periodTotalPropMarkers is the extensible marker set that identifies a
+// period/total prop (an Over/Under sub-market). September review proposal #3
+// ("corpse-by-clock"): a period/total prop that crashes on the game clock is
+// structurally unrecoverable — the goals already conceded cannot be un-printed
+// by the remaining time — so the snipe watcher must never alert on it (the Celta
+// 1st-Half O/U specimen). Spread props are deliberately absent: a one-goal swing
+// still flips a spread, so they stay alertable. Extend by appending a marker.
+var periodTotalPropMarkers = []string{"O/U", "Over/Under"}
+
+// periodTotalPropRe matches any marker as a whole token: word boundaries, each
+// marker QuoteMeta'd. Word boundaries — never Contains — keep a marker from
+// matching inside a larger word (the 2026-08-14 short-marker lesson:
+// "over/under" must not false-match "Takeover/Underdog").
+var periodTotalPropRe = buildMarkerRe(periodTotalPropMarkers)
+
+func buildMarkerRe(markers []string) *regexp.Regexp {
+	quoted := make([]string, len(markers))
+	for i, m := range markers {
+		quoted[i] = regexp.QuoteMeta(m)
+	}
+	return regexp.MustCompile(`(?i)\b(?:` + strings.Join(quoted, "|") + `)\b`)
+}
+
+// PeriodTotalProp reports whether question is a period/total Over/Under prop —
+// the snipe watcher's log-only, never-alerted class (September review proposal
+// #3). Case-insensitive, word-boundary matched against periodTotalPropMarkers.
+// Pure — table-tested.
+func PeriodTotalProp(question string) bool {
+	return periodTotalPropRe.MatchString(question)
+}
+
 func isSubMarketQuestion(question string) bool {
 	questionLower := strings.ToLower(question)
 	for _, keyword := range subMarketKeywords {

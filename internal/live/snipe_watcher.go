@@ -186,6 +186,13 @@ type snipeTokenState struct {
 	sessionHigh float64
 	alerted     bool
 	bought      bool
+	// propGated stamps the period/total prop (O/U) class once per token state
+	// (PeriodTotalProp over the market question, in ensureStateLocked). Such a
+	// prop decays on the game clock and is structurally unrecoverable (September
+	// review proposal #3, "corpse-by-clock"), so its in-band fire sets the episode
+	// latches like any alert but NEVER dispatches — no in-band alert, no deep DM,
+	// no boxed rung — and emits only a log-only prop-gated line.
+	propGated bool
 	// resetSince is when the current above-reset recovery streak began; zero
 	// when none is running. The episode un-latches only once the streak spans
 	// snipeResetConfirm (issue #50).
@@ -582,6 +589,7 @@ func (w *SnipeWatcher) ensureStateLocked(m SnipeMarket) *snipeTokenState {
 	st, ok := w.tokens[m.TokenID]
 	if !ok {
 		st = newSnipeTokenState(m)
+		st.propGated = PeriodTotalProp(m.Question)
 		w.tokens[m.TokenID] = st
 		// Apply a pending bought mark (issue #84): a restored buy latched this
 		// token before it was watched. Latch it now so the first in-band re-alert
@@ -603,6 +611,7 @@ func (w *SnipeWatcher) ensureStateLocked(m SnipeMarket) *snipeTokenState {
 	}
 	if st.market.Question == "" {
 		st.market.Question = m.Question
+		st.propGated = PeriodTotalProp(m.Question)
 	}
 	if st.market.Outcome == "" {
 		st.market.Outcome = m.Outcome
@@ -778,17 +787,25 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		ask >= SnipeMinAsk && ask <= SnipeCrashAsk &&
 		w.inPlay(st.market, now)
 	var pairAgo string
+	// propGatedFire marks an in-band fire on a period/total prop (September review
+	// proposal #3): the episode latches are set exactly as an alert would set them
+	// — so once-per-episode and reset semantics are identical — but no dispatch
+	// happens (no dispatching flag, no recipient resolution, no notifier call) and
+	// the fire emits only a log-only prop-gated line.
+	propGatedFire := fire && st.propGated
 	if fire {
 		st.alerted = true
-		st.dispatching = true
 		st.lastAlertAt = now
 		st.alertAsk = ask
 		st.deepAlerted = false
 		st.boxed1Alerted = false
 		st.boxed2Alerted = false
-		pairAgo = "never"
-		if at, ok := w.pairLastAlertLocked(st.market.MarketID, tokenID); ok {
-			pairAgo = now.Sub(at).Round(time.Second).String()
+		if !propGatedFire {
+			st.dispatching = true
+			pairAgo = "never"
+			if at, ok := w.pairLastAlertLocked(st.market.MarketID, tokenID); ok {
+				pairAgo = now.Sub(at).Round(time.Second).String()
+			}
 		}
 	}
 
@@ -796,7 +813,7 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 	// live-panic evidence), fires once, ignores bought — the $10 usually
 	// already bought and the dip is the top-up moment. Zones are disjoint, so
 	// fire and deepFire are mutually exclusive.
-	deepFire := st.alerted && !st.deepAlerted && !st.dispatching && !fire &&
+	deepFire := st.alerted && !st.propGated && !st.deepAlerted && !st.dispatching && !fire &&
 		ask >= SnipeDeepFloor && ask < SnipeMinAsk &&
 		w.inPlay(st.market, now)
 	var sinceAlert time.Duration
@@ -821,7 +838,7 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 	// its postponed flip. !dispatching keeps the ladder exclusive with
 	// fire/deepFire within a single evaluate; across ticks it fires on the next
 	// one (a straight-to-deep crash offers the flip on the tick after deep).
-	boxedZone := st.alerted && !st.dispatching && !fire && !deepFire &&
+	boxedZone := st.alerted && !st.propGated && !st.dispatching && !fire && !deepFire &&
 		ask >= SnipeDeepFloor && w.inPlay(st.market, now)
 	boxed1Fire := boxedZone && !st.boxed1Alerted && ask <= SnipeBoxedMaxAsk
 	boxed2Fire := boxedZone && !st.boxed2Alerted && ask <= SnipeBoxedDeepAsk
@@ -852,7 +869,7 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 	boxedFire := boxed1Fire || boxed2Fire
 	var eventSlugs []string
 	var holders []int64
-	if fire || deepFire || boxedFire {
+	if (fire && !propGatedFire) || deepFire || boxedFire {
 		for slug := range st.events {
 			eventSlugs = append(eventSlugs, slug)
 		}
@@ -862,7 +879,13 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 	}
 	w.mu.Unlock()
 
-	if fire {
+	if propGatedFire {
+		// Period/total prop (September review proposal #3): log-only, never
+		// dispatched. The episode latches are already set; this is the single
+		// house-style line that replaces the whole alert cascade for the class.
+		log.Printf("SnipeWatcher: prop-gated token=%.12s… high=%.3f ask=%.3f q=%q",
+			tokenID, high, ask, market.Question)
+	} else if fire {
 		recipients := w.dispatch(market, high, ask, eventSlugs, holders)
 		// bid/impliedComplement/pairAlerted are log-only instrumentation for
 		// the corpse-filter review: complement bid is mechanically 1-ask on
@@ -898,7 +921,7 @@ func (w *SnipeWatcher) evaluate(tokenID string, bid, ask float64) {
 		log.Printf("SnipeWatcher: shadow-alert class=underdog-dip token=%.12s… high=%.3f ask=%.3f bid=%.3f impliedComplement=%.3f",
 			tokenID, high, ask, bid, 1-ask)
 	}
-	if fire || deepFire || boxedFire {
+	if (fire && !propGatedFire) || deepFire || boxedFire {
 		w.mu.Lock()
 		if st := w.tokens[tokenID]; st != nil {
 			st.dispatching = false
