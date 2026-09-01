@@ -1448,10 +1448,10 @@ func (b *Bot) snipeAutoBuyExec(ctx context.Context, chatID int64, user *database
 			chatID, market.TokenID, res.outcome, res.err, res.errorMsg)
 		return res, 0, snipeAutoSkipped
 	}
-	// Record the holding so a later Deep Crash fire on this token is
-	// holdings-gated (Gate 3a). Only the in-band auto-buy, one-tap, and boxed
-	// tranches feed this record — never the deep tier itself. mark also writes
-	// the durable buy row (pool 'main', this stake) when a store is wired (#84).
+	// Record the holding — the boxed case-3 sibling gate and restart restore
+	// read this record (the deep holdings gate it once fed retired with the
+	// deep auto-buy, #105). mark also writes the durable buy row (pool 'main',
+	// this stake) when a store is wired (#84).
 	if b.snipeBought != nil {
 		b.snipeBought.mark(chatID, market.TokenID, amount)
 	}
@@ -1700,9 +1700,9 @@ func (b *Bot) handleSnipeCallback(ctx context.Context, update *tgbotapi.Update) 
 			"❌ *Snipe failed*\n\n*Market:* %s\n*Error:* %s",
 			question, res.errorMsg))
 	case snipeBuyFilled:
-		// Record the holding so a later Deep Crash fire on this token is
-		// holdings-gated (Gate 3a), same as the in-band auto-buy. mark also writes
-		// the durable buy row (pool 'main', this tap's stake) when wired (#84).
+		// Record the holding — boxed case-3 gating and restore read it, same as
+		// the in-band auto-buy (#105 retired the deep gate it once fed). mark
+		// also writes the durable buy row (pool 'main', this tap's stake) (#84).
 		if b.snipeBought != nil {
 			b.snipeBought.mark(chatID, entry.tokenID, amount)
 		}

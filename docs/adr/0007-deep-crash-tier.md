@@ -4,7 +4,12 @@ Date: 2026-08-07
 
 ## Status
 
-Accepted
+Superseded in part by issue #105 (2026-09-01): the $5 auto-buy and its
+daily pool were retired after the September review scored the tier
+0-for-13 (−$64.73) — the tier is now alert-only (DM + tap buttons). The
+detection design below (prior-alert gate, zone bounds, corpse floor,
+once-per-episode fire) remains accepted and live; only the "auto-buys a
+fixed $5 from a separate, smaller daily pool" clause no longer applies.
 
 ## Context
 
