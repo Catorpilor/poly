@@ -13,10 +13,11 @@ import (
 // capturingHeldWatch records the full WatchHeld call (chatID, market, ttl) and
 // flags any MarkBought — the direct-register helper must never latch bought.
 type capturingHeldWatch struct {
-	mu     sync.Mutex
-	calls  []heldWatchCall // WatchHeld (direct) calls
-	walked []heldWatchCall // WatchWalked (series-walked) calls (issue #102)
-	bought []string
+	mu         sync.Mutex
+	calls      []heldWatchCall // WatchHeld (direct) calls, WatchBought included
+	boughtSide []string        // WatchBought token IDs (bought-side mark, issue #111)
+	walked     []heldWatchCall // WatchWalked (series-walked) calls (issue #102)
+	bought     []string
 }
 
 type heldWatchCall struct {
@@ -27,7 +28,7 @@ type heldWatchCall struct {
 
 func (c *capturingHeldWatch) WatchArmed(live.SnipeMarket) {}
 func (c *capturingHeldWatch) UnwatchArmed(string)         {}
-func (c *capturingHeldWatch) RenewHeldMarket(int64, string, time.Duration) bool {
+func (c *capturingHeldWatch) RenewHeldMarket(int64, string, time.Duration, bool) bool {
 	return false
 }
 func (x *capturingHeldWatch) EventSlugOf(string) string { return "" }
@@ -42,6 +43,22 @@ func (c *capturingHeldWatch) WatchWalked(chatID int64, m live.SnipeMarket, ttl t
 	c.mu.Unlock()
 }
 func (c *capturingHeldWatch) WalkedOnlyHolder(int64, string) bool { return false }
+
+// WatchBought is a direct registration plus the bought-side mark (issue #111):
+// it records in calls (it IS a direct watch) and in boughtSide.
+func (c *capturingHeldWatch) WatchBought(chatID int64, m live.SnipeMarket, ttl time.Duration) {
+	c.mu.Lock()
+	c.calls = append(c.calls, heldWatchCall{chatID: chatID, market: m, ttl: ttl})
+	c.boughtSide = append(c.boughtSide, m.TokenID)
+	c.mu.Unlock()
+}
+func (c *capturingHeldWatch) Holds(int64, string) bool { return false }
+
+func (c *capturingHeldWatch) boughtSideTokens() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.boughtSide...)
+}
 func (c *capturingHeldWatch) MarkBought(tokenID string) {
 	c.mu.Lock()
 	c.bought = append(c.bought, tokenID)

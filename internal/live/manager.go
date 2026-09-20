@@ -603,8 +603,15 @@ func (m *LiveTradeManager) RegisterHeldBuy(telegramID int64, eventSlug, tokenID 
 	// composes: a later buy of a continuation's own market re-registers it DIRECT
 	// (bought branch) and the re-walk of the now-held earlier market never
 	// downgrades it.
+	// Bought-side mark (issue #111): tokenID names the token the buyer now owns,
+	// so it registers via WatchBought. Its market sibling is a watch, not a
+	// holding — marking it would gate the case-3 flip buy the sibling watch
+	// exists for.
 	for _, sm := range sms {
 		switch {
+		case sm.TokenID == tokenID:
+			sm.EventSlug = eventSlug
+			m.snipeWatcher.WatchBought(telegramID, sm, SnipeHeldTTL)
 		case sm.MarketID == marketID:
 			sm.EventSlug = eventSlug
 			m.snipeWatcher.WatchHeld(telegramID, sm, SnipeHeldTTL)

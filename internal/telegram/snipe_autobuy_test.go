@@ -233,8 +233,10 @@ type fakeSnipeWatch struct {
 	bought     []string
 	armed      []live.SnipeMarket
 	held       []live.SnipeMarket // WatchHeld (direct) registrations
+	boughtSide []live.SnipeMarket // WatchBought (bought-side mark) registrations (issue #111)
 	walked     []live.SnipeMarket // WatchWalked (series-walked) registrations (issue #102)
 	walkedOnly map[string]bool    // tokenIDs for which WalkedOnlyHolder returns true
+	holds      map[string]bool    // tokenIDs for which Holds returns true (issue #111)
 	siblings   []string           // returned by SiblingTokenIDs (boxed case-3 tests)
 }
 
@@ -254,6 +256,48 @@ func (f *fakeSnipeWatch) WatchWalked(_ int64, m live.SnipeMarket, _ time.Duratio
 	f.mu.Lock()
 	f.walked = append(f.walked, m)
 	f.mu.Unlock()
+}
+
+// WatchBought is a DIRECT registration that also carries the bought-side mark
+// (issue #111), so it records as both — production's Holds answers true for it.
+func (f *fakeSnipeWatch) WatchBought(_ int64, m live.SnipeMarket, _ time.Duration) {
+	f.mu.Lock()
+	f.held = append(f.held, m)
+	f.boughtSide = append(f.boughtSide, m)
+	delete(f.walkedOnly, m.TokenID) // direct always wins
+	f.markHoldsLocked(m.TokenID)
+	f.mu.Unlock()
+}
+
+func (f *fakeSnipeWatch) Holds(_ int64, tokenID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.holds[tokenID]
+}
+
+// markHolds makes Holds report tokenID as a live holding — the seam the
+// holdings gate's tier `held` tests drive (issue #111).
+func (f *fakeSnipeWatch) markHolds(tokenID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.markHoldsLocked(tokenID)
+}
+
+func (f *fakeSnipeWatch) markHoldsLocked(tokenID string) {
+	if f.holds == nil {
+		f.holds = make(map[string]bool)
+	}
+	f.holds[tokenID] = true
+}
+
+func (f *fakeSnipeWatch) boughtSideTokens() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.boughtSide))
+	for _, m := range f.boughtSide {
+		out = append(out, m.TokenID)
+	}
+	return out
 }
 func (f *fakeSnipeWatch) WalkedOnlyHolder(_ int64, tokenID string) bool {
 	f.mu.Lock()
@@ -289,8 +333,8 @@ func (f *fakeSnipeWatch) walkedTokens() []string {
 	}
 	return out
 }
-func (f *fakeSnipeWatch) RenewHeldMarket(int64, string, time.Duration) bool { return true }
-func (f *fakeSnipeWatch) EventSlugOf(string) string                         { return "" }
+func (f *fakeSnipeWatch) RenewHeldMarket(int64, string, time.Duration, bool) bool { return true }
+func (f *fakeSnipeWatch) EventSlugOf(string) string                               { return "" }
 
 func (f *fakeSnipeWatch) MarkBought(tokenID string) {
 	f.mu.Lock()
@@ -668,6 +712,12 @@ func TestNotifySnipeAlertDailyCap(t *testing.T) {
 	now := time.Date(2026, 8, 4, 23, 30, 0, 0, time.UTC)
 	h.bot.snipeSpend.now = func() time.Time { return now }
 	m := testSnipeMarket()
+	// Each alert below stands for a DIFFERENT alerted token — this harness can
+	// only buy the one market it serves. Without the bought record the holdings
+	// gate (issue #111) has no evidence, so the daily cap stays the only limiter,
+	// which is what this test is about. (In production a token that was just
+	// bought never re-alerts anyway: the watcher latches it bought.)
+	h.bot.snipeBought = nil
 
 	for i := 0; i < 5; i++ {
 		h.bot.NotifySnipeAlert(7, m, 0.45, 0.17)
@@ -707,6 +757,10 @@ func TestNotifySnipeAlertCapConcurrencySafe(t *testing.T) {
 	t.Parallel()
 	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.17, askOK: true, user: snipeWalletUser()})
 	m := testSnipeMarket()
+	// As in TestNotifySnipeAlertDailyCap: the racing alerts stand for distinct
+	// tokens, so the holdings gate (issue #111) is given no evidence and the cap
+	// ledger is what races. Assigned before any goroutine starts.
+	h.bot.snipeBought = nil
 
 	const alerts = 10
 	var wg sync.WaitGroup
