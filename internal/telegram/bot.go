@@ -1530,13 +1530,20 @@ Please wait...`, marketName, outcomeName, amount, limitPrice))
 
 	// Show result
 	if result.Success {
-		// Register the bought token as a Held Watch directly from the market
-		// (issue #67), lag-free. A resting limit isn't a position yet, but
-		// registering the held watch immediately is strictly better: it's
-		// TTL-bounded, and these market-adjacent limits usually fill near-
-		// immediately — a fill-then-crash can't slip past the watch. The
-		// positions refetch stays as secondary rescue for older holdings (#64).
-		b.snipeRegisterBoughtToken(chatID, market, outcomeIndex)
+		// Register both sides as a Held Watch directly from the market (issue
+		// #67), lag-free. A resting limit isn't a position yet, but registering
+		// the watch immediately is strictly better: it's TTL-bounded, and these
+		// market-adjacent limits usually fill near-immediately — a fill-then-crash
+		// can't slip past the watch. It registers NO bought-side mark though
+		// (issue #111): an order that never fills must not gate the auto-buy on a
+		// token the user doesn't own. The positions refetch below is the secondary
+		// rescue, and it marks once the fill is real.
+		//
+		// KEEP THE RESTING VARIANT HERE: a resting order is not a holding (issue
+		// #111), and this call site has no test harness to catch a "simplifying"
+		// swap back to snipeRegisterBoughtToken, which would holdings-gate the
+		// $10 auto-buy for 6h on a token that may never fill.
+		b.snipeRegisterRestingOrder(chatID, market, outcomeIndex)
 		go b.snipeRegisterHeldForUser(chatID, common.HexToAddress(user.ProxyAddress))
 		message := fmt.Sprintf(`✅ *Limit Buy Order Placed!*
 

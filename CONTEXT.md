@@ -202,10 +202,15 @@ episode — see Deep Crash. v2 (issue #45): on every genuine alert the bot insta
 auto-buys a fixed $10 for the recipient through the guarded buy path
 (fresh-ask repricing guard ≤ 0.30), bounded by a $50-per-user-per-UTC-day
 in-memory cap (a restart resets it — soft rail). Since 2026-08-14 the
-auto-buy is gated twice: esports markets only (marker allowlist;
-non-esports and unclassifiable ⇒ alert-only — tennis went 0/5, every
-winner was esports), and skipped on corpse spread (fresh best bid below
-a third of the fresh ask — the decided-game signature). The alert then
+auto-buy is gated by sport and by spread: esports markets only (marker
+allowlist; non-esports and unclassifiable ⇒ alert-only — tennis went
+0/5, every winner was esports), and skipped on corpse spread (fresh best
+bid below a third of the fresh ask — the decided-game signature). Since
+2026-09-20 (v0.26.0, #111) it is also holdings-gated: a recipient who already holds the
+alerted token — bought on any surface, any earlier tranche, with or
+without an Arm — gets alert-only with the tap buttons; topping up a held
+position is the human's call, never the machine's (auto top-ups went
+2-for-21, −$86, against ≈20% on fresh entries). The alert then
 offers a one-tap Add $25 top-up riding the same alert entry; any
 auto-buy failure or gate skip (cap, guard, sport, spread, no wallet,
 CLOB) falls back to the unchanged manual alert with one-tap buy
@@ -245,11 +250,16 @@ which it is not: a Deep Crash doubles down on the same side; a Lottery
 Ticket buys the opposite side after our own ceiling exit.
 
 **Boxed Snipe** — The case-3 variant of the Comeback Snipe (2026-08-15):
-when the alert's recipient already holds the OPPOSITE side of the
+when the alert's recipient holds ONLY the OPPOSITE side of the
 market, the in-band $10 is postponed — the watcher re-offers the token
 once per episode when its ask reaches the deep flip zone (≤ $0.10,
 mirroring the held side's $0.95 ceiling), and only then buys. Holding
-the crashed side (case 1) or nothing (case 2) buys at the normal band.
+nothing (case 2) buys at the normal band; holding the crashed side
+(case 1, with or without the other side) is holdings-gated to
+alert-only — the ladder is for a flip you do not yet hold, never a
+deeper top-up of one you do. The ladder's own rung fires are not
+holdings-checked: rung 2 by construction lands on the token rung 1
+just bought.
 Alerts and tap buttons always deliver; a boxed-waited alert says so.
 Deliberate regime bet: pre-auto-arm, case-3 taps at ~0.20 were the
 ledger's best subclass; with the held side now ceiling-harvested, the
@@ -262,9 +272,12 @@ with the snipe watcher, making that user a full alert recipient — pings
 positions are sighted (positions and SL/TP views) and on every
 successful BUY on any surface (web or Telegram); each sighting renews
 the TTL, which lapses 6 hours after the last renewal. In-memory only:
-unlike an Arm or a Live Watch it does not survive a restart. A plain buy
-never sets the token's bought latch — only a snipe alert buy (auto or
-one-tap) does.
+unlike an Arm or a Live Watch it does not survive a restart. A buy
+registers both sides of its market (the flip side is the sibling
+watch) but remembers which side was actually bought; that memory is
+the holdings gate's lag-free evidence, ahead of Arms and the positions
+API. A plain buy never sets the token's bought latch — only a snipe
+alert buy (auto or one-tap) does.
 _Avoid_: holder registration, held-token watch
 
 **Live Watch** — A durable, per-user subscription to an event: it drives

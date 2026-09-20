@@ -204,14 +204,18 @@ func TestSnipeAutoArmInBand(t *testing.T) {
 }
 
 // TestSnipeAutoArmNoClobber: an existing arm is never overwritten by the
-// auto-arm — no ArmTPOnly call, no error, buy unaffected.
+// auto-arm — no ArmTPOnly call, no error, buy unaffected. Driven through the
+// TAP (taps are never gated): since issue #111 an existing arm row is holding
+// evidence, so the in-band auto-buy never reaches the arm ceremony.
 func TestSnipeAutoArmNoClobber(t *testing.T) {
 	t.Parallel()
 	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.20, askOK: true, user: snipeWalletUser()})
-	repo := &recordingArmRepo{existing: &database.SLTPArm{ID: 99, TelegramID: 7, TokenID: testSnipeMarket().TokenID}}
+	m := testSnipeMarket()
+	repo := &recordingArmRepo{existing: &database.SLTPArm{ID: 99, TelegramID: 7, TokenID: m.TokenID}}
 	h.bot.sltpArmRepo = repo
+	alertID := h.bot.snipeAlerts.add(m)
 
-	h.bot.NotifySnipeAlert(7, testSnipeMarket(), 0.45, 0.20)
+	h.bot.handleSnipeCallback(context.Background(), snipeTapUpdate(7, "snipe:"+alertID+":10"))
 
 	if got := h.buys.count(); got != 1 {
 		t.Fatalf("buy calls = %d, want 1", got)

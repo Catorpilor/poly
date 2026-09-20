@@ -128,7 +128,7 @@ func TestRenewHeldMarket_PreservesClass(t *testing.T) {
 	w.WatchWalked(7, mk("walked", "m-walked", "ev-1"), time.Hour)
 
 	clock.advance(30 * time.Minute)
-	if !w.RenewHeldMarket(7, "held", time.Hour) {
+	if !w.RenewHeldMarket(7, "held", time.Hour, true) {
 		t.Fatal("RenewHeldMarket returned false for a watched token")
 	}
 
@@ -180,7 +180,7 @@ func TestRenewHeldMarket_AddedHolderDefaultsByGroup(t *testing.T) {
 	w.WatchHeld(9, mk("ml-b", "ml", "ev-1"), time.Hour)
 	w.WatchHeld(9, mk("g3-a", "g3", "ev-1"), time.Hour)
 
-	if !w.RenewHeldMarket(7, "ml-a", time.Hour) {
+	if !w.RenewHeldMarket(7, "ml-a", time.Hour, true) {
 		t.Fatal("RenewHeldMarket returned false for a watched token")
 	}
 

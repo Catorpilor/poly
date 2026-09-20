@@ -80,10 +80,19 @@ func TestSnipeTapUpgradesWalkedMarket(t *testing.T) {
 		t.Error("tap success did not register the bought market as held")
 	}
 
-	// A subsequent qualifying crash now auto-buys — the gate no longer fires.
+	// A subsequent qualifying crash is no longer SERIES-WALKED — but the tap made
+	// the recipient a holder, so the holdings gate (issue #111) keeps it
+	// alert-only: the upgrade changed the skip class, not the wallet.
 	h.bot.NotifySnipeAlert(7, m, 0.45, 0.17)
-	if got := h.buys.count(); got != 2 {
-		t.Fatalf("post-upgrade buys = %d, want 2 (upgraded market auto-buys, no series-walked skip)", got)
+	if got := h.buys.count(); got != 1 {
+		t.Fatalf("post-upgrade buys = %d, want still 1 (no top-up of the tapped holding)", got)
+	}
+	post := h.tg.sentAt(t, 1)
+	if !strings.Contains(post.text, "you already hold this token") {
+		t.Errorf("post-tap alert must be holdings-gated:\n%s", post.text)
+	}
+	if strings.Contains(post.text, "continuations are alert-only") {
+		t.Errorf("post-tap alert must no longer be series-walked:\n%s", post.text)
 	}
 }
 

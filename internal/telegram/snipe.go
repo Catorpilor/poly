@@ -33,6 +33,13 @@ type snipeWatch interface {
 	WatchArmed(m live.SnipeMarket)
 	UnwatchArmed(tokenID string)
 	WatchHeld(chatID int64, m live.SnipeMarket, ttl time.Duration)
+	// WatchBought registers the token the chat ACTUALLY bought/holds (issue
+	// #111): a direct held watch that also carries the bought-side mark Holds
+	// reads. Siblings and continuations stay on WatchHeld/WatchWalked.
+	WatchBought(chatID int64, m live.SnipeMarket, ttl time.Duration)
+	// Holds reports whether chatID owns tokenID per a live bought-side mark —
+	// the holdings gate's lag-free tier (issue #111).
+	Holds(chatID int64, tokenID string) bool
 	// WatchWalked registers a series-walked held watch (issue #102): alert-only,
 	// no auto-buy at either tier. A later direct WatchHeld upgrades it; the
 	// hourly re-walk never downgrades a direct entry.
@@ -47,7 +54,9 @@ type snipeWatch interface {
 	// RenewHeldMarket extends the holder TTL for the token AND its watched
 	// siblings (issue #78), so a position refresh keeps both sides of a held
 	// market alive. False ⇒ unwatched, caller must WatchHeld with metadata.
-	RenewHeldMarket(chatID int64, tokenID string, ttl time.Duration) bool
+	// held marks the anchor bought-side only when the caller saw real shares
+	// (issue #111) — zero-share rows renew the watch without claiming a holding.
+	RenewHeldMarket(chatID int64, tokenID string, ttl time.Duration, held bool) bool
 	MarkBought(tokenID string)
 	// SiblingTokenIDs returns other watched token IDs in the same market — the
 	// boxed tier's case-3 sibling lookup.
@@ -591,7 +600,12 @@ func snipeSkipNote(res snipeBuyResult) string {
 		reason = "this isn't an esports market (auto-buy is esports-only)"
 	case snipeBuyCorpseSpread:
 		reason = "the book shows a decided-game spread (fresh bid far below ask)"
-	case snipeBuyDeepHeld:
+	case snipeBuyAlreadyHeld:
+		// Issue #111: the recipient already holds the alerted token (bought record,
+		// bought-side mark, arm, or an open position), so the in-band $10 would be
+		// a top-up — 2W/19L, −$85.86 in the September ledger. Copy inherited from
+		// the retired deep tier. (The template appends "— tap below if you still
+		// want it.")
 		reason = "you already hold this token — not topping up a held position"
 	case snipeBuyBoxedWait:
 		reason = "you hold the other side — laddering the flip deep ($5 at ≤ $0.10 + $5 at ≤ $0.05)"
@@ -902,14 +916,121 @@ func (b *Bot) NotifySnipeDeepCrash(chatID int64, market live.SnipeMarket, sessio
 	b.sendMessageWithKeyboard(chatID, text, snipeKeyboard(alertID))
 }
 
+// snipePositionsFunc is a memoized read of one user's Data API positions. The
+// alert path builds ONE per alert (snipePositionsOnce) and shares it between the
+// holdings gate and the case-3 sibling check, so a single crash never costs two
+// positions round-trips (issue #111).
+type snipePositionsFunc func() ([]*polymarket.Position, error)
+
+// snipePositionsOnce returns the alert path's shared lazy positions read: the
+// first caller pays the Data API round-trip, later callers get the same slice
+// (or the same error). No proxy wallet ⇒ nothing to read, no call. Not
+// concurrency-critical — the alert path is sequential — but sync.Once keeps it
+// honest if that ever changes.
+func (b *Bot) snipePositionsOnce(ctx context.Context, user *database.User) snipePositionsFunc {
+	var (
+		once      sync.Once
+		positions []*polymarket.Position
+		err       error
+	)
+	return func() ([]*polymarket.Position, error) {
+		once.Do(func() {
+			if user == nil || user.ProxyAddress == "" {
+				return
+			}
+			scanner := b.snipePositions
+			if scanner == nil {
+				scanner = polymarket.NewUnifiedPositionScanner()
+			}
+			positions, err = scanner.GetPositions(ctx, common.HexToAddress(user.ProxyAddress))
+		})
+		return positions, err
+	}
+}
+
+// Holdings-gate tiers (issue #111), cheapest first — `via` names the tier that
+// hit in the skip log, so the October review can score skips per evidence
+// source. snipeHoldViaArmSL is the one tier hit that keeps the #86 manual-armed
+// outcome and copy instead of the generic already-held one.
+const (
+	snipeHoldViaBought    = "bought"
+	snipeHoldViaHeld      = "held"
+	snipeHoldViaArm       = "arm"
+	snipeHoldViaArmSL     = "arm-sl"
+	snipeHoldViaPositions = "positions"
+)
+
+// snipeHoldsAlerted reports whether chatID already holds the ALERTED (crashed)
+// token, from any source — bot buy, web buy, manual tap, pre-restart position —
+// and names the tier that proved it. The in-band $10 is a TOP-UP in that case,
+// and top-ups of a held token were 2W/19L (−$85.86) in the September ledger
+// (issue #111), so the caller converts the buy into an alert-only DM.
+//
+// Tiers, cheapest first, first hit wins:
+//
+//	a. bought    — the in-memory snipe bought record (lag-free, this session).
+//	b. held      — the watcher's bought-side mark (every buy/positions path that
+//	               registers a Held Watch stamps the token it actually bought).
+//	c. arm       — ANY sltp_arms row on the alerted token (a row exists only
+//	               because the user held it; ClearTP leaves tp_armed=FALSE rows
+//	               behind a partially sold position). An ACTIVE manual
+//	               stop keeps the #86 manual-armed class (its own copy: the buy
+//	               would be stop-sold moments later or ride unprotected — DK G2
+//	               bought 0.26 under a 0.464 stop that fired); a TP-only auto-arm is
+//	               a holding like any other and now gates too (reversing v0.21.2's
+//	               free top-up). A read error logs and falls through — this is a
+//	               guard, not a dependency.
+//	d. positions — the shared Data API read, matched by TOKEN ID with Shares > 0
+//	               (dust counts). A read error logs and fails OPEN: the buy
+//	               proceeds exactly as before the gate existed.
+//
+// Scope is the alerted token ONLY. Holding a SIBLING is case 3 (the boxed
+// ladder), which the caller decides after this returns false.
+func (b *Bot) snipeHoldsAlerted(ctx context.Context, chatID int64, market live.SnipeMarket, positions snipePositionsFunc) (string, bool) {
+	if b.snipeBought != nil && b.snipeBought.held(chatID, market.TokenID) { // (a)
+		return snipeHoldViaBought, true
+	}
+	if b.snipeWatcher != nil && b.snipeWatcher.Holds(chatID, market.TokenID) { // (b)
+		return snipeHoldViaHeld, true
+	}
+	if b.sltpArmRepo != nil { // (c)
+		arm, err := b.sltpArmRepo.GetByUserAndToken(ctx, chatID, market.TokenID)
+		switch {
+		case err != nil:
+			log.Printf("Snipe auto-buy: holdings gate arm read FAILED chat=%d token=%.12s…: %v — falling through to positions",
+				chatID, market.TokenID, err)
+		case arm != nil && arm.SLArmed:
+			return snipeHoldViaArmSL, true
+		case arm != nil:
+			// ANY row is holding evidence: it exists only because the user held the
+			// token, and ClearTP leaves a (false,false) row after the TP-only arm
+			// sells 25% while ~75% is still held. A genuine disarm DELETEs the row.
+			return snipeHoldViaArm, true
+		}
+	}
+	held, err := positions() // (d)
+	if err != nil {
+		log.Printf("Snipe auto-buy: holdings gate positions read FAILED chat=%d token=%.12s…: %v — failing open, buy proceeds",
+			chatID, market.TokenID, err)
+		return "", false
+	}
+	for _, pos := range held {
+		if pos.TokenID == market.TokenID && pos.Shares != nil && pos.Shares.Sign() > 0 {
+			return snipeHoldViaPositions, true
+		}
+	}
+	return "", false
+}
+
 // snipeHoldsSibling reports whether chatID already holds ANY OTHER token of the
 // same market as the alerted token ("case 3": e.g. holds the favorite at ~0.80
 // while the underdog crashed to 0.20). Sibling token IDs come from the watcher's
 // in-memory index — no Gamma round-trip in the alert path. Checked cheapest
 // first, first hit wins: (a) the in-memory bought record, (b) a live SL/TP arm,
-// (c) the positions API. A positions read failure is treated as NOT case-3 so
-// the buy proceeds normally — conservative toward existing behavior.
-func (b *Bot) snipeHoldsSibling(ctx context.Context, user *database.User, chatID int64, market live.SnipeMarket) bool {
+// (c) the positions API (the alert's shared read, issue #111). A positions read
+// failure is treated as NOT case-3 so the buy proceeds normally — conservative
+// toward existing behavior.
+func (b *Bot) snipeHoldsSibling(ctx context.Context, chatID int64, market live.SnipeMarket, positions snipePositionsFunc) bool {
 	if b.snipeWatcher == nil {
 		return false
 	}
@@ -931,22 +1052,16 @@ func (b *Bot) snipeHoldsSibling(ctx context.Context, user *database.User, chatID
 			}
 		}
 	}
-	return b.snipeHoldsSiblingPosition(ctx, user, siblings) // (c) positions API
+	return snipeHoldsSiblingPosition(positions, siblings) // (c) positions API
 }
 
-// snipeHoldsSiblingPosition reports whether the user's proxy holds shares of any
-// sibling token. Matches by TOKEN ID (a Data API position's MarketID is often
-// the 0x condition ID, not the numeric Gamma ID the alert carries, so token ID
-// is the reliable key). A read failure is not-case-3 (conservative).
-func (b *Bot) snipeHoldsSiblingPosition(ctx context.Context, user *database.User, siblings []string) bool {
-	if user.ProxyAddress == "" {
-		return false
-	}
-	scanner := b.snipePositions
-	if scanner == nil {
-		scanner = polymarket.NewUnifiedPositionScanner()
-	}
-	positions, err := scanner.GetPositions(ctx, common.HexToAddress(user.ProxyAddress))
+// snipeHoldsSiblingPosition reports whether the alert's shared positions read
+// shows shares of any sibling token. Matches by TOKEN ID (a Data API position's
+// MarketID is often the 0x condition ID, not the numeric Gamma ID the alert
+// carries, so token ID is the reliable key). A read failure is not-case-3
+// (conservative). Pure with respect to the bot — the fetch belongs to the alert.
+func snipeHoldsSiblingPosition(positions snipePositionsFunc, siblings []string) bool {
+	held, err := positions()
 	if err != nil {
 		log.Printf("Snipe boxed: sibling positions read failed: %v", err)
 		return false
@@ -955,7 +1070,7 @@ func (b *Bot) snipeHoldsSiblingPosition(ctx context.Context, user *database.User
 	for _, s := range siblings {
 		sibSet[s] = true
 	}
-	for _, pos := range positions {
+	for _, pos := range held {
 		if sibSet[pos.TokenID] && pos.Shares != nil && pos.Shares.Sign() > 0 {
 			return true
 		}
@@ -1340,13 +1455,42 @@ func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResul
 		return snipeBuyResult{outcome: snipeBuyNoWallet}, 0, snipeAutoSkipped
 	}
 
+	// One positions read per alert (issue #111): the holdings gate and the case-3
+	// sibling check below share this lazy fetch, so a crash never costs two Data
+	// API round-trips.
+	positions := b.snipePositionsOnce(ctx, user)
+
+	// Holdings gate (issue #111): the recipient already holds the ALERTED token,
+	// from any source. The in-band $10 would be a TOP-UP of a held position —
+	// 2W/19L, −$85.86 in the September ledger — so it converts to an alert-only
+	// DM with live tap buttons.
+	//
+	// Precedence is load-bearing: this runs BEFORE case 3, so holding the crashed
+	// side (with or without the other side) is case 1 — no boxed latch is armed
+	// and the watcher's later rungs cannot fire on it. Case 3 is now precisely
+	// "holds ONLY the other side". It also runs before snipeAutoBuyExec's cap
+	// reserve, so a gated alert never touches the daily cap (no reserve, no
+	// refund, no MarkBought). The boxed rung fires and manual taps are never
+	// gated, as with every gate.
+	if via, held := b.snipeHoldsAlerted(ctx, chatID, market, positions); held {
+		// An ACTIVE manual stop keeps its own class and copy (issue #86): the buy
+		// would be stop-sold moments later or ride unprotected, which is a
+		// different story to tell the user than "you already hold this".
+		if via == snipeHoldViaArmSL {
+			log.Printf("Snipe auto-buy: manual-armed chat=%d token=%.12s…", chatID, market.TokenID)
+			return snipeBuyResult{outcome: snipeBuyManualArmed}, 0, snipeAutoSkipped
+		}
+		log.Printf("Snipe auto-buy: holdings-gated chat=%d token=%.12s… via=%s", chatID, market.TokenID, via)
+		return snipeBuyResult{outcome: snipeBuyAlreadyHeld}, 0, snipeAutoSkipped
+	}
+
 	// Case 3 (boxed ladder): the recipient already holds the OTHER side of this
 	// market. With TP-only auto-arms the held side harvests at the $0.95 ceiling,
 	// so the flip ticket is better bought deep — as the two-rung ladder ($5 at
 	// ≤ $0.10 + $5 at ≤ $0.05) rather than the in-band $10 (issue #78). The
 	// per-tranche latch, not a fire-time sibling re-check, drives the watcher's
 	// later fires, so a mid-episode ceiling harvest cannot cancel the flip.
-	if b.snipeHoldsSibling(ctx, user, chatID, market) {
+	if b.snipeHoldsSibling(ctx, chatID, market, positions) {
 		var ask float64
 		var ok bool
 		if b.snipeFeed != nil {
@@ -1381,44 +1525,9 @@ func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResul
 		return res, capLeft, status
 	}
 
-	// Manual-arm gate (issue #86): skip the normal in-band $10 auto-buy when this
-	// recipient already carries an ACTIVE manual stop (sl_armed = TRUE) on the
-	// CRASHED/alerted token. Rationale is coherence, not just orphan-avoidance: a
-	// trailing stop armed above the snipe band means the buy is either stop-sold
-	// moments later or rides unprotected — the snipe thesis can't play out under a
-	// live manual stop (DK G2 exhibit: the machine bought 0.26 while its own stop
-	// stood at 0.464 and fired minutes later).
-	//
-	// Precedence is load-bearing and deliberate:
-	//   - It runs AFTER case-3 classification. A recipient holding the OTHER side
-	//     already latched boxed-wait / bought a tranche and returned above, so
-	//     case-3 WINS — this gate reads the arm on the ALERTED token only, never a
-	//     sibling, and a holder of both sides never reaches here.
-	//   - It runs BEFORE snipeAutoBuyExec's cap reserve, so a gated alert never
-	//     touches the daily cap (no reserve, no refund, no MarkBought).
-	//
-	// Scope (binding, from the ratified spec):
-	//   - TP-only auto-arms (sl_armed = FALSE) never gate — they already carry
-	//     fire-time whole-position TP coverage, so a top-up stays orphan-safe.
-	//   - Disarmed/swept arms never gate: every disarm path (user disarm, SL-fire
-	//     completion, sweep) DELETEs the row, so GetByUserAndToken returns nil;
-	//     the sl_armed=FALSE rows that do exist (TP-only arms, incl. post-ClearTP)
-	//     fall through to the buy on the flag check.
-	//   - The gate is a GUARD, not a dependency: a DB-read failure fails OPEN (the
-	//     buy proceeds exactly as today) and logs loudly. A nil repo (test bots,
-	//     legacy wiring) is likewise a no-op.
-	if b.sltpArmRepo != nil {
-		arm, err := b.sltpArmRepo.GetByUserAndToken(ctx, chatID, market.TokenID)
-		switch {
-		case err != nil:
-			log.Printf("Snipe auto-buy: manual-arm gate read FAILED chat=%d token=%.12s…: %v — failing open, buy proceeds",
-				chatID, market.TokenID, err)
-		case arm != nil && arm.SLArmed:
-			log.Printf("Snipe auto-buy: manual-armed chat=%d token=%.12s…", chatID, market.TokenID)
-			return snipeBuyResult{outcome: snipeBuyManualArmed}, 0, snipeAutoSkipped
-		}
-	}
-
+	// The manual-arm gate (issue #86) lives in snipeHoldsAlerted's tier `arm` now
+	// — an active stop is one kind of holding evidence, and the holdings gate
+	// subsumes it while keeping its outcome, copy, log line and fail-open read.
 	return b.snipeAutoBuyExec(ctx, chatID, user, market, snipeAutoBuyUSD)
 }
 
@@ -1448,10 +1557,10 @@ func (b *Bot) snipeAutoBuyExec(ctx context.Context, chatID int64, user *database
 			chatID, market.TokenID, res.outcome, res.err, res.errorMsg)
 		return res, 0, snipeAutoSkipped
 	}
-	// Record the holding — the boxed case-3 sibling gate and restart restore
-	// read this record (the deep holdings gate it once fed retired with the
-	// deep auto-buy, #105). mark also writes the durable buy row (pool 'main',
-	// this stake) when a store is wired (#84).
+	// Record the holding — the holdings gate's tier `bought` (issue #111), the
+	// boxed case-3 sibling gate, and restart restore all read this record. mark
+	// also writes the durable buy row (pool 'main', this stake) when a store is
+	// wired (#84).
 	if b.snipeBought != nil {
 		b.snipeBought.mark(chatID, market.TokenID, amount)
 	}
@@ -1477,7 +1586,7 @@ const (
 	snipeBuyNoWallet                     // recipient has no trading wallet — buy path never attempted
 	snipeBuyNotEsports                   // sport gate: non-esports/unclassifiable — auto-buy is esports-only
 	snipeBuyCorpseSpread                 // corpse-spread gate: fresh bid far below ask (decided-game signature)
-	snipeBuyDeepHeld                     // deep holdings gate: recipient already holds the crashed token
+	snipeBuyAlreadyHeld                  // holdings gate (issue #111): recipient already holds the ALERTED token — no top-up
 	snipeBuyBoxedWait                    // boxed tier: recipient holds the other side — postpone until ask ≤ $0.10
 	snipeBuyManualArmed                  // manual-arm gate (issue #86): recipient has an ACTIVE sl_armed stop on the crashed token
 	snipeBuyFutureGame                   // future-game gate (issue #97): an earlier game of the event is still live — this game hasn't started
@@ -1810,9 +1919,12 @@ func (b *Bot) SeedSnipeArmed() {
 // where a comeback crash and the boxed case-3 buy actually land, and every
 // auto-buy tier hangs off that token's own in-band alert, so both sides must be
 // watched. Empty token IDs are skipped; the bought latch is never touched.
-// Shared by the buy path (snipeRegisterBoughtToken) and the position-refresh
-// path (registerSnipeHeld) so the sibling fan-out lives in one place.
-func (b *Bot) snipeWatchHeldMarket(chatID int64, market *polymarket.GammaMarket, ttl time.Duration) {
+//
+// heldToken names the token the chat actually holds (the position's own token),
+// which registers with the bought-side mark the holdings gate reads (issue
+// #111); its siblings stay plain watches. Pass "" when no token is claimed — a
+// metadata-only refresh must never look like a holding.
+func (b *Bot) snipeWatchHeldMarket(chatID int64, market *polymarket.GammaMarket, heldToken string, ttl time.Duration) {
 	if b.snipeWatcher == nil || market == nil {
 		return
 	}
@@ -1828,7 +1940,12 @@ func (b *Bot) snipeWatchHeldMarket(chatID int64, market *polymarket.GammaMarket,
 		if i < len(outcomes) {
 			outcome = outcomes[i]
 		}
-		b.snipeWatcher.WatchHeld(chatID, snipeMarketFromGamma(market, tokenID, outcome), ttl)
+		sm := snipeMarketFromGamma(market, tokenID, outcome)
+		if tokenID == heldToken {
+			b.snipeWatcher.WatchBought(chatID, sm, ttl)
+			continue
+		}
+		b.snipeWatcher.WatchHeld(chatID, sm, ttl)
 	}
 	b.snipeWatchEventMates(chatID, market, ttl)
 }
@@ -2025,7 +2142,10 @@ func (b *Bot) registerSnipeHeld(chatID int64, positions []*polymarket.Position) 
 		if pos.TokenID == "" {
 			continue
 		}
-		if b.snipeWatcher.RenewHeldMarket(chatID, pos.TokenID, live.SnipeHeldTTL) {
+		// The renew branch applies the SAME holding predicate as the fallback
+		// below: a zero-share row (the Data API keeps returning sold positions)
+		// renews the watch group but claims no holding (issue #111).
+		if b.snipeWatcher.RenewHeldMarket(chatID, pos.TokenID, live.SnipeHeldTTL, snipeHeldTokenOf(pos) != "") {
 			// Renewed without a metadata fetch — but the series walk must still
 			// run for events whose mates were never registered (armed-only or
 			// pre-#94 states) or have lapsed. Deduped per (chat, event) by
@@ -2048,8 +2168,19 @@ func (b *Bot) registerSnipeHeld(chatID int64, positions []*polymarket.Position) 
 			market = m
 			markets[pos.MarketID] = m
 		}
-		b.snipeWatchHeldMarket(chatID, market, live.SnipeHeldTTL)
+		b.snipeWatchHeldMarket(chatID, market, snipeHeldTokenOf(pos), live.SnipeHeldTTL)
 	}
+}
+
+// snipeHeldTokenOf names the token a position actually HOLDS — "" for a
+// zero-share (closed/dust-free) row, which registers as a plain watch and must
+// never be marked bought-side (issue #111): the Data API keeps returning sold
+// positions at 0 shares.
+func snipeHeldTokenOf(pos *polymarket.Position) string {
+	if pos.Shares == nil || pos.Shares.Sign() <= 0 {
+		return ""
+	}
+	return pos.TokenID
 }
 
 // fetchSnipeMarket fetches a Gamma market for a held position. The Data API's
@@ -2086,7 +2217,28 @@ func fetchSnipeMarket(ctx context.Context, mc *polymarket.MarketClient, id strin
 // in-play-gated. In-memory and cheap — call inline, not in a goroutine, and
 // keep the positions refetch as secondary rescue for older holdings. Never
 // MarkBought: a manual buy is not a snipe fill.
+//
+// idx names a FILLED buy, so its token carries the bought-side mark (issue
+// #111). Order PLACEMENT that may rest unfilled registers through
+// snipeRegisterRestingOrder instead.
 func (b *Bot) snipeRegisterBoughtToken(chatID int64, market *polymarket.GammaMarket, idx int) {
+	b.snipeRegisterMarketWatch(chatID, market, idx, true)
+}
+
+// snipeRegisterRestingOrder registers both sides of a market whose buy order
+// was ACCEPTED but may still be resting (the limit-buy handler): the watch is
+// worth having immediately — a fill-then-crash must not slip past it — but a
+// resting order is not a position, so nothing is marked bought-side (issue
+// #111). A later fill is picked up by the positions refresh (which marks the
+// anchor) and by the gate's own positions tier.
+func (b *Bot) snipeRegisterRestingOrder(chatID int64, market *polymarket.GammaMarket, idx int) {
+	b.snipeRegisterMarketWatch(chatID, market, idx, false)
+}
+
+// snipeRegisterMarketWatch is the shared body: filled decides whether the idx
+// token registers as a holding (WatchBought) or as a plain watch like its
+// sibling.
+func (b *Bot) snipeRegisterMarketWatch(chatID int64, market *polymarket.GammaMarket, idx int, filled bool) {
 	if b.snipeWatcher == nil || market == nil {
 		return
 	}
@@ -2114,7 +2266,14 @@ func (b *Bot) snipeRegisterBoughtToken(chatID int64, market *polymarket.GammaMar
 		if i < len(outcomes) {
 			outcome = outcomes[i]
 		}
-		b.snipeWatcher.WatchHeld(chatID, snipeMarketFromGamma(market, tokenID, outcome), live.SnipeHeldTTL)
+		sm := snipeMarketFromGamma(market, tokenID, outcome)
+		if filled && i == idx {
+			// The bought token carries the bought-side mark (issue #111); the flip
+			// side is a watch, not a holding.
+			b.snipeWatcher.WatchBought(chatID, sm, live.SnipeHeldTTL)
+			continue
+		}
+		b.snipeWatcher.WatchHeld(chatID, sm, live.SnipeHeldTTL)
 	}
 	go b.snipeWatchEventMates(chatID, market, live.SnipeHeldTTL)
 }

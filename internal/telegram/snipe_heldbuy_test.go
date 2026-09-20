@@ -20,8 +20,9 @@ import (
 // path (no Gamma fetch), false forces the WatchHeld fan-out path.
 type recordingHeldWatch struct {
 	mu          sync.Mutex
-	renewed     []string
+	renewed     []renewCall
 	held        []string // WatchHeld (direct) token IDs
+	boughtSide  []string // WatchBought (bought-side mark) token IDs (issue #111)
 	walked      []string // WatchWalked (series-walked) token IDs (issue #102)
 	renewResult bool
 	eventSlug   string // served by EventSlugOf (series-walk tests, issue #94)
@@ -41,9 +42,24 @@ func (r *recordingHeldWatch) WatchWalked(_ int64, m live.SnipeMarket, _ time.Dur
 	r.mu.Unlock()
 }
 func (r *recordingHeldWatch) WalkedOnlyHolder(int64, string) bool { return false }
-func (r *recordingHeldWatch) RenewHeldMarket(_ int64, tokenID string, _ time.Duration) bool {
+
+// WatchBought is a direct registration plus the bought-side mark (issue #111).
+func (r *recordingHeldWatch) WatchBought(_ int64, m live.SnipeMarket, _ time.Duration) {
 	r.mu.Lock()
-	r.renewed = append(r.renewed, tokenID)
+	r.held = append(r.held, m.TokenID)
+	r.boughtSide = append(r.boughtSide, m.TokenID)
+	r.mu.Unlock()
+}
+func (r *recordingHeldWatch) Holds(int64, string) bool { return false }
+
+func (r *recordingHeldWatch) boughtSideTokens() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.boughtSide...)
+}
+func (r *recordingHeldWatch) RenewHeldMarket(_ int64, tokenID string, _ time.Duration, held bool) bool {
+	r.mu.Lock()
+	r.renewed = append(r.renewed, renewCall{tokenID: tokenID, held: held})
 	result := r.renewResult
 	r.mu.Unlock()
 	return result
@@ -55,10 +71,27 @@ func (x *recordingHeldWatch) EventSlugOf(string) string {
 }
 func (r *recordingHeldWatch) SiblingTokenIDs(_, _ string) []string { return nil }
 
+// renewCall is one RenewHeldMarket call: the anchor token and whether the
+// caller claimed it as an actual holding (issue #111).
+type renewCall struct {
+	tokenID string
+	held    bool
+}
+
+func (r *recordingHeldWatch) renewCalls() []renewCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]renewCall(nil), r.renewed...)
+}
+
 func (r *recordingHeldWatch) renewedTokens() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]string(nil), r.renewed...)
+	out := make([]string, 0, len(r.renewed))
+	for _, c := range r.renewed {
+		out = append(out, c.tokenID)
+	}
+	return out
 }
 
 func (r *recordingHeldWatch) heldTokens() []string {

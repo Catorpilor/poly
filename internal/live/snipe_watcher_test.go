@@ -1307,7 +1307,7 @@ func TestSnipeWatcher_HeldTTLExpires(t *testing.T) {
 func TestSnipeWatcher_RenewHeldMarket(t *testing.T) {
 	t.Parallel()
 	w, _, _, notif, clock := snipeHarness()
-	if w.RenewHeldMarket(404, "A", time.Hour) {
+	if w.RenewHeldMarket(404, "A", time.Hour, true) {
 		t.Fatal("RenewHeldMarket on unknown token = true, want false")
 	}
 
@@ -1318,7 +1318,7 @@ func TestSnipeWatcher_RenewHeldMarket(t *testing.T) {
 	w.WatchHeld(404, sib, time.Hour)
 
 	clock.advance(30 * time.Minute)
-	if !w.RenewHeldMarket(404, "A", time.Hour) {
+	if !w.RenewHeldMarket(404, "A", time.Hour, true) {
 		t.Fatal("RenewHeldMarket on watched token = false, want true")
 	}
 	clock.advance(45 * time.Minute) // original TTLs (60m) passed; renewed ones (90m) have not

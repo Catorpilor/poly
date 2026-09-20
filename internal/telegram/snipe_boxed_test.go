@@ -37,12 +37,17 @@ func TestSnipeHoldsSibling(t *testing.T) {
 			snipeBought:  newSnipeBoughtRecord(),
 		}
 	}
+	// The sibling check reads the alert's shared positions fetch (issue #111).
+	holdsSibling := func(b *Bot) bool {
+		ctx := context.Background()
+		return b.snipeHoldsSibling(ctx, 7, market, b.snipePositionsOnce(ctx, user))
+	}
 
 	t.Run("record source", func(t *testing.T) {
 		t.Parallel()
 		b := newBot()
 		b.snipeBought.mark(7, "sibB", snipeAutoBuyUSD)
-		if !b.snipeHoldsSibling(context.Background(), user, 7, market) {
+		if !holdsSibling(b) {
 			t.Error("record-held sibling not detected")
 		}
 	})
@@ -51,7 +56,7 @@ func TestSnipeHoldsSibling(t *testing.T) {
 		t.Parallel()
 		b := newBot()
 		b.sltpArmRepo = &siblingArmRepo{arms: map[string]*database.SLTPArm{"sibB": {ID: 1, TokenID: "sibB"}}}
-		if !b.snipeHoldsSibling(context.Background(), user, 7, market) {
+		if !holdsSibling(b) {
 			t.Error("armed sibling not detected")
 		}
 	})
@@ -62,7 +67,7 @@ func TestSnipeHoldsSibling(t *testing.T) {
 		b.snipePositions = &fakePositionSource{positions: []*polymarket.Position{
 			{TokenID: "sibB", Shares: big.NewInt(50_000_000)},
 		}}
-		if !b.snipeHoldsSibling(context.Background(), user, 7, market) {
+		if !holdsSibling(b) {
 			t.Error("positions-held sibling not detected")
 		}
 	})
@@ -73,7 +78,7 @@ func TestSnipeHoldsSibling(t *testing.T) {
 		b.snipePositions = &fakePositionSource{positions: []*polymarket.Position{
 			{TokenID: "unrelated", Shares: big.NewInt(50_000_000)},
 		}}
-		if b.snipeHoldsSibling(context.Background(), user, 7, market) {
+		if holdsSibling(b) {
 			t.Error("false case-3 with no sibling holding")
 		}
 	})
@@ -82,7 +87,7 @@ func TestSnipeHoldsSibling(t *testing.T) {
 		t.Parallel()
 		b := newBot()
 		b.snipePositions = &fakePositionSource{err: errors.New("data api down")}
-		if b.snipeHoldsSibling(context.Background(), user, 7, market) {
+		if holdsSibling(b) {
 			t.Error("positions error must be treated as not case-3")
 		}
 	})
@@ -91,7 +96,7 @@ func TestSnipeHoldsSibling(t *testing.T) {
 		t.Parallel()
 		b := &Bot{snipeWatcher: &fakeSnipeWatch{}, snipeBought: newSnipeBoughtRecord()}
 		b.snipeBought.mark(7, "sibB", snipeAutoBuyUSD)
-		if b.snipeHoldsSibling(context.Background(), user, 7, market) {
+		if holdsSibling(b) {
 			t.Error("no watched siblings must short-circuit to false")
 		}
 	})

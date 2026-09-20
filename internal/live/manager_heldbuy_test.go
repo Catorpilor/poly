@@ -136,3 +136,24 @@ func TestRegisterHeldBuy(t *testing.T) {
 		}
 	})
 }
+
+// Bought-side mark (issue #111): the web buy path knows exactly which token was
+// bought, so ONLY that token becomes a holding the auto-buy's holdings gate can
+// see. The market sibling and the series continuations are watches, not
+// holdings — marking them would gate the flip buy that is the whole point of
+// the sibling watch.
+func TestRegisterHeldBuy_BoughtSideMark(t *testing.T) {
+	t.Parallel()
+	m, w, _ := newSnipeWiredManager(t)
+
+	m.RegisterHeldBuy(7, pinnedFeedEventSlug, "ml-blg", snipeWiringEvent())
+
+	if !w.Holds(7, "ml-blg") {
+		t.Error("bought token ml-blg carries no bought-side mark")
+	}
+	for _, tok := range []string{"ml-hle", "g3-blg", "g3-hle"} {
+		if w.Holds(7, tok) {
+			t.Errorf("%s marked as held — only the bought token is a holding", tok)
+		}
+	}
+}

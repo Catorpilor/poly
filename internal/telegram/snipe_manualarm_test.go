@@ -10,9 +10,10 @@ import (
 	"github.com/Catorpilor/poly/internal/database/repositories"
 )
 
-// armGateRepo is a fake SLTPArmRepository for the manual-arm gate (issue #86):
-// GetByUserAndToken answers from a fixed per-token map, or returns a wired error
-// to exercise the fail-open path. Keying by token ID (not chatID) is enough for
+// armGateRepo is a fake SLTPArmRepository for the holdings gate's `arm` tier
+// (issue #86's manual-arm gate, subsumed by #111): GetByUserAndToken answers
+// from a fixed per-token map, or returns a wired error to exercise the
+// fall-through path. Keying by token ID (not chatID) is enough for
 // these single-user tests. Every other method is inherited from the embedded nil
 // interface — the gate must never call them.
 type armGateRepo struct {
@@ -110,10 +111,11 @@ func TestNotifySnipeAlertManualArmedGates(t *testing.T) {
 	}
 }
 
-// TestNotifySnipeAlertTPOnlyArmDoesNotGate: a TP-only auto-arm (sl_armed = FALSE)
-// carries whole-position TP coverage, so a top-up is orphan-safe — it must buy
-// exactly as today.
-func TestNotifySnipeAlertTPOnlyArmDoesNotGate(t *testing.T) {
+// TestNotifySnipeAlertTPOnlyArmGates: a TP-only auto-arm (sl_armed = FALSE) is
+// evidence of a HOLDING, and issue #111 reverses v0.21.2's "TP-only arms top up
+// freely" — the in-band $10 is a top-up either way. The skip is the generic
+// already-held class (via=arm), not the #86 manual-armed one.
+func TestNotifySnipeAlertTPOnlyArmGates(t *testing.T) {
 	t.Parallel()
 	h := newSnipeAutoBuyHarness(t, snipeHarnessConfig{ask: 0.17, askOK: true, user: snipeWalletUser()})
 	m := testSnipeMarket()
@@ -123,26 +125,36 @@ func TestNotifySnipeAlertTPOnlyArmDoesNotGate(t *testing.T) {
 
 	h.bot.NotifySnipeAlert(7, m, 0.45, 0.17)
 
-	if got := h.buys.count(); got != 1 {
-		t.Fatalf("buy calls = %d, want 1 (TP-only never gates)", got)
+	if got := h.buys.count(); got != 0 {
+		t.Fatalf("buy calls = %d, want 0 (holdings gate, tier arm)", got)
 	}
-	if !h.tg.hasSendContaining("Auto-sniped") {
-		t.Error("TP-only-armed recipient must still get the Auto-sniped alert")
+	sent := h.tg.sentAt(t, 0)
+	if !strings.Contains(sent.text, "you already hold this token") {
+		t.Errorf("TP-only arm must gate with the already-held note:\n%s", sent.text)
+	}
+	if strings.Contains(sent.text, "your stop is already managing this token") {
+		t.Errorf("TP-only arm must NOT claim a stop is managing the token:\n%s", sent.text)
+	}
+	if _, ok := h.bot.snipeSpend.reserve(7, snipeAutoBuyDailyCapUSD); !ok {
+		t.Error("cap consumed by a holdings-gated alert")
 	}
 }
 
-// TestNotifySnipeAlertNoOrSweptArmDoesNotGate: no arm row, and a fully
-// disarmed/swept row (tp_armed = FALSE AND sl_armed = FALSE), both fall through
-// to the normal auto-buy.
-func TestNotifySnipeAlertNoOrSweptArmDoesNotGate(t *testing.T) {
+// TestNotifySnipeAlertArmRowShapes: tier `arm` is ANY row for (chat, token) —
+// a row exists only because the user held enough of the token to arm it, and
+// ClearTP (sltp_monitor.go) flips tp_armed → false after the TP-only arm sells
+// 25%, leaving a (false,false) row while ~75% is still held. A genuinely
+// disarmed/swept arm is a DELETED row (nil), which never gates.
+func TestNotifySnipeAlertArmRowShapes(t *testing.T) {
 	t.Parallel()
 	m := testSnipeMarket()
 	tests := []struct {
-		name string
-		arm  *database.SLTPArm // nil ⇒ no row for the token
+		name      string
+		arm       *database.SLTPArm // nil ⇒ no row for the token
+		wantGated bool
 	}{
-		{"no arm row", nil},
-		{"disarmed/swept row (tp+sl both false)", &database.SLTPArm{TokenID: m.TokenID, SLArmed: false, TPArmed: false}},
+		{"no arm row (disarmed/swept ⇒ deleted)", nil, false},
+		{"post-ClearTP row (tp+sl both false)", &database.SLTPArm{TokenID: m.TokenID, SLArmed: false, TPArmed: false}, true},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -157,6 +169,15 @@ func TestNotifySnipeAlertNoOrSweptArmDoesNotGate(t *testing.T) {
 
 			h.bot.NotifySnipeAlert(7, m, 0.45, 0.17)
 
+			if tt.wantGated {
+				if got := h.buys.count(); got != 0 {
+					t.Fatalf("buy calls = %d, want 0 (%s gates via=arm)", got, tt.name)
+				}
+				if !strings.Contains(h.tg.sentAt(t, 0).text, "you already hold this token") {
+					t.Errorf("%s must carry the already-held note", tt.name)
+				}
+				return
+			}
 			if got := h.buys.count(); got != 1 {
 				t.Fatalf("buy calls = %d, want 1 (%s must not gate)", got, tt.name)
 			}

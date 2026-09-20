@@ -25,7 +25,7 @@ func TestRenewHeldMarket_EventGroup(t *testing.T) {
 	w.WatchHeld(7, mk("other", "om", "ev-2"), time.Hour)
 
 	clock.advance(30 * time.Minute)
-	if !w.RenewHeldMarket(7, "ml-a", time.Hour) {
+	if !w.RenewHeldMarket(7, "ml-a", time.Hour, true) {
 		t.Fatal("RenewHeldMarket returned false for a watched token")
 	}
 
@@ -60,7 +60,7 @@ func TestRenewHeldMarket_EmptySlugKeepsMarketGrouping(t *testing.T) {
 	w.WatchHeld(7, mk("m2-a", "m2"), time.Hour)
 
 	clock.advance(30 * time.Minute)
-	w.RenewHeldMarket(7, "m1-a", time.Hour)
+	w.RenewHeldMarket(7, "m1-a", time.Hour, true)
 
 	wantExp := clock.now().Add(time.Hour)
 	w.mu.Lock()

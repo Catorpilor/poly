@@ -43,7 +43,7 @@ func TestSnipeWatchHeldMarketRegistersEventMates(t *testing.T) {
 		Events:          []*polymarket.GammaEvent{{Slug: "cs2-a-b-2026"}},
 	}
 
-	b.snipeWatchHeldMarket(7, held, time.Hour)
+	b.snipeWatchHeldMarket(7, held, "m3a", time.Hour)
 
 	// The held market's own tokens register DIRECT; the event's open Map 4
 	// mates register WALKED (issue #102) — alert-only continuations.
@@ -96,12 +96,12 @@ func TestSnipeWatchHeldMarketEventWalkFailOpen(t *testing.T) {
 
 	noEvent := &polymarket.GammaMarket{ID: "solo", Question: "Will X win?",
 		OutcomesRaw: `["Yes","No"]`, ClobTokenIdsRaw: `["ya","yb"]`}
-	b.snipeWatchHeldMarket(7, noEvent, time.Hour)
+	b.snipeWatchHeldMarket(7, noEvent, "ya", time.Hour)
 
 	withEvent := &polymarket.GammaMarket{ID: "m3", Question: "A vs B - Map 3 Winner",
 		OutcomesRaw: `["A","B"]`, ClobTokenIdsRaw: `["m3a","m3b"]`,
 		Events: []*polymarket.GammaEvent{{Slug: "cs2-a-b-2026"}}}
-	b.snipeWatchHeldMarket(7, withEvent, time.Hour)
+	b.snipeWatchHeldMarket(7, withEvent, "m3a", time.Hour)
 
 	got := watch.heldTokens()
 	if len(got) != 4 {
