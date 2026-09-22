@@ -82,6 +82,14 @@ type Bot struct {
 	// see snipeSeriesWalkDue. Lazily initialized under snipeSeriesWalkMu.
 	snipeSeriesWalkMu sync.Mutex
 	snipeSeriesWalked map[string]time.Time
+	// snipeRestingOrders tracks (chatID, tokenID) for limit orders the bot placed
+	// that may still be resting. The auto-snipe gate checks it: a resting buy
+	// order on the alerted token converts the auto-buy to alert-only — the
+	// user's limit is their strategy. In-memory only (soft rail); cleared on
+	// cancel or when a new order replaces it. Lazily initialized under
+	// snipeRestingMu.
+	snipeRestingMu     sync.Mutex
+	snipeRestingOrders map[int64]map[string]bool // chatID -> tokenID -> true
 }
 
 // snipePositionSource is the slice of the position scanner the held-registration
@@ -1544,6 +1552,12 @@ Please wait...`, marketName, outcomeName, amount, limitPrice))
 		// swap back to snipeRegisterBoughtToken, which would holdings-gate the
 		// $10 auto-buy for 6h on a token that may never fill.
 		b.snipeRegisterRestingOrder(chatID, market, outcomeIndex)
+		// Track the resting order for the auto-snipe gate: if the user has a
+		// pending limit buy on this token, auto-snipe converts to alert-only.
+		tokenIDs := market.GetClobTokenIds()
+		if outcomeIndex < len(tokenIDs) && tokenIDs[outcomeIndex] != "" {
+			b.trackRestingOrder(chatID, tokenIDs[outcomeIndex])
+		}
 		go b.snipeRegisterHeldForUser(chatID, common.HexToAddress(user.ProxyAddress))
 		message := fmt.Sprintf(`✅ *Limit Buy Order Placed!*
 
@@ -2293,6 +2307,9 @@ Use /markets to find markets and place orders.`
 		b.editMessage(chatID, messageID, msg)
 		return
 	}
+
+	// Clear all resting order records for this chat (the auto-snipe gate).
+	b.clearRestingOrdersForChat(chatID)
 
 	msg := fmt.Sprintf(`✅ *Orders Cancelled*
 

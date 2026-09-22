@@ -34,6 +34,12 @@ between quote and submission.
 implied price. Orders live on the exchange, never locally. An **Open Order**
 is the resting, unmatched remainder of one.
 
+**Resting Order Intent** — An Open Order on a token signals that the user
+has already expressed a deliberate entry strategy for that token. For
+auto-snipe gating: any resting BUY order on the alerted token converts the
+auto-snipe to alert-only — the user's limit is their strategy, and the bot
+should not second-guess it. The tap buttons remain live for manual overrides.
+
 **Trade** — An executed match (a fill). On a market's live tape, a Trade is
 anyone's fill; in our own results, ours. A Trade results from an Order and
 is never a synonym for one.
