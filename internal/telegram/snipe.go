@@ -623,6 +623,11 @@ func snipeSkipNote(res snipeBuyResult) string {
 		// live for the user who wants it anyway. (The template appends "— tap below
 		// if you still want it.", completing the ratified copy.)
 		reason = "your stop is already managing this token"
+	case snipeBuyRestingOrder:
+		// The user has a pending limit buy order on this token — their expressed
+		// entry strategy. The bot should not second-guess it by auto-buying at a
+		// different price. (The template appends "— tap below if you still want it.")
+		reason = "you have a resting buy order on this token — letting your limit work"
 	default:
 		reason = "auto-buy unavailable"
 	}
@@ -835,6 +840,12 @@ func (b *Bot) NotifySnipeBoxed(chatID int64, market live.SnipeMarket, sessionHig
 	}
 	// Sport gate (esports-only), mirroring the other tiers.
 	if !snipeIsEsports(market.Question) {
+		return
+	}
+	// Resting order gate, mirroring the in-band tier: a pending limit buy order
+	// on this token means the user's limit is their strategy.
+	if b.hasRestingOrder(chatID, market.TokenID) {
+		log.Printf("Snipe boxed-buy: resting-order-gated chat=%d token=%.12s… tranche=%d", chatID, market.TokenID, tranche)
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -1439,6 +1450,14 @@ func (b *Bot) snipeAutoBuy(chatID int64, market live.SnipeMarket) (snipeBuyResul
 		return snipeBuyResult{outcome: snipeBuySeriesWalked}, 0, snipeAutoSkipped
 	}
 
+	// Resting order gate: the user has a pending limit buy order on this token.
+	// Their limit is their expressed entry strategy — the bot should not
+	// second-guess it. Checked before wallet lookup or cap reservation.
+	if b.hasRestingOrder(chatID, market.TokenID) {
+		log.Printf("Snipe auto-buy: resting-order-gated chat=%d token=%.12s…", chatID, market.TokenID)
+		return snipeBuyResult{outcome: snipeBuyRestingOrder}, 0, snipeAutoSkipped
+	}
+
 	// Gate 1 (sport gate): auto-buy only esports; non-esports and
 	// unclassifiable markets stay alert-only. Checked before any wallet lookup
 	// or cap reservation — the classification alone decides.
@@ -1591,6 +1610,7 @@ const (
 	snipeBuyManualArmed                  // manual-arm gate (issue #86): recipient has an ACTIVE sl_armed stop on the crashed token
 	snipeBuyFutureGame                   // future-game gate (issue #97): an earlier game of the event is still live — this game hasn't started
 	snipeBuySeriesWalked                 // series-walked gate (issue #102): market entered the watch ONLY via the series walk — alert-only
+	snipeBuyRestingOrder                 // resting-order gate: user has a pending limit buy on this token — letting their limit work
 )
 
 // snipeBuyResult carries what each caller needs to message the user.
@@ -2142,6 +2162,12 @@ func (b *Bot) registerSnipeHeld(chatID int64, positions []*polymarket.Position) 
 		if pos.TokenID == "" {
 			continue
 		}
+		// If the position has shares, clear any resting order record for this
+		// token — the order has filled, so the auto-snipe gate should no longer
+		// apply to this token.
+		if snipeHeldTokenOf(pos) != "" {
+			b.clearRestingOrder(chatID, pos.TokenID)
+		}
 		// The renew branch applies the SAME holding predicate as the fallback
 		// below: a zero-share row (the Data API keeps returning sold positions)
 		// renews the watch group but claims no holding (issue #111).
@@ -2298,4 +2324,56 @@ func (b *Bot) snipeRegisterHeldForUser(chatID int64, proxyAddr common.Address) {
 		return
 	}
 	b.registerSnipeHeld(chatID, positions)
+}
+
+// trackRestingOrder records that chatID has placed a limit buy order on
+// tokenID. The auto-snipe gate checks this: a resting order on the alerted
+// token converts the auto-buy to alert-only — the user's limit is their
+// strategy, and the bot should not second-guess it.
+func (b *Bot) trackRestingOrder(chatID int64, tokenID string) {
+	b.snipeRestingMu.Lock()
+	defer b.snipeRestingMu.Unlock()
+	if b.snipeRestingOrders == nil {
+		b.snipeRestingOrders = make(map[int64]map[string]bool)
+	}
+	if b.snipeRestingOrders[chatID] == nil {
+		b.snipeRestingOrders[chatID] = make(map[string]bool)
+	}
+	b.snipeRestingOrders[chatID][tokenID] = true
+}
+
+// clearRestingOrder removes the resting order record for (chatID, tokenID).
+// Called when the order is cancelled, filled, or replaced.
+func (b *Bot) clearRestingOrder(chatID int64, tokenID string) {
+	b.snipeRestingMu.Lock()
+	defer b.snipeRestingMu.Unlock()
+	if b.snipeRestingOrders == nil {
+		return
+	}
+	if toks := b.snipeRestingOrders[chatID]; toks != nil {
+		delete(toks, tokenID)
+		if len(toks) == 0 {
+			delete(b.snipeRestingOrders, chatID)
+		}
+	}
+}
+
+// clearRestingOrdersForChat removes all resting order records for chatID.
+// Called when the user cancels all orders.
+func (b *Bot) clearRestingOrdersForChat(chatID int64) {
+	b.snipeRestingMu.Lock()
+	defer b.snipeRestingMu.Unlock()
+	if b.snipeRestingOrders != nil {
+		delete(b.snipeRestingOrders, chatID)
+	}
+}
+
+// hasRestingOrder reports whether chatID has a resting buy order on tokenID.
+func (b *Bot) hasRestingOrder(chatID int64, tokenID string) bool {
+	b.snipeRestingMu.Lock()
+	defer b.snipeRestingMu.Unlock()
+	if b.snipeRestingOrders == nil {
+		return false
+	}
+	return b.snipeRestingOrders[chatID][tokenID]
 }
