@@ -2326,24 +2326,52 @@ func (b *Bot) snipeRegisterHeldForUser(chatID int64, proxyAddr common.Address) {
 	b.registerSnipeHeld(chatID, positions)
 }
 
-// trackRestingOrder records that chatID has placed a limit buy order on
-// tokenID. The auto-snipe gate checks this: a resting order on the alerted
-// token converts the auto-buy to alert-only — the user's limit is their
-// strategy, and the bot should not second-guess it.
-func (b *Bot) trackRestingOrder(chatID int64, tokenID string) {
+// trackRestingOrder records that chatID placed limit buy orderID on tokenID.
+// The auto-snipe gate checks this: a resting order on the alerted token
+// converts the auto-buy to alert-only — the user's limit is their strategy,
+// and the bot should not second-guess it. The order ID lets a single-order
+// cancel forget exactly that order (issue #115).
+func (b *Bot) trackRestingOrder(chatID int64, tokenID, orderID string) {
+	if tokenID == "" || orderID == "" {
+		return
+	}
 	b.snipeRestingMu.Lock()
 	defer b.snipeRestingMu.Unlock()
 	if b.snipeRestingOrders == nil {
-		b.snipeRestingOrders = make(map[int64]map[string]bool)
+		b.snipeRestingOrders = make(map[int64]map[string]map[string]bool)
 	}
 	if b.snipeRestingOrders[chatID] == nil {
-		b.snipeRestingOrders[chatID] = make(map[string]bool)
+		b.snipeRestingOrders[chatID] = make(map[string]map[string]bool)
 	}
-	b.snipeRestingOrders[chatID][tokenID] = true
+	if b.snipeRestingOrders[chatID][tokenID] == nil {
+		b.snipeRestingOrders[chatID][tokenID] = make(map[string]bool)
+	}
+	b.snipeRestingOrders[chatID][tokenID][orderID] = true
 }
 
-// clearRestingOrder removes the resting order record for (chatID, tokenID).
-// Called when the order is cancelled, filled, or replaced.
+// forgetRestingOrderID removes one cancelled order (issue #115). The token
+// stays gated while any other tracked order on it remains. An order ID the bot
+// never tracked is a no-op.
+func (b *Bot) forgetRestingOrderID(chatID int64, orderID string) {
+	b.snipeRestingMu.Lock()
+	defer b.snipeRestingMu.Unlock()
+	toks := b.snipeRestingOrders[chatID]
+	for tokenID, orders := range toks {
+		if !orders[orderID] {
+			continue
+		}
+		delete(orders, orderID)
+		if len(orders) == 0 {
+			delete(toks, tokenID)
+		}
+	}
+	if toks != nil && len(toks) == 0 {
+		delete(b.snipeRestingOrders, chatID)
+	}
+}
+
+// clearRestingOrder removes every tracked order for (chatID, tokenID). Called
+// when a positions refresh shows the token filled.
 func (b *Bot) clearRestingOrder(chatID int64, tokenID string) {
 	b.snipeRestingMu.Lock()
 	defer b.snipeRestingMu.Unlock()
@@ -2372,8 +2400,5 @@ func (b *Bot) clearRestingOrdersForChat(chatID int64) {
 func (b *Bot) hasRestingOrder(chatID int64, tokenID string) bool {
 	b.snipeRestingMu.Lock()
 	defer b.snipeRestingMu.Unlock()
-	if b.snipeRestingOrders == nil {
-		return false
-	}
-	return b.snipeRestingOrders[chatID][tokenID]
+	return len(b.snipeRestingOrders[chatID][tokenID]) > 0
 }

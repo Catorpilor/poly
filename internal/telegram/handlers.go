@@ -658,6 +658,8 @@ func (b *Bot) handleCancel(ctx context.Context, bot *Bot, update *tgbotapi.Updat
 		b.editMessage(update.Message.Chat.ID, loadingMsg.MessageID, fmt.Sprintf("❌ Failed to cancel order: %v", err))
 		return nil
 	}
+	// Forget this order for the auto-snipe resting-order gate (issue #115).
+	b.forgetRestingOrderID(update.Message.Chat.ID, orderID)
 
 	message := fmt.Sprintf(`✅ *Order Cancelled*
 
