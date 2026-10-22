@@ -56,6 +56,20 @@ var (
 var v2Contracts = map[VerifyingContract]common.Address{
 	CTFExchange:        common.HexToAddress("0xE111180000d2663C0091e4f400237545B87B996B"),
 	NegRiskCTFExchange: common.HexToAddress("0xe2222d279d744050d28e00520010520000310F59"),
+	// Exchange v3 (Combos), docs.polymarket.com/trading/combos/requesters.
+	ExchangeV3: common.HexToAddress("0xe3333700cA9d93003F00f0F71f8515005F6c00Aa"),
+}
+
+// exchangeV3VersionHash is the Combo exchange's EIP-712 domain version ("3").
+var exchangeV3VersionHash = crypto.Keccak256Hash([]byte("3"))
+
+// domainVersionHashFor returns the EIP-712 domain version hash of an exchange:
+// "2" for the CTF / NegRisk exchanges, "3" for the Combo exchange.
+func domainVersionHashFor(c VerifyingContract) common.Hash {
+	if c == ExchangeV3 {
+		return exchangeV3VersionHash
+	}
+	return domainVersionHash
 }
 
 // Builder constructs and signs V2 orders.
@@ -100,11 +114,11 @@ func (b *Builder) WithTimestampMillis(fn func() int64) *Builder {
 	return b
 }
 
-// VerifyingContractAddress returns the on-chain address for a given V2 exchange.
+// VerifyingContractAddress returns the on-chain address for a given exchange.
 func VerifyingContractAddress(c VerifyingContract) (common.Address, error) {
 	addr, ok := v2Contracts[c]
 	if !ok {
-		return common.Address{}, fmt.Errorf("unknown V2 verifying contract: %d", c)
+		return common.Address{}, fmt.Errorf("unknown verifying contract: %d", c)
 	}
 	return addr, nil
 }
@@ -215,7 +229,7 @@ func (b *Builder) BuildOrderHash(order *Order, contract VerifyingContract) (Orde
 		return OrderHash{}, err
 	}
 
-	domainSeparator, err := eip712.BuildEIP712DomainSeparator(domainNameHash, domainVersionHash, b.chainID, verifyingContract)
+	domainSeparator, err := eip712.BuildEIP712DomainSeparator(domainNameHash, domainVersionHashFor(contract), b.chainID, verifyingContract)
 	if err != nil {
 		return OrderHash{}, err
 	}
