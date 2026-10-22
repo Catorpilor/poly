@@ -59,6 +59,8 @@ type GammaMarket struct {
 	FeeType          string        `json:"feeType"`         // Fee category (e.g., "sports_fees_v2", "crypto_fees_v2")
 	ClobTokenIdsRaw  string        `json:"clobTokenIds"`    // JSON string like "[\"123...\", \"456...\"]"
 	GameStartTimeRaw string        `json:"gameStartTime"`   // Scheduled game start (sports markets only)
+	PositionIDs      []string      `json:"positionIds"`     // Combo leg position ids [outcome0, outcome1]; not CLOB token ids
+	ComboStatus      string        `json:"comboStatus"`     // "enabled" when the market can be a Combo leg
 }
 
 // GetClobTokenIds parses the clobTokenIds JSON string. Returns nil when the
@@ -308,7 +310,7 @@ func (mc *MarketClient) GetMarketByID(ctx context.Context, id string) (*GammaMar
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("market not found")
+		return nil, ErrMarketNotFound
 	}
 
 	if resp.StatusCode != http.StatusOK {

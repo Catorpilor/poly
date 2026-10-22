@@ -43,6 +43,9 @@ type TradingClient struct {
 	fokPollInterval    time.Duration
 	fokGoneGraceWindow time.Duration
 	fokConfirmTimeout  time.Duration
+
+	// comboRFQURL is the Combo Requester gateway base URL ("" = default).
+	comboRFQURL string
 }
 
 // APICredentials holds L2 API credentials for authenticated requests

@@ -30,7 +30,8 @@ distinct from `clobTokenIds`), so a market ID and a side are sufficient.
 ## Decision
 
 A Combo Link carries only the Legs: `c_` followed, per leg in leg order,
-by the Gamma market ID and `y` (YES) or `n` (NO), with no separators —
+by the Gamma market ID and `y` (the market's first outcome, index 0 —
+"Yes", "Over") or `n` (the second, index 1), with no separators —
 e.g. `c_5801197y5889785n5905290n`. The bot rebuilds the Combo from Gamma;
 no wallet, Combo Condition or bot-side registry is involved. The format is
 not meant to be human-readable.
