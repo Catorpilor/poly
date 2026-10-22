@@ -35,8 +35,18 @@ func (ups *UnifiedPositionScanner) ScanAllStrategies(ctx context.Context, proxyA
 
 	log.Printf("Data API returned %d active positions", len(positions))
 
-	// Return formatted positions (empty list if none)
-	return ups.formatPositionsFromAPI(positions), nil
+	// Combos live on a separate route; v2 /positions never includes them
+	// (issue #118). A combo failure must not hide regular positions.
+	summary := ups.formatPositionsFromAPI(positions)
+	combos, cerr := ups.positionManager.GetComboPositions(ctx, proxyAddress)
+	switch {
+	case cerr != nil:
+		log.Printf("Combo positions error: %v", cerr)
+		summary += "\n\n⚠️ Couldn't load combos — check polymarket.com."
+	case len(combos) > 0:
+		summary += "\n\n" + FormatComboPositions(combos)
+	}
+	return summary, nil
 }
 
 // GetPositions fetches raw positions for selling
