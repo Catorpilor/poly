@@ -102,6 +102,7 @@ type Bot struct {
 	comboStatusFn  func(ctx context.Context, acct *comboAccount, rfqID string) (*polymarket.ComboTakeResult, error)
 	comboEditFn    func(chatID int64, msgID int, text string, kb *tgbotapi.InlineKeyboardMarkup)
 	comboNotifyFn  func(chatID int64, text string)
+	comboSendFn    func(chatID int64, text string) int // new message, returns its id
 	comboLinksMu   sync.Mutex
 	comboLinks     map[string]string
 
