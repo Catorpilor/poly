@@ -61,8 +61,9 @@ has no slug and no page: outside the chain a Combo is addressed by its
 Legs. Shown on Polymarket as the leg questions joined with " AND ".
 _Avoid_: parlay, multi, accumulator
 
-**Leg** — One market outcome inside a Combo: a market plus a side (YES
-or NO). Its leg position ID is not the CLOB Token ID of that outcome.
+**Leg** — One market outcome inside a Combo: a market plus which of its
+two outcomes is taken (the first — "Yes", "Over", a team — or the second).
+Its leg position ID is not the CLOB Token ID of that outcome.
 
 **Copy Signal** — A Telegram notification, sent by an external notifier
 (not this bot), that a tracked wallet traded. It carries a deep link into
