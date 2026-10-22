@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,33 +30,42 @@ type Position struct {
 	NegativeRisk bool     `json:"negative_risk,omitempty"`
 }
 
-// DataAPIPosition represents the response from Polymarket Data API /positions endpoint
+// DataAPIPosition is one row of the Polymarket Data API v2 /v2/positions
+// response (snake_case). v1 /positions was retired on 2026-10-24 (#117).
 type DataAPIPosition struct {
-	ProxyWallet        string  `json:"proxyWallet"`
-	Asset              string  `json:"asset"`
-	ConditionID        string  `json:"conditionId"`
-	Size               float64 `json:"size"`
-	AvgPrice           float64 `json:"avgPrice"`
-	InitialValue       float64 `json:"initialValue"`
-	CurrentValue       float64 `json:"currentValue"`
-	CashPnl            float64 `json:"cashPnl"`
-	PercentPnl         float64 `json:"percentPnl"`
-	TotalBought        float64 `json:"totalBought"`
-	RealizedPnl        float64 `json:"realizedPnl"`
-	PercentRealizedPnl float64 `json:"percentRealizedPnl"`
-	CurPrice           float64 `json:"curPrice"`
+	ProxyWallet        string  `json:"proxy_wallet"`
+	Asset              string  `json:"token_id"`
+	ConditionID        string  `json:"condition_id"`
+	Size               float64 `json:"current_size"`
+	AvgPrice           float64 `json:"avg_price"`
+	InitialValue       float64 `json:"entry_cost_usdc"`
+	CurrentValue       float64 `json:"current_value"`
+	CashPnl            float64 `json:"unrealized_pnl"`
+	PercentPnl         float64 `json:"percent_pnl"`
+	TotalBought        float64 `json:"total_size"`
+	RealizedPnl        float64 `json:"realized_pnl"`
+	PercentRealizedPnl float64 `json:"percent_realized_pnl"`
+	CurPrice           float64 `json:"current_price"`
 	Redeemable         bool    `json:"redeemable"`
 	Mergeable          bool    `json:"mergeable"`
 	Title              string  `json:"title"`
 	Slug               string  `json:"slug"`
 	Icon               string  `json:"icon"`
-	EventSlug          string  `json:"eventSlug"`
+	EventSlug          string  `json:"event_slug"`
 	Outcome            string  `json:"outcome"`
-	OutcomeIndex       int     `json:"outcomeIndex"`
-	OppositeOutcome    string  `json:"oppositeOutcome"`
-	OppositeAsset      string  `json:"oppositeAsset"`
-	EndDate            string  `json:"endDate"`
-	NegativeRisk       bool    `json:"negativeRisk"`
+	OutcomeIndex       int     `json:"outcome_index"`
+	OppositeOutcome    string  `json:"opposite_outcome"`
+	OppositeAsset      string  `json:"opposite_token_id"`
+	EndDate            string  `json:"end_date"`
+	NegativeRisk       bool    `json:"negative_risk"`
+}
+
+// dataAPIPositionsPage is the v2 response envelope for /v2/positions.
+type dataAPIPositionsPage struct {
+	Data       []DataAPIPosition `json:"data"`
+	Pagination struct {
+		NextCursor *string `json:"next_cursor"`
+	} `json:"pagination"`
 }
 
 // RedeemablePositionInfo contains all data needed to display and execute a redemption.
@@ -99,31 +110,12 @@ func NewPositionManagerWithDataAPI(dataAPIURL string) *PositionManager {
 // GetUserPositionsFromAPI fetches positions using the Polymarket Data API
 // This is the preferred method as it returns complete position data including P&L
 func (pm *PositionManager) GetUserPositionsFromAPI(ctx context.Context, proxyAddress common.Address) ([]*Position, error) {
-	// limit=500: the API defaults to 100 and we've seen users with 160+
-	// historical positions where the newest active position falls past the
-	// default page boundary, leading to /positions returning "no positions"
-	// despite the trade succeeding.
-	url := fmt.Sprintf("%s/positions?user=%s&limit=500", pm.dataAPIURL, strings.ToLower(proxyAddress.Hex()))
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := pm.httpClient.Do(req)
+	// status OPEN (v2's default) is the superset matching v1 /positions: it
+	// includes settled-but-unredeemed winners. limit=500 avoids the 100-row
+	// default page that once hid a fresh position (see fetchPositionsV2).
+	apiPositions, err := pm.fetchPositionsV2(ctx, proxyAddress, "OPEN")
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch positions from Data API: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Data API returned status %d", resp.StatusCode)
-	}
-
-	var apiPositions []DataAPIPosition
-	if err := json.NewDecoder(resp.Body).Decode(&apiPositions); err != nil {
-		return nil, fmt.Errorf("failed to decode positions: %w", err)
 	}
 
 	// Convert API positions to internal Position type
@@ -162,28 +154,11 @@ func (pm *PositionManager) GetUserPositionsFromAPI(ctx context.Context, proxyAdd
 // excluded from display but still get burned automatically by the CTF contract when
 // the winning side is redeemed.
 func (pm *PositionManager) GetRedeemablePositions(ctx context.Context, proxyAddress common.Address) ([]*RedeemablePositionInfo, error) {
-	url := fmt.Sprintf("%s/positions?user=%s&redeemable=true&limit=500",
-		pm.dataAPIURL, strings.ToLower(proxyAddress.Hex()))
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := pm.httpClient.Do(req)
+	// REDEEMABLE includes losing sides (price 0), as v1 redeemable=true did;
+	// the price filter below drops them.
+	apiPositions, err := pm.fetchPositionsV2(ctx, proxyAddress, "REDEEMABLE")
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch redeemable positions: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Data API returned status %d", resp.StatusCode)
-	}
-
-	var apiPositions []DataAPIPosition
-	if err := json.NewDecoder(resp.Body).Decode(&apiPositions); err != nil {
-		return nil, fmt.Errorf("failed to decode positions: %w", err)
 	}
 
 	positions := make([]*RedeemablePositionInfo, 0, len(apiPositions))
@@ -230,4 +205,61 @@ func FormatShares(shares *big.Int) string {
 	result := new(big.Float).Quo(sharesFloat, divisor)
 
 	return fmt.Sprintf("%.2f", result)
+}
+
+// maxPositionPages bounds cursor pagination on /v2/positions.
+const maxPositionPages = 20
+
+// positionsPageSize is the first-page size; v2 allows up to 1000.
+const positionsPageSize = 500
+
+// fetchPositionsV2 reads every page of /v2/positions for one wallet and
+// status, following pagination.next_cursor until it is null. v2 rejects the
+// v1 offset/redeemable params with HTTP 400, so neither is ever sent.
+func (pm *PositionManager) fetchPositionsV2(ctx context.Context, proxyAddress common.Address, status string) ([]DataAPIPosition, error) {
+	base := pm.dataAPIURL + "/v2/positions"
+	user := strings.ToLower(proxyAddress.Hex())
+
+	var all []DataAPIPosition
+	cursor := ""
+	for page := 0; page < maxPositionPages; page++ {
+		q := url.Values{}
+		q.Set("user", user)
+		q.Set("status", status)
+		if cursor == "" {
+			q.Set("limit", strconv.Itoa(positionsPageSize))
+		} else {
+			q.Set("cursor", cursor) // the cursor carries the page size
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"?"+q.Encode(), nil)
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := pm.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		var body dataAPIPositionsPage
+		var decodeErr error
+		if resp.StatusCode == http.StatusOK {
+			decodeErr = json.NewDecoder(resp.Body).Decode(&body)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("Data API returned status %d", resp.StatusCode)
+		}
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decode positions: %w", decodeErr)
+		}
+
+		all = append(all, body.Data...)
+		if body.Pagination.NextCursor == nil || *body.Pagination.NextCursor == "" {
+			return all, nil
+		}
+		cursor = *body.Pagination.NextCursor
+	}
+	return nil, fmt.Errorf("positions pagination exceeded %d pages", maxPositionPages)
 }
