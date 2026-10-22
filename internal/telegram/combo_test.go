@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+
 	"github.com/Catorpilor/poly/internal/polymarket"
 )
 
@@ -50,11 +52,22 @@ type fakeComboQuoter struct {
 	err   error
 }
 
-func (f *fakeComboQuoter) fn(_ context.Context, userID int64, legs []string, stake float64) (*polymarket.ComboQuote, error) {
+func (f *fakeComboQuoter) fn(_ context.Context, acct *comboAccount, legs []string, stake float64) (*polymarket.ComboQuote, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, quoteCall{userID, append([]string(nil), legs...), stake})
+	f.calls = append(f.calls, quoteCall{acct.userID, append([]string(nil), legs...), stake})
 	return f.quote, f.err
+}
+
+// fakeComboAccount loads a stub account; noWallet makes it fail like a user
+// without a wallet.
+func fakeComboAccount(noWallet bool) func(context.Context, int64) (*comboAccount, error) {
+	return func(_ context.Context, userID int64) (*comboAccount, error) {
+		if noWallet {
+			return nil, errComboNoWallet
+		}
+		return &comboAccount{userID: userID}, nil
+	}
 }
 
 // docsQuote: pay $10.00 (fees incl.), receive 19.32381 shares -> x1.93.
@@ -71,6 +84,7 @@ func TestComboScreen(t *testing.T) {
 		param       string
 		quote       *polymarket.ComboQuote
 		quoteErr    error
+		noWallet    bool
 		wantText    []string
 		notText     []string
 		wantQuoted  bool
@@ -131,9 +145,8 @@ func TestComboScreen(t *testing.T) {
 		{
 			name:        "no wallet yet",
 			param:       "c_700001y700002y",
-			quoteErr:    errComboNoWallet,
+			noWallet:    true,
 			wantText:    []string{"/start", "Estimate: x5.00"},
-			wantQuoted:  true,
 			wantRefresh: true,
 		},
 		{
@@ -150,7 +163,7 @@ func TestComboScreen(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			q := &fakeComboQuoter{quote: tt.quote, err: tt.quoteErr}
-			b := &Bot{comboMarketFn: fakeComboMarket(t), comboQuoteFn: q.fn}
+			b := &Bot{comboMarketFn: fakeComboMarket(t), comboAccountFn: fakeComboAccount(tt.noWallet), comboQuoteFn: q.fn}
 
 			text, kb := b.comboScreen(context.Background(), 42, tt.param)
 
@@ -192,6 +205,15 @@ func TestComboScreen(t *testing.T) {
 			if hasRefresh != tt.wantRefresh {
 				t.Errorf("refresh button = %v, want %v", hasRefresh, tt.wantRefresh)
 			}
+			// Every buyable screen (all legs open) offers the stake buttons,
+			// whatever happened to the quote; others never do.
+			stakes := comboStakeButtons(kb)
+			if want := tt.wantRefresh; (len(stakes) == 6) != want {
+				t.Errorf("stake buttons = %v, want 6 iff buyable", stakes)
+			}
+			if strings.Contains(text, "next release") {
+				t.Error("buying is live: drop the 'next release' footer")
+			}
 		})
 	}
 }
@@ -199,7 +221,7 @@ func TestComboScreen(t *testing.T) {
 func TestComboScreen_LegsCarryTheirMarketLink(t *testing.T) {
 	t.Parallel()
 
-	b := &Bot{comboMarketFn: fakeComboMarket(t), comboQuoteFn: (&fakeComboQuoter{quote: docsQuote}).fn}
+	b := &Bot{comboMarketFn: fakeComboMarket(t), comboAccountFn: fakeComboAccount(false), comboQuoteFn: (&fakeComboQuoter{quote: docsQuote}).fn}
 	text, _ := b.comboScreen(context.Background(), 1, "c_5437373y5436769y")
 	for _, slug := range []string{"ucl-bay-ars-2026-10-21-total-0pt5", "ucl-ast-vf-2026-10-21-exact-score-3-1"} {
 		if !strings.Contains(text, fmt.Sprintf("(https://polymarket.com/market/%s)", slug)) {
@@ -212,7 +234,7 @@ func TestComboScreen_QuotesTheLegPositionIDsInLinkOrder(t *testing.T) {
 	t.Parallel()
 
 	q := &fakeComboQuoter{quote: docsQuote}
-	b := &Bot{comboMarketFn: fakeComboMarket(t), comboQuoteFn: q.fn}
+	b := &Bot{comboMarketFn: fakeComboMarket(t), comboAccountFn: fakeComboAccount(false), comboQuoteFn: q.fn}
 	b.comboScreen(context.Background(), 1, "c_700002n700001y")
 	if len(q.calls) != 1 {
 		t.Fatalf("quote calls = %d, want 1", len(q.calls))
@@ -221,4 +243,20 @@ func TestComboScreen_QuotesTheLegPositionIDsInLinkOrder(t *testing.T) {
 	if got := strings.Join(q.calls[0].legs, ","); got != "70000201,70000100" {
 		t.Errorf("legs = %s, want 70000201,70000100", got)
 	}
+}
+
+// comboStakeButtons lists the stake callbacks on a keyboard, in order.
+func comboStakeButtons(kb *tgbotapi.InlineKeyboardMarkup) []string {
+	var out []string
+	if kb == nil {
+		return nil
+	}
+	for _, row := range kb.InlineKeyboard {
+		for _, btn := range row {
+			if btn.CallbackData != nil && (strings.HasPrefix(*btn.CallbackData, comboBuyPrefix) || strings.HasPrefix(*btn.CallbackData, comboCustomPrefix)) {
+				out = append(out, *btn.CallbackData)
+			}
+		}
+	}
+	return out
 }

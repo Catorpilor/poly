@@ -42,6 +42,8 @@ type VerifyingContract uint8
 const (
 	CTFExchange        VerifyingContract = 0
 	NegRiskCTFExchange VerifyingContract = 1
+	// ExchangeV3 settles Combos (RFQ). Same Order struct, domain version "3".
+	ExchangeV3 VerifyingContract = 2
 )
 
 // OrderData is the caller-friendly input shape (strings for big numbers,

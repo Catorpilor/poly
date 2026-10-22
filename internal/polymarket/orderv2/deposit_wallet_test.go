@@ -77,7 +77,7 @@ func TestDepositWalletIntermediateHashes(t *testing.T) {
 		t.Fatalf("VerifyingContractAddress: %v", err)
 	}
 
-	if got := exchangeDomainSeparator(b.chainID, exchange).Hex(); !strings.EqualFold(got, gvAppDomainSep) {
+	if got := exchangeDomainSeparator(b.chainID, exchange, domainVersionHash).Hex(); !strings.EqualFold(got, gvAppDomainSep) {
 		t.Errorf("appDomainSep = %s, want %s", got, gvAppDomainSep)
 	}
 	if got := orderStructHash(order).Hex(); !strings.EqualFold(got, gvContentsHash) {

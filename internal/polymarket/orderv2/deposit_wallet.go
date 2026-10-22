@@ -53,7 +53,7 @@ func word(b []byte) []byte {
 	return w
 }
 
-func uint256Word(n *big.Int) []byte      { return word(n.Bytes()) }
+func uint256Word(n *big.Int) []byte       { return word(n.Bytes()) }
 func addressWord(a common.Address) []byte { return word(a.Bytes()) }
 
 // concatBytes joins byte slices left-to-right.
@@ -67,11 +67,11 @@ func concatBytes(parts ...[]byte) []byte {
 
 // exchangeDomainSeparator is the CTF Exchange's EIP-712 domain separator
 // (the "app domain" that ERC-7739 folds in at digest time).
-func exchangeDomainSeparator(chainID *big.Int, exchange common.Address) common.Hash {
+func exchangeDomainSeparator(chainID *big.Int, exchange common.Address, versionHash common.Hash) common.Hash {
 	return crypto.Keccak256Hash(concatBytes(
 		eip712DomainTypeHash.Bytes(),
-		domainNameHash.Bytes(),    // keccak("Polymarket CTF Exchange")
-		domainVersionHash.Bytes(), // keccak("2")
+		domainNameHash.Bytes(), // keccak("Polymarket CTF Exchange")
+		versionHash.Bytes(),    // keccak("2"), or keccak("3") for Exchange v3
 		uint256Word(chainID),
 		addressWord(exchange),
 	))
@@ -150,7 +150,7 @@ func (b *Builder) depositWalletSignature(privateKey *ecdsa.PrivateKey, order *Or
 		return nil, err
 	}
 
-	appDomainSep := exchangeDomainSeparator(b.chainID, exchange)
+	appDomainSep := exchangeDomainSeparator(b.chainID, exchange, domainVersionHashFor(contract))
 	contentsHash := orderStructHash(order)
 	tdsHash := typedDataSignStructHash(b.chainID, contentsHash, order.Signer)
 

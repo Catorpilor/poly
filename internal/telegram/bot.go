@@ -94,10 +94,26 @@ type Bot struct {
 	// Combo Links (issue #118). comboMarketFn / comboQuoteFn are test seams
 	// (nil = Gamma by id / the user's live RFQ quote). comboLinks maps a
 	// 🔄 Refresh key to its link; in-memory, lost on restart.
-	comboMarketFn func(ctx context.Context, id string) (*polymarket.GammaMarket, error)
-	comboQuoteFn  func(ctx context.Context, userID int64, legPositionIDs []string, stakeUSD float64) (*polymarket.ComboQuote, error)
-	comboLinksMu  sync.Mutex
-	comboLinks    map[string]string
+	comboMarketFn  func(ctx context.Context, id string) (*polymarket.GammaMarket, error)
+	comboAccountFn func(ctx context.Context, userID int64) (*comboAccount, error)
+	comboQuoteFn   func(ctx context.Context, acct *comboAccount, legPositionIDs []string, stakeUSD float64) (*polymarket.ComboQuote, error)
+	comboBalanceFn func(ctx context.Context, acct *comboAccount) (int64, error)
+	comboTakeFn    func(ctx context.Context, acct *comboAccount, q *polymarket.ComboQuote) (*polymarket.ComboTakeResult, error)
+	comboStatusFn  func(ctx context.Context, acct *comboAccount, rfqID string) (*polymarket.ComboTakeResult, error)
+	comboEditFn    func(chatID int64, msgID int, text string, kb *tgbotapi.InlineKeyboardMarkup)
+	comboNotifyFn  func(chatID int64, text string)
+	comboLinksMu   sync.Mutex
+	comboLinks     map[string]string
+
+	// Combo buy state (ADR 0010), in-memory: the multiplier on each user's
+	// screen per link (Multiplier Tolerance reference) and Pending Takes.
+	// Poll timings are fields so tests can shrink them (0 = defaults).
+	comboStateMu        sync.Mutex
+	comboDisplayedMult  map[comboUserKey]float64
+	comboPending        map[comboUserKey]bool
+	comboPollEvery      time.Duration
+	comboInlineWait     time.Duration
+	comboBackgroundWait time.Duration
 }
 
 // snipePositionSource is the slice of the position scanner the held-registration
@@ -779,6 +795,9 @@ func (b *Bot) handleTextMessage(ctx context.Context, update *tgbotapi.Update) {
 		// User is entering custom amount
 		b.handleCustomAmountInput(ctx, update, userCtx)
 
+	case StateWaitingForComboStake:
+		b.handleComboStakeInput(ctx, update, userCtx)
+
 	case StateWaitingForLimitPrice:
 		// User is entering limit price for sell order
 		b.handleLimitPriceInput(ctx, update, userCtx)
@@ -1035,6 +1054,12 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, update *tgbotapi.Update) 
 
 	case strings.HasPrefix(data, comboRefreshPrefix):
 		b.handleComboRefresh(ctx, update)
+
+	case strings.HasPrefix(data, comboBuyPrefix):
+		b.handleComboBuyCallback(ctx, update)
+
+	case strings.HasPrefix(data, comboCustomPrefix):
+		b.handleComboCustomCallback(ctx, update)
 
 	case strings.HasPrefix(data, "amt:"):
 		b.handleAmountCallback(ctx, update)
