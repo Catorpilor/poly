@@ -37,6 +37,7 @@ type ComboQuoteRequest struct {
 // (e.g. NO_QUOTES) is a normal business outcome, not an error.
 type ComboQuote struct {
 	RFQID            string
+	QuoteID          string
 	Status           string
 	ExpiresAt        time.Time
 	ComboConditionID string
@@ -106,6 +107,7 @@ type comboRFQResponse struct {
 		YesPositionID string `json:"yes_position_id"`
 	} `json:"request"`
 	Quote *struct {
+		QuoteID         string `json:"quote_id"`
 		BlendedPriceE6  string `json:"blended_price_e6"`
 		MakerAmountE6   string `json:"maker_amount_e6"`
 		TakerAmountE6   string `json:"taker_amount_e6"`
@@ -157,43 +159,9 @@ func (tc *TradingClient) RequestComboQuote(ctx context.Context, req ComboQuoteRe
 		return nil, fmt.Errorf("encode RFQ: %w", err)
 	}
 
-	base := tc.comboRFQURL
-	if base == "" {
-		base = comboRFQURLDefault
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, base+comboRFQRequestsPath, bytes.NewReader(body))
+	raw, err := tc.rfqDo(ctx, http.MethodPost, comboRFQRequestsPath, body, req.EOA, req.Creds)
 	if err != nil {
-		return nil, fmt.Errorf("create RFQ request: %w", err)
-	}
-	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("POLY_ADDRESS", req.EOA.Hex())
-	httpReq.Header.Set("POLY_API_KEY", req.Creds.APIKey)
-	httpReq.Header.Set("POLY_PASSPHRASE", req.Creds.Passphrase)
-	httpReq.Header.Set("POLY_TIMESTAMP", timestamp)
-	httpReq.Header.Set("POLY_SIGNATURE", tc.signL2Request(req.Creds.Secret, timestamp, http.MethodPost, comboRFQRequestsPath, string(body)))
-
-	resp, err := tc.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("RFQ request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, fmt.Errorf("read RFQ response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		var e comboRFQErrorBody
-		_ = json.Unmarshal(raw, &e)
-		msg := strings.TrimSpace(e.Error)
-		if msg == "" {
-			msg = strings.TrimSpace(string(raw))
-		}
-		if e.Code != "" {
-			return nil, fmt.Errorf("RFQ gateway HTTP %d %s: %s", resp.StatusCode, e.Code, msg)
-		}
-		return nil, fmt.Errorf("RFQ gateway HTTP %d: %s", resp.StatusCode, msg)
+		return nil, err
 	}
 
 	var r comboRFQResponse
@@ -213,6 +181,7 @@ func (tc *TradingClient) RequestComboQuote(ctx context.Context, req ComboQuoteRe
 		q.ErrorCode, q.ErrorMessage = r.Error.Code, r.Error.Message
 	}
 	if r.Quote != nil {
+		q.QuoteID = r.Quote.QuoteID
 		q.MakerAmountE6 = parseE6(r.Quote.MakerAmountE6)
 		q.TakerAmountE6 = parseE6(r.Quote.TakerAmountE6)
 		q.TotalRequiredE6 = parseE6(r.Quote.TotalRequiredE6)
@@ -229,4 +198,73 @@ func parseE6(s string) int64 {
 		return 0
 	}
 	return v
+}
+
+// rfqHTTPError is a non-200 gateway response (validation, auth, rate limit).
+type rfqHTTPError struct {
+	Status int
+	Code   string
+	Msg    string
+}
+
+func (e *rfqHTTPError) Error() string {
+	if e.Code != "" {
+		return fmt.Sprintf("RFQ gateway HTTP %d %s: %s", e.Status, e.Code, e.Msg)
+	}
+	return fmt.Sprintf("RFQ gateway HTTP %d: %s", e.Status, e.Msg)
+}
+
+// rfqDo sends one L2-signed request to the Requester gateway and returns the
+// 200 body. A GET is signed without a body. Non-200 responses come back as
+// *rfqHTTPError so callers can interpret specific statuses (409 = expired).
+func (tc *TradingClient) rfqDo(ctx context.Context, method, path string, body []byte, eoa common.Address, creds *APICredentials) ([]byte, error) {
+	base := tc.comboRFQURL
+	if base == "" {
+		base = comboRFQURLDefault
+	}
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, method, base+path, reader)
+	if err != nil {
+		return nil, fmt.Errorf("create RFQ request: %w", err)
+	}
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	if body != nil {
+		httpReq.Header.Set("Content-Type", "application/json")
+	}
+	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Set("POLY_ADDRESS", eoa.Hex())
+	httpReq.Header.Set("POLY_API_KEY", creds.APIKey)
+	httpReq.Header.Set("POLY_PASSPHRASE", creds.Passphrase)
+	httpReq.Header.Set("POLY_TIMESTAMP", timestamp)
+	httpReq.Header.Set("POLY_SIGNATURE", tc.signL2Request(creds.Secret, timestamp, method, path, string(body)))
+
+	resp, err := tc.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("RFQ request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read RFQ response: %w", err)
+	}
+	if resp.StatusCode == http.StatusOK {
+		return raw, nil
+	}
+	var e comboRFQErrorBody
+	_ = json.Unmarshal(raw, &e)
+	msg := strings.TrimSpace(e.Error)
+	if msg == "" {
+		msg = strings.TrimSpace(string(raw))
+	}
+	return nil, &rfqHTTPError{Status: resp.StatusCode, Code: e.Code, Msg: msg}
+}
+
+// IsComboRateLimited reports a gateway HTTP 429 (15 quote creates per
+// rolling minute per maker address).
+func IsComboRateLimited(err error) bool {
+	var he *rfqHTTPError
+	return errors.As(err, &he) && he.Status == http.StatusTooManyRequests
 }
