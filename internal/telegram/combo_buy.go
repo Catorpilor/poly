@@ -355,7 +355,6 @@ func (b *Bot) handleComboCustomCallback(ctx context.Context, update *tgbotapi.Up
 	key := strings.TrimPrefix(cq.Data, comboCustomPrefix)
 	b.stateManager.SetState(cq.From.ID, StateWaitingForComboStake, map[string]interface{}{
 		"combo_key": key,
-		"msg_id":    cq.Message.MessageID,
 	}, comboStakeInputTTL)
 	b.comboNotify(cq.Message.Chat.ID, "✏️ Enter your combo stake in $ (e.g. 40), or /cancel.")
 }
@@ -375,6 +374,10 @@ func (b *Bot) handleComboStakeInput(ctx context.Context, update *tgbotapi.Update
 		return
 	}
 	key, _ := userCtx.Data["combo_key"].(string)
-	msgID, _ := userCtx.Data["msg_id"].(int)
+	// Report in a new message below the user's reply: the original screen is
+	// now above the prompt, and editing it looked like nothing happened
+	// (2026-10-22 live test). The old screen keeps working; the Pending block
+	// and the Multiplier Tolerance still guard a second tap there.
+	msgID := b.comboSend(chatID, fmt.Sprintf("⏳ Buying $%s of this combo…", formatStake(stake)))
 	b.comboBuy(ctx, userID, chatID, msgID, key, stake)
 }

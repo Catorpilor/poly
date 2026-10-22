@@ -449,3 +449,40 @@ func waitFor(t *testing.T, cond func() bool) {
 	}
 	t.Fatal("condition not met within 2s")
 }
+
+// Regression (2026-10-22 live test): a Custom stake's result edited the
+// original combo screen — by then above the "Enter your stake" prompt and the
+// user's reply — so "nothing happened" on screen while the buy filled. The
+// result must land in a NEW message below the reply.
+func TestComboStakeInput_ReportsInANewMessage(t *testing.T) {
+	t.Parallel()
+
+	g := &fakeComboGateway{balanceE6: 100e6, quotes: []*polymarket.ComboQuote{quoteAt(10, 2.75), quoteAt(5, 2.76)}, takes: []*polymarket.ComboTakeResult{filled}}
+	b, key := newBuyHarness(t, g)
+	b.stateManager = NewStateManager()
+	const newMsg = 13099
+	var sent []string
+	b.comboSendFn = func(_ int64, text string) int { sent = append(sent, text); return newMsg }
+	var editedIDs []int
+	inner := b.comboEditFn
+	b.comboEditFn = func(chatID int64, msgID int, text string, kb *tgbotapi.InlineKeyboardMarkup) {
+		editedIDs = append(editedIDs, msgID)
+		inner(chatID, msgID, text, kb)
+	}
+
+	userCtx := &UserContext{State: StateWaitingForComboStake, Data: map[string]interface{}{"combo_key": key}}
+	upd := &tgbotapi.Update{Message: &tgbotapi.Message{Text: "5", Chat: &tgbotapi.Chat{ID: 1}, From: &tgbotapi.User{ID: 7}}}
+	b.handleComboStakeInput(context.Background(), upd, userCtx)
+
+	if len(sent) != 1 {
+		t.Fatalf("new messages = %d, want 1", len(sent))
+	}
+	for _, id := range editedIDs {
+		if id != newMsg {
+			t.Errorf("edited message %d; the result must go to the new message %d, not the old screen", id, newMsg)
+		}
+	}
+	if !strings.Contains(g.lastEdit(), "Combo bought") {
+		t.Errorf("want the fill in the new message:\n%s", g.lastEdit())
+	}
+}

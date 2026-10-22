@@ -343,6 +343,14 @@ func (b *Bot) comboNotify(chatID int64, text string) {
 	b.sendMessage(chatID, text)
 }
 
+// comboSend posts a new message and returns its id (seam: comboSendFn).
+func (b *Bot) comboSend(chatID int64, text string) int {
+	if b.comboSendFn != nil {
+		return b.comboSendFn(chatID, text)
+	}
+	return b.sendMessageAndReturn(chatID, text).MessageID
+}
+
 // escapeMarkdown escapes Telegram legacy-Markdown control characters in
 // untrusted text (market questions, outcome labels, error messages).
 func escapeMarkdown(s string) string {
