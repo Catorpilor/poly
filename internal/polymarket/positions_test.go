@@ -2,7 +2,6 @@ package polymarket
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,11 +15,11 @@ func TestGetRedeemablePositions_Empty(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Verify query params
-		if r.URL.Query().Get("redeemable") != "true" {
-			t.Errorf("expected redeemable=true param, got %q", r.URL.Query().Get("redeemable"))
+		if r.URL.Query().Get("status") != "REDEEMABLE" {
+			t.Errorf("expected status=REDEEMABLE param, got %q", r.URL.Query().Get("status"))
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]DataAPIPosition{})
+		writeV2Positions(t, w, nil, "")
 	}))
 	defer server.Close()
 
@@ -39,21 +38,21 @@ func TestGetRedeemablePositions_StandardMarket(t *testing.T) {
 
 	apiPositions := []DataAPIPosition{
 		{
-			Title:        "Will X happen?",
-			Outcome:      "Yes",
-			ConditionID:  "0xabc123",
-			Asset:        "token-yes-id",
+			Title:         "Will X happen?",
+			Outcome:       "Yes",
+			ConditionID:   "0xabc123",
+			Asset:         "token-yes-id",
 			OppositeAsset: "token-no-id",
-			Size:         50.0,
-			CurPrice:     1.0,
-			Redeemable:   true,
-			NegativeRisk: false,
+			Size:          50.0,
+			CurPrice:      1.0,
+			Redeemable:    true,
+			NegativeRisk:  false,
 		},
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(apiPositions)
+		writeV2Positions(t, w, apiPositions, "")
 	}))
 	defer server.Close()
 
@@ -107,7 +106,7 @@ func TestGetRedeemablePositions_NegRiskMarket(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(apiPositions)
+		writeV2Positions(t, w, apiPositions, "")
 	}))
 	defer server.Close()
 
@@ -150,7 +149,7 @@ func TestGetRedeemablePositions_FiltersZeroSize(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(apiPositions)
+		writeV2Positions(t, w, apiPositions, "")
 	}))
 	defer server.Close()
 
@@ -188,7 +187,7 @@ func TestGetRedeemablePositions_FiltersLosingPositions(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(apiPositions)
+		writeV2Positions(t, w, apiPositions, "")
 	}))
 	defer server.Close()
 
@@ -216,7 +215,7 @@ func TestGetRedeemablePositions_URLFormat(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestURL = r.URL.String()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]DataAPIPosition{})
+		writeV2Positions(t, w, nil, "")
 	}))
 	defer server.Close()
 
@@ -231,15 +230,21 @@ func TestGetRedeemablePositions_URLFormat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse request URL: %v", err)
 	}
-	if parsed.Path != "/positions" {
-		t.Errorf("path = %q, want /positions", parsed.Path)
+	if parsed.Path != "/v2/positions" {
+		t.Errorf("path = %q, want /v2/positions", parsed.Path)
 	}
 	q := parsed.Query()
 	if got, want := q.Get("user"), "0xabcdef1234567890abcdef1234567890abcdef12"; got != want {
 		t.Errorf("user param = %q, want %q", got, want)
 	}
-	if q.Get("redeemable") != "true" {
-		t.Errorf("redeemable param = %q, want true", q.Get("redeemable"))
+	if q.Get("status") != "REDEEMABLE" {
+		t.Errorf("status param = %q, want REDEEMABLE", q.Get("status"))
+	}
+	// v2 rejects the obsolete v1 params with HTTP 400.
+	for _, banned := range []string{"redeemable", "offset", "market"} {
+		if q.Has(banned) {
+			t.Errorf("obsolete v1 param %q must not be sent to v2", banned)
+		}
 	}
 	if q.Get("limit") == "" {
 		t.Errorf("limit param missing, expected to be set to bypass default 100-row pagination")
