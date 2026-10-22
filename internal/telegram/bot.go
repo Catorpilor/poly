@@ -90,6 +90,14 @@ type Bot struct {
 	// the token. Lazily initialized under snipeRestingMu.
 	snipeRestingMu     sync.Mutex
 	snipeRestingOrders map[int64]map[string]map[string]bool // chatID -> tokenID -> orderID -> true
+
+	// Combo Links (issue #118). comboMarketFn / comboQuoteFn are test seams
+	// (nil = Gamma by id / the user's live RFQ quote). comboLinks maps a
+	// 🔄 Refresh key to its link; in-memory, lost on restart.
+	comboMarketFn func(ctx context.Context, id string) (*polymarket.GammaMarket, error)
+	comboQuoteFn  func(ctx context.Context, userID int64, legPositionIDs []string, stakeUSD float64) (*polymarket.ComboQuote, error)
+	comboLinksMu  sync.Mutex
+	comboLinks    map[string]string
 }
 
 // snipePositionSource is the slice of the position scanner the held-registration
@@ -363,6 +371,12 @@ func (b *Bot) handleDeepLink(ctx context.Context, update *tgbotapi.Update) {
 	if strings.HasPrefix(parameter, "s_") {
 		slug := strings.TrimPrefix(parameter, "s_")
 		b.handleMarketBySlug(ctx, update, slug)
+		return
+	}
+
+	// Handle combo deep links: c_<marketId><y|n>... (issue #118, ADR 0009)
+	if strings.HasPrefix(parameter, polymarket.ComboLinkPrefix) {
+		b.handleComboLink(ctx, update, parameter)
 		return
 	}
 
@@ -1018,6 +1032,9 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, update *tgbotapi.Update) 
 
 	case strings.HasPrefix(data, "buy:"):
 		b.handleBuyCallback(ctx, update)
+
+	case strings.HasPrefix(data, comboRefreshPrefix):
+		b.handleComboRefresh(ctx, update)
 
 	case strings.HasPrefix(data, "amt:"):
 		b.handleAmountCallback(ctx, update)
