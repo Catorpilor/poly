@@ -228,3 +228,15 @@ func TestIsComboRateLimited(t *testing.T) {
 		t.Error("only a gateway 429 counts")
 	}
 }
+
+func TestComboRFQHTTPStatus(t *testing.T) {
+	t.Parallel()
+	tc := newRFQServer(t, http.StatusConflict, `{"error":"rfq state conflict","code":"CONFLICT"}`, nil)
+	_, err := tc.GetComboRFQStatus(context.Background(), rfqTestEOA, &APICredentials{Secret: rfqTestSecret}, "rfq-1")
+	if ComboRFQHTTPStatus(err) != 409 {
+		t.Errorf("status = %d, want 409 (%v)", ComboRFQHTTPStatus(err), err)
+	}
+	if ComboRFQHTTPStatus(errors.New("dial tcp: timeout")) != 0 || ComboRFQHTTPStatus(nil) != 0 {
+		t.Error("non-gateway errors must be 0")
+	}
+}

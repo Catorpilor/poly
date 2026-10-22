@@ -268,3 +268,13 @@ func IsComboRateLimited(err error) bool {
 	var he *rfqHTTPError
 	return errors.As(err, &he) && he.Status == http.StatusTooManyRequests
 }
+
+// ComboRFQHTTPStatus is the gateway's HTTP status for a rejected request,
+// or 0 when err is not a gateway response (nil, transport, decoding).
+func ComboRFQHTTPStatus(err error) int {
+	var he *rfqHTTPError
+	if errors.As(err, &he) {
+		return he.Status
+	}
+	return 0
+}
