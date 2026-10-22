@@ -53,6 +53,55 @@ watch and the web tape only.
 **Position** — A user's current holdings of one outcome token: share count
 plus average price. Lives on Polymarket, keyed by Token ID.
 
+**Combo** — One YES/NO position built from 2–50 Legs across different
+markets; its YES pays only if every Leg wins. Bought by request-for-quote,
+never from an order book, so it has no resting Orders, no public tape and
+no published price. Identified on-chain by its **Combo Condition**, but it
+has no slug and no page: outside the chain a Combo is addressed by its
+Legs. Shown on Polymarket as the leg questions joined with " AND ".
+_Avoid_: parlay, multi, accumulator
+
+**Leg** — One market outcome inside a Combo: a market plus a side (YES
+or NO). Its leg position ID is not the CLOB Token ID of that outcome.
+
+**Copy Signal** — A Telegram notification, sent by an external notifier
+(not this bot), that a tracked wallet traded. It carries a deep link into
+the bot; opening it shows the market at the *current* price so the user
+can decide to follow. The bot never watches wallets or trades on a signal
+by itself.
+_Avoid_: copy trade (implies automatic execution)
+
+**Combo Link** — A deep link into the bot that addresses a Combo by its
+Legs alone (each leg's market and side), with no wallet or Combo Condition.
+Not human-readable. The Copy Signal for a combo trade carries one.
+
+**Combo Quote** — A market maker's executable price for one Combo at one
+stake, valid for seconds. The only real Combo price; requesting one
+commits to nothing.
+
+**Combo Estimate** — The product of the Legs' current prices. Indicative
+only: it ignores maker margin, fees and whether anyone will quote at all.
+
+**Multiplier** — What a Combo pays back per dollar staked if every Leg
+wins. Quoted fee-inclusive (shares received ÷ collateral paid); an
+Estimate's multiplier is before fees.
+_Avoid_: odds, payout ratio
+
+**Multiplier Tolerance** — How much worse than the displayed Multiplier a
+fresh Combo Quote may be and still be taken without asking again (5%). A
+worse quote is shown to the user, never taken. The Combo counterpart of the
+Slippage Allowance.
+
+**Combo Position** — A user's holdings of one side of a Combo: shares,
+entry cost and each Leg's status. Keyed by the combo position ID, not a
+Token ID, and never a **Position** for SL/TP, Comeback Snipe or Resting
+Order Intent \u2014 those all need an order book.
+
+**Take** — Signing and submitting a Combo Quote so it executes. Polymarket's
+API calls this "accept"; here that word is reserved for **Acceptance**, and
+a Combo succeeds only on **Fill**.
+_Avoid_: accept (for quotes)
+
 **Token ID** — The ERC-1155 token identifier of one outcome of one market.
 The canonical identity for outcomes and positions.
 
