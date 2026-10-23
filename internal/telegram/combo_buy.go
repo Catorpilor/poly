@@ -48,15 +48,25 @@ func (b *Bot) setComboDisplayed(userID int64, key string, q *polymarket.ComboQuo
 	if err == nil && !q.NoQuote() {
 		mult = q.Multiplier()
 	}
+	b.setComboDisplayedValue(userID, key, mult)
+}
+
+func (b *Bot) comboDisplayed(userID int64, key string) float64 {
+	return b.comboDisplayedValue(userID, key)
+}
+
+// setComboDisplayedValue records the reference figure on a user's screen:
+// a buy multiplier, or a sell's proceeds per share (0 = nothing shown).
+func (b *Bot) setComboDisplayedValue(userID int64, key string, v float64) {
 	b.comboStateMu.Lock()
 	defer b.comboStateMu.Unlock()
 	if b.comboDisplayedMult == nil {
 		b.comboDisplayedMult = make(map[comboUserKey]float64)
 	}
-	b.comboDisplayedMult[comboUserKey{userID, key}] = mult
+	b.comboDisplayedMult[comboUserKey{userID, key}] = v
 }
 
-func (b *Bot) comboDisplayed(userID int64, key string) float64 {
+func (b *Bot) comboDisplayedValue(userID int64, key string) float64 {
 	b.comboStateMu.Lock()
 	defer b.comboStateMu.Unlock()
 	return b.comboDisplayedMult[comboUserKey{userID, key}]
@@ -180,46 +190,58 @@ func (b *Bot) comboBuy(ctx context.Context, userID, chatID int64, msgID int, key
 		}
 
 		keepPending = true
-		b.followComboTake(ctx, acct, chatID, msgID, lc, q, res.RFQID)
+		b.followComboTake(ctx, acct, chatID, msgID, res.RFQID, comboFollow{
+			pendingText: comboLegsText(lc.view) +
+				"⏳ *Pending* — the market maker hasn't settled this buy yet. I'll update this message when it does.\n" +
+				"Don't buy this combo again until then.",
+			unknownText: func(w time.Duration) string {
+				return comboLegsText(lc.view) + fmt.Sprintf(
+					"⚠️ Still no final status after %s — the outcome is *unknown*. Check /positions before buying this combo again.", w)
+			},
+			finish: func(res *polymarket.ComboTakeResult) {
+				if res.Filled() {
+					b.showComboScreen(chatID, msgID, comboFilledText(lc, q, res), nil)
+					return
+				}
+				show(comboQuoteLine(q, nil), "❌ Combo buy failed: "+escapeMarkdown(comboRefusal(res))+". Nothing was bought.")
+			},
+			release: func() { b.clearComboPending(userID, key) },
+		})
 		return
 	}
 }
 
+// comboFollow says how to report a Pending Take (buy or sell).
+type comboFollow struct {
+	pendingText string                                // shown when inline polling ends unresolved
+	unknownText func(window time.Duration) string     // shown when background polling ends unresolved
+	finish      func(res *polymarket.ComboTakeResult) // terminal status: Filled or Failed
+	release     func()                                // clears the Pending block
+}
+
 // followComboTake polls a Pending Take: inline for comboInlineWait, then in
-// the background for comboBackgroundWait, editing the message on a terminal
-// status. It never reports failure without one (ADR 0010) and releases the
-// Pending block when done.
-func (b *Bot) followComboTake(ctx context.Context, acct *comboAccount, chatID int64, msgID int, lc *loadedCombo, q *polymarket.ComboQuote, rfqID string) {
+// the background for comboBackgroundWait, reporting a terminal status via
+// f.finish. It never reports failure without one (ADR 0010) and always
+// releases the Pending block when done.
+func (b *Bot) followComboTake(ctx context.Context, acct *comboAccount, chatID int64, msgID int, rfqID string, f comboFollow) {
 	every := durationOr(b.comboPollEvery, comboPollEveryDefault)
 	inline := durationOr(b.comboInlineWait, comboInlineWaitDefault)
 	background := durationOr(b.comboBackgroundWait, comboBackgroundWaitDefault)
 
-	finish := func(res *polymarket.ComboTakeResult) {
-		if res.Filled() {
-			b.showComboScreen(chatID, msgID, comboFilledText(lc, q, res), nil)
-		} else {
-			t, k := b.renderBuyableCombo(lc, comboQuoteLine(q, nil), "❌ Combo buy failed: "+escapeMarkdown(comboRefusal(res))+". Nothing was bought.")
-			b.showComboScreen(chatID, msgID, t, k)
-		}
-		b.clearComboPending(acct.userID, lc.key)
-	}
-
 	if res := b.pollComboTake(ctx, acct, rfqID, every, inline); res != nil {
-		finish(res)
+		f.finish(res)
+		f.release()
 		return
 	}
-	b.showComboScreen(chatID, msgID, comboLegsText(lc.view)+
-		"⏳ *Pending* — the market maker hasn't settled this buy yet. I'll update this message when it does.\n"+
-		"Don't buy this combo again until then.", nil)
+	b.showComboScreen(chatID, msgID, f.pendingText, nil)
 
 	go func() {
+		defer f.release()
 		if res := b.pollComboTake(ctx, acct, rfqID, every, background); res != nil {
-			finish(res)
+			f.finish(res)
 			return
 		}
-		b.showComboScreen(chatID, msgID, comboLegsText(lc.view)+fmt.Sprintf(
-			"⚠️ Still no final status after %s — the outcome is *unknown*. Check /positions before buying this combo again.", background), nil)
-		b.clearComboPending(acct.userID, lc.key)
+		b.showComboScreen(chatID, msgID, f.unknownText(background), nil)
 	}()
 }
 

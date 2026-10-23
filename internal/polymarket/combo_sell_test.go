@@ -140,11 +140,12 @@ func TestComboPosition_Sellable(t *testing.T) {
 		c    ComboPosition
 		want bool
 	}{
-		{"open", ComboPosition{Status: "OPEN", SharesE6: 1, Legs: []ComboPositionLeg{leg("OPEN"), leg("OPEN")}}, true},
-		{"partial, a leg won", ComboPosition{Status: "PARTIAL", SharesE6: 1, Legs: []ComboPositionLeg{leg("RESOLVED_WIN"), leg("OPEN")}}, true},
+		{"open", ComboPosition{Status: "OPEN", SharesE6: 10_000, Legs: []ComboPositionLeg{leg("OPEN"), leg("OPEN")}}, true},
+		{"partial, a leg won", ComboPosition{Status: "PARTIAL", SharesE6: 10_000, Legs: []ComboPositionLeg{leg("RESOLVED_WIN"), leg("OPEN")}}, true},
 		{"a leg lost", ComboPosition{Status: "PARTIAL", SharesE6: 1, Legs: []ComboPositionLeg{leg("RESOLVED_LOSS"), leg("OPEN")}}, false},
 		{"won: redeem, don't sell", ComboPosition{Status: "REDEEMABLE", Redeemable: true, SharesE6: 1, Legs: []ComboPositionLeg{leg("RESOLVED_WIN"), leg("RESOLVED_WIN")}}, false},
 		{"no shares", ComboPosition{Status: "OPEN", Legs: []ComboPositionLeg{leg("OPEN"), leg("OPEN")}}, false},
+		{"dust below one 0.01-share step", ComboPosition{Status: "OPEN", SharesE6: 8_319, Legs: []ComboPositionLeg{leg("OPEN"), leg("OPEN")}}, false},
 	}
 	for _, tt := range tests {
 		if got := tt.c.Sellable(); got != tt.want {

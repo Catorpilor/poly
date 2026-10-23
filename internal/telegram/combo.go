@@ -240,14 +240,23 @@ func (b *Bot) loadComboAccount(ctx context.Context, userID int64) (*comboAccount
 	}, nil
 }
 
-// comboQuote requests a Combo Quote (seam: comboQuoteFn).
+// comboQuote requests a BUY Combo Quote for stakeUSD (seam: comboQuoteFn).
 func (b *Bot) comboQuote(ctx context.Context, acct *comboAccount, legs []string, stakeUSD float64) (*polymarket.ComboQuote, error) {
+	return b.comboRFQQuote(ctx, acct, legs, stakeUSD, 0)
+}
+
+// comboSellQuote requests a SELL Combo Quote for sharesE6 shares.
+func (b *Bot) comboSellQuote(ctx context.Context, acct *comboAccount, legs []string, sharesE6 int64) (*polymarket.ComboQuote, error) {
+	return b.comboRFQQuote(ctx, acct, legs, 0, sharesE6)
+}
+
+func (b *Bot) comboRFQQuote(ctx context.Context, acct *comboAccount, legs []string, stakeUSD float64, sellSharesE6 int64) (*polymarket.ComboQuote, error) {
 	if b.comboQuoteFn != nil {
-		return b.comboQuoteFn(ctx, acct, legs, stakeUSD)
+		return b.comboQuoteFn(ctx, acct, legs, stakeUSD, sellSharesE6)
 	}
 	return b.tradingClient.RequestComboQuote(ctx, polymarket.ComboQuoteRequest{
 		EOA: acct.eoa, Proxy: acct.proxy, AccountType: acct.accountType,
-		Creds: acct.creds, LegPositionIDs: legs, StakeUSD: stakeUSD,
+		Creds: acct.creds, LegPositionIDs: legs, StakeUSD: stakeUSD, SellSharesE6: sellSharesE6,
 	})
 }
 

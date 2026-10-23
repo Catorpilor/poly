@@ -23,6 +23,13 @@ func NewUnifiedPositionScanner() *UnifiedPositionScanner {
 
 // ScanAllStrategies fetches positions using Polymarket Data API
 func (ups *UnifiedPositionScanner) ScanAllStrategies(ctx context.Context, proxyAddress common.Address) (string, error) {
+	summary, _, err := ups.ScanWithCombos(ctx, proxyAddress)
+	return summary, err
+}
+
+// ScanWithCombos is ScanAllStrategies plus the held Combos it listed, in
+// display order (nil when the combo lookup failed), for the Sell buttons.
+func (ups *UnifiedPositionScanner) ScanWithCombos(ctx context.Context, proxyAddress common.Address) (string, []*ComboPosition, error) {
 	log.Printf("Starting position scan for proxy: %s", proxyAddress.Hex())
 
 	// Use Polymarket Data API only
@@ -30,7 +37,7 @@ func (ups *UnifiedPositionScanner) ScanAllStrategies(ctx context.Context, proxyA
 	positions, err := ups.positionManager.GetUserPositionsFromAPI(ctx, proxyAddress)
 	if err != nil {
 		log.Printf("Data API error: %v", err)
-		return "Failed to fetch positions. Please try again later.", err
+		return "Failed to fetch positions. Please try again later.", nil, err
 	}
 
 	log.Printf("Data API returned %d active positions", len(positions))
@@ -46,7 +53,7 @@ func (ups *UnifiedPositionScanner) ScanAllStrategies(ctx context.Context, proxyA
 	case len(combos) > 0:
 		summary += "\n\n" + FormatComboPositions(combos)
 	}
-	return summary, nil
+	return summary, combos, nil
 }
 
 // GetPositions fetches raw positions for selling

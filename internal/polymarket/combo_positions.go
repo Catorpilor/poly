@@ -102,11 +102,16 @@ func (c *ComboPosition) LegPositionIDs() []string {
 	return ids
 }
 
+// ComboShareStepE6 is the RFQ gateway's sell size step: 0.01 share. It
+// rounds requested SELL sizes down to it (13.798319 -> 13.79, observed live
+// 2026-10-22), so anything smaller cannot be sold back.
+const ComboShareStepE6 = 10_000
+
 // Sellable reports whether a held combo can be sold back: live (not
-// redeemable), some shares, and no leg lost — a lost leg makes it
-// worthless, and a won combo should be redeemed, not sold (issue #125).
+// redeemable), at least one 0.01-share step, and no leg lost — a lost leg
+// makes it worthless, and a won combo should be redeemed, not sold (#125).
 func (c *ComboPosition) Sellable() bool {
-	if c.Redeemable || c.SharesE6 <= 0 || (c.Status != "OPEN" && c.Status != "PARTIAL") {
+	if c.Redeemable || c.SharesE6 < ComboShareStepE6 || (c.Status != "OPEN" && c.Status != "PARTIAL") {
 		return false
 	}
 	for _, l := range c.Legs {

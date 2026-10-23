@@ -94,17 +94,18 @@ type Bot struct {
 	// Combo Links (issue #118). comboMarketFn / comboQuoteFn are test seams
 	// (nil = Gamma by id / the user's live RFQ quote). comboLinks maps a
 	// 🔄 Refresh key to its link; in-memory, lost on restart.
-	comboMarketFn  func(ctx context.Context, id string) (*polymarket.GammaMarket, error)
-	comboAccountFn func(ctx context.Context, userID int64) (*comboAccount, error)
-	comboQuoteFn   func(ctx context.Context, acct *comboAccount, legPositionIDs []string, stakeUSD float64) (*polymarket.ComboQuote, error)
-	comboBalanceFn func(ctx context.Context, acct *comboAccount) (int64, error)
-	comboTakeFn    func(ctx context.Context, acct *comboAccount, q *polymarket.ComboQuote) (*polymarket.ComboTakeResult, error)
-	comboStatusFn  func(ctx context.Context, acct *comboAccount, rfqID string) (*polymarket.ComboTakeResult, error)
-	comboEditFn    func(chatID int64, msgID int, text string, kb *tgbotapi.InlineKeyboardMarkup)
-	comboNotifyFn  func(chatID int64, text string)
-	comboSendFn    func(chatID int64, text string) int // new message, returns its id
-	comboLinksMu   sync.Mutex
-	comboLinks     map[string]string
+	comboMarketFn   func(ctx context.Context, id string) (*polymarket.GammaMarket, error)
+	comboAccountFn  func(ctx context.Context, userID int64) (*comboAccount, error)
+	comboQuoteFn    func(ctx context.Context, acct *comboAccount, legPositionIDs []string, stakeUSD float64, sellSharesE6 int64) (*polymarket.ComboQuote, error)
+	comboPositionFn func(ctx context.Context, acct *comboAccount, comboConditionID string) (*polymarket.ComboPosition, error)
+	comboBalanceFn  func(ctx context.Context, acct *comboAccount) (int64, error)
+	comboTakeFn     func(ctx context.Context, acct *comboAccount, q *polymarket.ComboQuote) (*polymarket.ComboTakeResult, error)
+	comboStatusFn   func(ctx context.Context, acct *comboAccount, rfqID string) (*polymarket.ComboTakeResult, error)
+	comboEditFn     func(chatID int64, msgID int, text string, kb *tgbotapi.InlineKeyboardMarkup)
+	comboNotifyFn   func(chatID int64, text string)
+	comboSendFn     func(chatID int64, text string) int // new message, returns its id
+	comboLinksMu    sync.Mutex
+	comboLinks      map[string]string
 
 	// Combo buy state (ADR 0010), in-memory: the multiplier on each user's
 	// screen per link (Multiplier Tolerance reference) and Pending Takes.
@@ -1062,6 +1063,15 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, update *tgbotapi.Update) 
 	case strings.HasPrefix(data, comboCustomPrefix):
 		b.handleComboCustomCallback(ctx, update)
 
+	case strings.HasPrefix(data, comboSellPrefix):
+		b.handleComboSellOpen(ctx, update)
+
+	case strings.HasPrefix(data, comboSellQtyPrefix):
+		b.handleComboSellQty(ctx, update)
+
+	case strings.HasPrefix(data, comboSellRefreshPrefix):
+		b.handleComboSellRefresh(ctx, update)
+
 	case strings.HasPrefix(data, "amt:"):
 		b.handleAmountCallback(ctx, update)
 
@@ -1679,7 +1689,7 @@ func (b *Bot) handleRefreshPositions(ctx context.Context, update *tgbotapi.Updat
 	// Fetch positions using Polymarket Data API (no blockchain required)
 	proxyAddr := common.HexToAddress(user.ProxyAddress)
 	unifiedScanner := polymarket.NewUnifiedPositionScanner()
-	summary, err := unifiedScanner.ScanAllStrategies(ctx, proxyAddr)
+	summary, combos, err := unifiedScanner.ScanWithCombos(ctx, proxyAddr)
 	if err != nil {
 		log.Printf("Unified position scan error: %v", err)
 	}
@@ -1709,6 +1719,8 @@ func (b *Bot) handleRefreshPositions(ctx context.Context, update *tgbotapi.Updat
 			tgbotapi.NewInlineKeyboardButtonData("🎯 SL/TP", "sltp_list"),
 		),
 	)
+	// 💰 Sell combo N for each sellable combo listed (issue #125).
+	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, b.comboSellRows(combos)...)
 
 	b.editMessageWithKeyboard(chatID, messageID, fullMessage, keyboard)
 }
