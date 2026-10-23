@@ -92,8 +92,9 @@ _Avoid_: odds, payout ratio
 fresh Combo Quote may be and still be taken without asking again (5%). A
 worse quote is shown to the user — becoming the displayed Multiplier —
 never taken. With no Multiplier on screen (no quote yet), a stake tap only
-fetches one: the bot never takes a price the user has not seen. The Combo
-counterpart of the Slippage Allowance.
+fetches one: the bot never takes a price the user has not seen. For a
+sell, the same 5% applies to proceeds per share. The Combo counterpart of
+the Slippage Allowance.
 
 **Combo Position** — A user's holdings of one side of a Combo: shares,
 entry cost and each Leg's status. Keyed by the combo position ID, not a
@@ -105,9 +106,10 @@ API calls this "accept"; here that word is reserved for **Acceptance**, and
 a Combo succeeds only on **Fill**.
 _Avoid_: accept (for quotes)
 
-**Pending Take** — A Take that has reached neither a Fill nor a terminal
-failure (failed, expired, canceled). Never reported as failed: while one is
-pending on a Combo, the user cannot buy that same Combo again. If it is still
+**Pending Take** — A Take (buy or sell) that has reached neither a Fill nor
+a terminal failure (failed, expired, canceled). Never reported as failed:
+while one is pending on a Combo, the user cannot trade that same Combo again
+in the same direction. If it is still
 unresolved when the bot stops checking, its outcome is *unknown*, not failed.
 
 **Token ID** — The ERC-1155 token identifier of one outcome of one market.

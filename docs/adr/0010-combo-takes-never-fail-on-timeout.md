@@ -44,3 +44,13 @@ truth.
   do not. The asymmetry follows which mistake is recoverable.
 - A restart during a Pending Take can leave a stale "⏳ Pending" message; the
   combo still shows in `/positions` if it filled.
+
+## Addendum (2026-10-22): sells
+
+Combo sells (RFQ `SELL`, priced in shares) follow the same three outcomes —
+**Sold**, **Failed** only on a terminal status, **Pending** with background
+polling and an *unknown* (never "failed") ending — and block further sells
+of the same Combo position while one is Pending. A double sell is less
+harmful than a double buy (the wallet cannot sell shares it no longer holds),
+but one rule for every Combo Take keeps the flow predictable and reuses the
+same machinery. The Multiplier Tolerance applies to proceeds per share.
