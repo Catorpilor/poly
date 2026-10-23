@@ -87,7 +87,8 @@ type comboRFQStateResponse struct {
 	} `json:"error"`
 }
 
-// TakeComboQuote signs the BUY requester order for a quote and accepts it.
+// TakeComboQuote signs the requester order for a quote (side 0 BUY, 1 SELL)
+// and accepts it.
 // The order uses the quote's amounts verbatim, tokenId = the combo YES
 // position id, builder = zero, and a unix-seconds timestamp. An HTTP 409
 // (acceptance window expired) is a terminal EXPIRED result, not an error:
@@ -105,13 +106,17 @@ func (tc *TradingClient) TakeComboQuote(ctx context.Context, req ComboTakeReques
 		return nil, err
 	}
 
+	side := orderv2.BUY
+	if q.Direction == "SELL" {
+		side = orderv2.SELL
+	}
 	signed, err := tc.builder.BuildSignedOrder(req.PrivateKey, &orderv2.OrderData{
 		Maker:         maker.Hex(),
 		Signer:        signer.Hex(),
 		TokenId:       q.YesPositionID,
 		MakerAmount:   strconv.FormatInt(q.MakerAmountE6, 10),
 		TakerAmount:   strconv.FormatInt(q.TakerAmountE6, 10),
-		Side:          orderv2.BUY,
+		Side:          side,
 		SignatureType: orderv2.SignatureType(sigType),
 		Timestamp:     strconv.FormatInt(time.Now().Unix(), 10),
 	}, orderv2.ExchangeV3)
