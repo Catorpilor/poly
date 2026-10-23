@@ -52,7 +52,7 @@ type fakeComboQuoter struct {
 	err   error
 }
 
-func (f *fakeComboQuoter) fn(_ context.Context, acct *comboAccount, legs []string, stake float64) (*polymarket.ComboQuote, error) {
+func (f *fakeComboQuoter) fn(_ context.Context, acct *comboAccount, legs []string, stake float64, _ int64) (*polymarket.ComboQuote, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, quoteCall{acct.userID, append([]string(nil), legs...), stake})

@@ -711,7 +711,7 @@ func (b *Bot) handlePositions(ctx context.Context, bot *Bot, update *tgbotapi.Up
 	// Fetch positions using Polymarket Data API (no blockchain required)
 	proxyAddr := common.HexToAddress(user.ProxyAddress)
 	unifiedScanner := polymarket.NewUnifiedPositionScanner()
-	summary, err := unifiedScanner.ScanAllStrategies(ctx, proxyAddr)
+	summary, combos, err := unifiedScanner.ScanWithCombos(ctx, proxyAddr)
 	if err != nil {
 		log.Printf("Unified position scan error: %v", err)
 	}
@@ -741,6 +741,8 @@ func (b *Bot) handlePositions(ctx context.Context, bot *Bot, update *tgbotapi.Up
 			tgbotapi.NewInlineKeyboardButtonData("🎯 SL/TP", "sltp_list"),
 		),
 	)
+	// 💰 Sell combo N for each sellable combo listed (issue #125).
+	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, b.comboSellRows(combos)...)
 
 	b.sendMessageWithKeyboard(update.Message.Chat.ID, fullMessage, keyboard)
 	return nil

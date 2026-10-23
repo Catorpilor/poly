@@ -48,7 +48,7 @@ func (g *fakeComboGateway) install(b *Bot) {
 	b.comboMarketFn = nil
 	b.comboAccountFn = fakeComboAccount(false)
 	b.comboBalanceFn = func(context.Context, *comboAccount) (int64, error) { return g.balanceE6, nil }
-	b.comboQuoteFn = func(_ context.Context, _ *comboAccount, _ []string, stake float64) (*polymarket.ComboQuote, error) {
+	b.comboQuoteFn = func(_ context.Context, _ *comboAccount, _ []string, stake float64, _ int64) (*polymarket.ComboQuote, error) {
 		g.mu.Lock()
 		defer g.mu.Unlock()
 		g.stakes = append(g.stakes, stake)

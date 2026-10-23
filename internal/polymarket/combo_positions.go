@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -16,17 +17,20 @@ import (
 // /v2/positions/combos). Read-only: SL/TP, Comeback Snipe and Resting Order
 // Intent never apply to it (issue #118).
 type ComboPosition struct {
-	Status       string // OPEN, PARTIAL, REDEEMABLE, RESOLVED_WIN, RESOLVED_LOSS, RESOLVED_PARTIAL
-	Redeemable   bool
-	Shares       float64 // combo shares; each pays $1 if every leg wins
-	Paid         float64 // gross entry cost, fees included
-	LegsTotal    int
-	LegsResolved int
-	Legs         []ComboPositionLeg // in leg order
+	ComboConditionID string
+	Status           string // OPEN, PARTIAL, REDEEMABLE, RESOLVED_WIN, RESOLVED_LOSS, RESOLVED_PARTIAL
+	Redeemable       bool
+	Shares           float64 // combo shares; each pays $1 if every leg wins
+	SharesE6         int64   // Shares in 6-decimal units (what a SELL quotes)
+	Paid             float64 // gross entry cost, fees included
+	LegsTotal        int
+	LegsResolved     int
+	Legs             []ComboPositionLeg // in leg order
 }
 
 // ComboPositionLeg is one leg of a held Combo.
 type ComboPositionLeg struct {
+	PositionID   string // leg position id (RFQ leg_position_ids)
 	Question     string
 	OutcomeLabel string
 	Status       string // OPEN, RESOLVED_WIN, RESOLVED_LOSS
@@ -35,14 +39,16 @@ type ComboPositionLeg struct {
 
 type comboPositionsPage struct {
 	Data []struct {
-		Status       string  `json:"status"`
-		Redeemable   bool    `json:"redeemable"`
-		CurrentSize  float64 `json:"current_size"`
-		GrossCost    float64 `json:"gross_entry_cost_usdc"`
-		LegsTotal    int     `json:"legs_total"`
-		LegsResolved int     `json:"legs_resolved"`
-		Legs         []struct {
+		ComboConditionID string  `json:"combo_condition_id"`
+		Status           string  `json:"status"`
+		Redeemable       bool    `json:"redeemable"`
+		CurrentSize      float64 `json:"current_size"`
+		GrossCost        float64 `json:"gross_entry_cost_usdc"`
+		LegsTotal        int     `json:"legs_total"`
+		LegsResolved     int     `json:"legs_resolved"`
+		Legs             []struct {
 			LegIndex     int     `json:"leg_index"`
+			PositionID   string  `json:"leg_position_id"`
 			LegStatus    string  `json:"leg_status"`
 			OutcomeLabel string  `json:"leg_outcome_label"`
 			CurrentPrice float64 `json:"leg_current_price"`
@@ -69,6 +75,54 @@ func comboHeld(status string, redeemable bool) bool {
 // GetComboPositions lists the wallet's held Combos (see comboHeld), newest
 // first, following cursor pagination.
 func (pm *PositionManager) GetComboPositions(ctx context.Context, proxyAddress common.Address) ([]*ComboPosition, error) {
+	return pm.fetchComboPositions(ctx, proxyAddress, "")
+}
+
+// GetComboPosition returns one held Combo by its Combo Condition, or nil
+// when the wallet no longer holds it.
+func (pm *PositionManager) GetComboPosition(ctx context.Context, proxyAddress common.Address, comboConditionID string) (*ComboPosition, error) {
+	combos, err := pm.fetchComboPositions(ctx, proxyAddress, comboConditionID)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range combos {
+		if strings.EqualFold(c.ComboConditionID, comboConditionID) {
+			return c, nil
+		}
+	}
+	return nil, nil
+}
+
+// LegPositionIDs returns the leg position ids in leg order, for a SELL RFQ.
+func (c *ComboPosition) LegPositionIDs() []string {
+	ids := make([]string, len(c.Legs))
+	for i, l := range c.Legs {
+		ids[i] = l.PositionID
+	}
+	return ids
+}
+
+// ComboShareStepE6 is the RFQ gateway's sell size step: 0.01 share. It
+// rounds requested SELL sizes down to it (13.798319 -> 13.79, observed live
+// 2026-10-22), so anything smaller cannot be sold back.
+const ComboShareStepE6 = 10_000
+
+// Sellable reports whether a held combo can be sold back: live (not
+// redeemable), at least one 0.01-share step, and no leg lost — a lost leg
+// makes it worthless, and a won combo should be redeemed, not sold (#125).
+func (c *ComboPosition) Sellable() bool {
+	if c.Redeemable || c.SharesE6 < ComboShareStepE6 || (c.Status != "OPEN" && c.Status != "PARTIAL") {
+		return false
+	}
+	for _, l := range c.Legs {
+		if l.Status == "RESOLVED_LOSS" {
+			return false
+		}
+	}
+	return true
+}
+
+func (pm *PositionManager) fetchComboPositions(ctx context.Context, proxyAddress common.Address, condition string) ([]*ComboPosition, error) {
 	base := pm.dataAPIURL + "/v2/positions/combos"
 	user := strings.ToLower(proxyAddress.Hex())
 
@@ -77,6 +131,9 @@ func (pm *PositionManager) GetComboPositions(ctx context.Context, proxyAddress c
 	for page := 0; page < maxPositionPages; page++ {
 		q := url.Values{}
 		q.Set("user", user)
+		if condition != "" {
+			q.Set("condition", condition)
+		}
 		if cursor == "" {
 			q.Set("limit", "100")
 		} else {
@@ -110,12 +167,15 @@ func (pm *PositionManager) GetComboPositions(ctx context.Context, proxyAddress c
 			}
 			sort.SliceStable(d.Legs, func(i, j int) bool { return d.Legs[i].LegIndex < d.Legs[j].LegIndex })
 			c := &ComboPosition{
-				Status: d.Status, Redeemable: d.Redeemable, Shares: d.CurrentSize, Paid: d.GrossCost,
+				ComboConditionID: d.ComboConditionID,
+				Status:           d.Status, Redeemable: d.Redeemable, Shares: d.CurrentSize, Paid: d.GrossCost,
+				SharesE6:  int64(math.Round(d.CurrentSize * 1e6)),
 				LegsTotal: d.LegsTotal, LegsResolved: d.LegsResolved,
 			}
 			for _, l := range d.Legs {
 				c.Legs = append(c.Legs, ComboPositionLeg{
-					Question: l.Market.Question, OutcomeLabel: l.OutcomeLabel, Status: l.LegStatus, Price: l.CurrentPrice,
+					PositionID: l.PositionID, Question: l.Market.Question, OutcomeLabel: l.OutcomeLabel,
+					Status: l.LegStatus, Price: l.CurrentPrice,
 				})
 			}
 			out = append(out, c)

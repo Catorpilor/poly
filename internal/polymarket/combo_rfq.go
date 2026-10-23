@@ -22,8 +22,9 @@ const comboRFQURLDefault = "https://combos-rfq-gateway-requester-api.polymarket.
 
 const comboRFQRequestsPath = "/v1/requester/rfq/requests"
 
-// ComboQuoteRequest asks for a Combo Quote: BUY the YES side of the combo
-// formed by LegPositionIDs, spending at most StakeUSD (fees included).
+// ComboQuoteRequest asks for a Combo Quote on the YES side of the combo
+// formed by LegPositionIDs: a BUY spending at most StakeUSD (fees included),
+// or a SELL of SellSharesE6 combo shares (6 decimals). Exactly one is set.
 type ComboQuoteRequest struct {
 	EOA            common.Address // owner of the CLOB API credentials
 	Proxy          common.Address // Trading Wallet
@@ -31,6 +32,7 @@ type ComboQuoteRequest struct {
 	Creds          *APICredentials
 	LegPositionIDs []string
 	StakeUSD       float64
+	SellSharesE6   int64
 }
 
 // ComboQuote is the gateway's answer to a quote request. A FAILED status
@@ -38,6 +40,7 @@ type ComboQuoteRequest struct {
 type ComboQuote struct {
 	RFQID            string
 	QuoteID          string
+	Direction        string // "BUY" or "SELL"
 	Status           string
 	ExpiresAt        time.Time
 	ComboConditionID string
@@ -56,10 +59,19 @@ func (q *ComboQuote) NoQuote() bool {
 	return q == nil || q.Status == "FAILED" || q.TotalRequiredE6 <= 0
 }
 
-// Multiplier is the fee-inclusive payout per dollar if every leg wins:
-// shares received / collateral paid. 0 when there is no quote.
+// Multiplier is a BUY quote's fee-inclusive payout per dollar if every leg
+// wins: shares received / collateral paid. 0 for no quote or a SELL.
 func (q *ComboQuote) Multiplier() float64 {
-	if q.NoQuote() || q.NetReceiveE6 <= 0 {
+	if q.NoQuote() || q.NetReceiveE6 <= 0 || q.Direction == "SELL" {
+		return 0
+	}
+	return float64(q.NetReceiveE6) / float64(q.TotalRequiredE6)
+}
+
+// ProceedsPerShare is a SELL quote's collateral received per share sold,
+// after fees: net_receive / shares. 0 for no quote or a BUY.
+func (q *ComboQuote) ProceedsPerShare() float64 {
+	if q.NoQuote() || q.NetReceiveE6 <= 0 || q.Direction != "SELL" {
 		return 0
 	}
 	return float64(q.NetReceiveE6) / float64(q.TotalRequiredE6)
@@ -135,7 +147,13 @@ func (tc *TradingClient) RequestComboQuote(ctx context.Context, req ComboQuoteRe
 	if len(req.LegPositionIDs) < 2 {
 		return nil, fmt.Errorf("a combo needs at least 2 legs, got %d", len(req.LegPositionIDs))
 	}
-	if req.StakeUSD <= 0 {
+	direction, size := "BUY", comboRFQSizeBody{Unit: "notional", ValueE6: strconv.FormatInt(int64(math.Round(req.StakeUSD*1e6)), 10)}
+	switch {
+	case req.StakeUSD > 0 && req.SellSharesE6 > 0:
+		return nil, errors.New("a combo quote is a BUY stake or a SELL size, not both")
+	case req.SellSharesE6 > 0:
+		direction, size = "SELL", comboRFQSizeBody{Unit: "shares", ValueE6: strconv.FormatInt(req.SellSharesE6, 10)}
+	case req.StakeUSD <= 0:
 		return nil, fmt.Errorf("stake must be positive, got %v", req.StakeUSD)
 	}
 	signer, maker, sigType, err := comboRequesterIdentity(req.EOA, req.Proxy, req.AccountType)
@@ -148,12 +166,9 @@ func (tc *TradingClient) RequestComboQuote(ctx context.Context, req ComboQuoteRe
 		MakerAddress:   maker.Hex(),
 		SignatureType:  sigType,
 		LegPositionIDs: req.LegPositionIDs,
-		Direction:      "BUY",
+		Direction:      direction,
 		Side:           "YES",
-		RequestedSize: comboRFQSizeBody{
-			Unit:    "notional",
-			ValueE6: strconv.FormatInt(int64(math.Round(req.StakeUSD*1e6)), 10),
-		},
+		RequestedSize:  size,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("encode RFQ: %w", err)
@@ -170,6 +185,7 @@ func (tc *TradingClient) RequestComboQuote(ctx context.Context, req ComboQuoteRe
 	}
 	q := &ComboQuote{
 		RFQID:            r.RFQID,
+		Direction:        direction,
 		Status:           r.Status,
 		ComboConditionID: r.Request.ConditionID,
 		YesPositionID:    r.Request.YesPositionID,
